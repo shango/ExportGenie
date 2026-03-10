@@ -1,6 +1,6 @@
 # Export Genie
 
-**Version v7_beta_4**
+**Version v10**
 
 Export Maya scenes to multiple formats (.ma, .fbx, .abc, .jsx, .mov) in a single operation with automatic folder structure and versioning. Three-tab interface serving camera trackers, matchmove/animation artists, and face track artists.
 
@@ -37,7 +37,7 @@ Requires **Maya 2025+**. Windows and macOS.
 - Rollover tooltips on every widget
 - Drag-and-drop install with automatic shelf button
 
-## What's New in v7
+## What's New in v10
 
 - New "H.264 (.mp4 Win)" playblast format — uses bundled ffmpeg to encode from PNG, no QuickTime needed (Windows only)
 - FBX exports now import into UE5 with correct camera orientation and scene scale (Z-up axis, centimeter units)
@@ -49,6 +49,14 @@ Requires **Maya 2025+**. Windows and macOS.
 - Export files now use tab-specific naming tags (`cam`, `charMM`, `KTHead`) while QC playblasts always use `track`
 - Frame range auto-populates when a camera is loaded: start 1001, end from the camera's last keyframe
 - Default start frame is now 1001, even if the Maya timeline starts earlier
+- **Preview Playblast** — live viewport toggle that shows exactly what the QC render will look like (camera, lighting, shaders, checker overlay, color management) without running a full export. Salmon button indicates active preview; auto-exits on export or window close.
+- Configurable **Far Clip** slider in Viewport Settings for all tabs (default 800,000)
+- **ffmpeg pre-validation** — MP4 exports check for ffmpeg.exe before starting; skipped with a clear message if not found
+- Viewport preview now applies the Raw (sRGB) view transform to the live viewport, matching the playblast output
+- Default checker overlay opacity changed to 30% (Matchmove and Face Track)
+- useBackground Shader + Wireframe checkbox now defaults to checked (Camera Track)
+- Simplified log window output — short, user-friendly messages with detailed diagnostics directed to Script Editor
+- ffmpeg errors now logged to Script Editor for easier troubleshooting
 
 ## What's New in v6
 
@@ -67,12 +75,12 @@ Requires **Maya 2025+**. Windows and macOS.
 1. Extract the distribution folder. It should contain:
    ```
    export_genie/
-     maya_multi_export.py
+     ExportGenie.py
      bin/
        win/
          ffmpeg.exe
    ```
-2. Drag `maya_multi_export.py` into the Maya viewport.
+2. Drag `ExportGenie.py` into the Maya viewport.
 3. A shelf button is added to your current shelf automatically.
 
 That's it. The install automatically copies the script and the `bin/` folder (with ffmpeg) to Maya's scripts directory. Click the shelf button to open the tool.
@@ -81,12 +89,12 @@ That's it. The install automatically copies the script and the `bin/` folder (wi
 
 ## Upgrade
 
-To update to a newer version, restart Maya, open a fresh scene, then drag the new `maya_multi_export.py` into the viewport again. It will overwrite the previous version in your scripts directory and replace the shelf button. If the new version includes an updated `bin/` folder, it will be copied as well. If you're upgrading with just the `.py` file, your existing `bin/` folder is preserved. Restart Maya after upgrading to ensure the new version is fully loaded.
+To update to a newer version, restart Maya, open a fresh scene, then drag the new `ExportGenie.py` into the viewport again. It will overwrite the previous version in your scripts directory and replace the shelf button. If the new version includes an updated `bin/` folder, it will be copied as well. If you're upgrading with just the `.py` file, your existing `bin/` folder is preserved. Restart Maya after upgrading to ensure the new version is fully loaded.
 
 ## How to Use
 
 1. Save your scene with a `_v##` version in the filename (e.g. `shot_layout_v03.ma`).
-2. Click the **Export_Genie** shelf button.
+2. Click the **ExportGenie** shelf button.
 3. Set the **Export Root** directory.
 4. Set the **Version Num** — pre-populated from your scene filename, editable for manual override.
 5. Select the appropriate tab for your workflow.

@@ -47,14 +47,14 @@ Artists in the studio need to export each scene they work on to multiple formats
 ## Functional Requirements
 
 ### Installation
-- **Single-file drag-and-drop install**: User drags `maya_multi_export.py` into the Maya viewport
+- **Single-file drag-and-drop install**: User drags `ExportGenie.py` into the Maya viewport
 - Automatically copies itself to Maya's user scripts directory
 - Creates a custom shelf button with a distinctive icon (embedded as base64 in the .py)
 - Works on both Windows and macOS
 - **ffmpeg bundling (Windows)**: If a `bin/win/ffmpeg.exe` directory exists next to the source `.py` file at install time, the entire `bin/` folder is automatically copied to the scripts directory alongside the script. This enables the H.264 (.mp4 Win) playblast format. The distribution folder structure is:
   ```
   export_genie/
-    maya_multi_export.py    ← drag this into Maya
+    ExportGenie.py    ← drag this into Maya
     bin/
       win/
         ffmpeg.exe
@@ -68,7 +68,7 @@ Artists in the studio need to export each scene they work on to multiple formats
 Shared elements stay outside the tabs; only role assignments, format checkboxes, and viewport settings go inside tabs.
 
 ```
-window "Maya Multi-Export v2.0"
+window "Export Genie v10"
 +-- columnLayout (main)
 |   +-- frameLayout "Scene Info"              <-- SHARED (auto-refreshes on save/open)
 |   +-- frameLayout "Export Root Directory"    <-- SHARED
@@ -128,7 +128,7 @@ window "Maya Multi-Export v2.0"
 |   +-- progressBar + label                   <-- SHARED
 |   +-- button "E X P O R T"                 <-- SHARED
 |   +-- frameLayout "Status"                 <-- SHARED
-|   +-- text "v2.0"                          <-- SHARED
+|   +-- text "v10"                            <-- SHARED
 ```
 
 #### Shared UI Elements
