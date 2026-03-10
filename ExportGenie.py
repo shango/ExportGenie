@@ -1,11 +1,12 @@
 """
-ExportGenie.py  v10
+ExportGenie.py  v11
 Export Genie — Export scenes to .ma, .fbx, .abc with auto versioning.
 
 Drag and drop this file into Maya's viewport to install.
 Compatible with Maya 2025+.
 """
 
+import datetime
 import math
 import os
 import re
@@ -23,7 +24,7 @@ import maya.mel as mel
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v10_beta_4"
+TOOL_VERSION = "v11_beta_2"
 WINDOW_NAME = "multiExportWindow"
 SHELF_BUTTON_LABEL = "ExportGenie"
 ICON_FILENAME = "ExportGenie.png"
@@ -590,6 +591,17 @@ class Exporter(object):
                 except Exception:
                     pass
 
+            # Create metadata group with version and export date
+            info_grp = cmds.group(em=True, name="ExportGenie_info")
+            cmds.addAttr(info_grp, ln="notes", dt="string")
+            cmds.setAttr(
+                info_grp + ".notes",
+                "Export Genie {} | {}".format(
+                    TOOL_VERSION,
+                    datetime.date.today().isoformat()),
+                type="string")
+            sel.append(info_grp)
+
             try:
                 cmds.select(sel, replace=True)
                 cmds.file(
@@ -604,6 +616,12 @@ class Exporter(object):
                     constructionHistory=True,
                 )
             finally:
+                # Remove temporary metadata group from scene
+                if cmds.objExists(info_grp):
+                    try:
+                        cmds.delete(info_grp)
+                    except Exception:
+                        pass
                 # Restore original shading assignments
                 for mesh, sg in original_shading.items():
                     try:
@@ -622,6 +640,15 @@ class Exporter(object):
         except Exception as e:
             self._log_error("MA", e)
             return False
+
+    @staticmethod
+    def _create_metadata_grp():
+        """Create a temporary empty group whose name encodes version + date."""
+        name = "ExportGenie_{}_{}".format(
+            TOOL_VERSION,
+            datetime.date.today().isoformat().replace("-", ""))
+        grp = cmds.group(em=True, name=name)
+        return grp
 
     def export_fbx(self, file_path, camera, geo_roots, rig_roots, proxy_geos,
                    start_frame, end_frame,
@@ -716,10 +743,20 @@ class Exporter(object):
             mel.eval("FBXExportScaleFactor 1")
             mel.eval("FBXExportUseSceneName -v false")
 
-            # Select and export
-            cmds.select(sel, replace=True)
-            mel_path = file_path.replace("\\", "/")
-            mel.eval('FBXExport -f "{}" -s'.format(mel_path))
+            # Create metadata group and include in export
+            info_grp = self._create_metadata_grp()
+            sel.append(info_grp)
+
+            try:
+                cmds.select(sel, replace=True)
+                mel_path = file_path.replace("\\", "/")
+                mel.eval('FBXExport -f "{}" -s'.format(mel_path))
+            finally:
+                if cmds.objExists(info_grp):
+                    try:
+                        cmds.delete(info_grp)
+                    except Exception:
+                        pass
 
             return True
         except Exception as e:
@@ -767,8 +804,11 @@ class Exporter(object):
                 self._is_descendant_of(camera, gr)
                 for gr in all_roots if gr
             )
+            # Create metadata group and include as a root
+            info_grp = self._create_metadata_grp()
+
             root_flags = ""
-            root_nodes = [camera] + geo_roots + proxy_geos
+            root_nodes = [camera] + geo_roots + proxy_geos + [info_grp]
             for node in root_nodes:
                 if not node:
                     continue
@@ -776,6 +816,8 @@ class Exporter(object):
                     continue
                 long_names = cmds.ls(node, long=True)
                 if not long_names:
+                    if node == info_grp:
+                        continue
                     self.log(
                         "ABC failed — '{}' not found.".format(node)
                     )
@@ -799,7 +841,14 @@ class Exporter(object):
                 file=abc_path,
             )
 
-            cmds.AbcExport(j=job_string)
+            try:
+                cmds.AbcExport(j=job_string)
+            finally:
+                if cmds.objExists(info_grp):
+                    try:
+                        cmds.delete(info_grp)
+                    except Exception:
+                        pass
             return True
         except Exception as e:
             self._log_error("ABC", e)
@@ -916,10 +965,10 @@ class Exporter(object):
             except Exception:
                 pass
 
-        pc = cmds.parentConstraint(src, tgt, mo=False)[0]
+        pc = cmds.parentConstraint(src, tgt, mo=True)[0]
         sc = None
         try:
-            sc = cmds.scaleConstraint(src, tgt, mo=False)[0]
+            sc = cmds.scaleConstraint(src, tgt, mo=True)[0]
         except Exception:
             sc = None
 
@@ -1073,8 +1122,10 @@ class Exporter(object):
         if cmds.objExists(src_xform):
             try:
                 cmds.delete(src_xform)
-            except Exception:
-                pass
+            except Exception as exc:
+                sys.stderr.write(
+                    "[ExportGenie] WARNING: Could not delete source "
+                    "mesh '{}': {}\n".format(src_xform, exc))
 
         self.log("Prepared {} target(s) for FBX export.".format(
             len(frames)))
@@ -1086,6 +1137,7 @@ class Exporter(object):
         return {
             "base_mesh": base_mesh,
             "blendshape_node": bs_node,
+            "targets_group": grp,
         }
 
     # --- Face Track: classification helpers ---
@@ -1155,7 +1207,8 @@ class Exporter(object):
                     pass
 
     def prep_for_ue5_fbx_export(self, geo_roots, rig_roots,
-                                start_frame, end_frame, camera=None):
+                                start_frame, end_frame, camera=None,
+                                skip_mesh_xforms=None):
         """Prepare a Matchmove scene for UE5-friendly FBX export.
 
         Performs: bake camera, bake animation to joints, remove
@@ -1163,7 +1216,14 @@ class Exporter(object):
         freeze transforms on non-skinned geo, strip namespaces.
 
         All changes are destructive — caller MUST wrap in an undo chunk.
+
+        Args:
+            skip_mesh_xforms: optional set of long DAG paths to exclude
+                from history deletion (Step 4) and freeze transforms
+                (Step 5).  Used for vertex-animated meshes that will be
+                converted to blendshapes after prep completes.
         """
+        skip_mesh_xforms = skip_mesh_xforms or set()
         trs = ["tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"]
 
         # --- Step 0: Bake camera animation ---
@@ -1301,6 +1361,8 @@ class Exporter(object):
 
         history_deleted = 0
         for mesh_xform in all_mesh_xforms:
+            if mesh_xform in skip_mesh_xforms:
+                continue
             try:
                 cmds.bakePartialHistory(
                     mesh_xform, prePostDeformers=True)
@@ -1313,6 +1375,8 @@ class Exporter(object):
         # --- Step 5: Freeze transforms on non-skinned non-joint geo ---
         transforms_frozen = 0
         for mesh_xform in all_mesh_xforms:
+            if mesh_xform in skip_mesh_xforms:
+                continue
             # Skip skinned meshes
             history = cmds.listHistory(
                 mesh_xform, pruneDagObjects=True
@@ -1374,6 +1438,95 @@ class Exporter(object):
                 pass
         if namespaces_stripped:
             self.log("Stripping namespaces...")
+
+    def detect_vertex_anim_meshes(self, geo_roots, start_frame, end_frame):
+        """Detect meshes with per-vertex animation under geo_roots.
+
+        Samples 3 vertex positions at start_frame vs end_frame to find
+        meshes with real vertex deformation (vs. AlembicNode only driving
+        TRS).  Read-only — does not modify the scene.
+
+        Args:
+            geo_roots: list of root transforms to search under.
+            start_frame: first frame to sample.
+            end_frame: last frame to sample.
+
+        Returns:
+            set of long DAG paths (mesh transforms) with vertex animation.
+        """
+        geo_roots = geo_roots or []
+        # Collect mesh transforms under all roots
+        mesh_xforms = []
+        for root in geo_roots:
+            if not cmds.objExists(root):
+                continue
+            descendants = cmds.listRelatives(
+                root, allDescendents=True, type="transform",
+                fullPath=True
+            ) or []
+            for desc in [cmds.ls(root, long=True)[0]] + descendants:
+                shapes = cmds.listRelatives(
+                    desc, shapes=True, type="mesh", fullPath=True
+                ) or []
+                # Filter out intermediate (orig) shapes
+                shapes = [
+                    s for s in shapes
+                    if not cmds.getAttr(s + ".intermediateObject")
+                ]
+                if shapes and desc not in mesh_xforms:
+                    mesh_xforms.append(desc)
+
+        vertex_anim_set = set()
+        if not mesh_xforms:
+            return vertex_anim_set
+
+        original_time = cmds.currentTime(query=True)
+        sample_frame_a = int(start_frame)
+        sample_frame_b = int(end_frame)
+
+        # Collect positions at frame A
+        cmds.currentTime(sample_frame_a, edit=True)
+        positions_a = {}  # {long_name: (shape, indices, [pos, ...])}
+        for xform in mesh_xforms:
+            shapes = cmds.listRelatives(
+                xform, shapes=True, type="mesh", fullPath=True
+            ) or []
+            for shp in shapes:
+                try:
+                    if cmds.getAttr(shp + ".intermediateObject"):
+                        continue
+                except Exception:
+                    pass
+                vtx_count = cmds.polyEvaluate(shp, vertex=True)
+                if not vtx_count:
+                    continue
+                indices = list(set(
+                    [0, vtx_count // 2, max(0, vtx_count - 1)]))
+                pts = []
+                for idx in indices:
+                    pts.append(cmds.pointPosition(
+                        "{}.vtx[{}]".format(shp, idx), local=True))
+                positions_a[xform] = (shp, indices, pts)
+                break  # one non-intermediate shape is enough
+
+        # Collect positions at frame B and compare
+        if sample_frame_a != sample_frame_b:
+            cmds.currentTime(sample_frame_b, edit=True)
+            for long_name, (shp, indices, pts_a) in positions_a.items():
+                found = False
+                for i, idx in enumerate(indices):
+                    pos_b = cmds.pointPosition(
+                        "{}.vtx[{}]".format(shp, idx), local=True)
+                    for c in range(3):
+                        if abs(pts_a[i][c] - pos_b[c]) > 1e-5:
+                            vertex_anim_set.add(long_name)
+                            found = True
+                            break
+                    if found:
+                        break
+
+        cmds.currentTime(original_time, edit=True)
+        return vertex_anim_set
 
     def prepare_face_track_for_export(self, picked_nodes, start_frame,
                                        end_frame):
@@ -1445,64 +1598,10 @@ class Exporter(object):
             "[ExportGenie] Found {} leaf transforms to classify.\n".format(
             len(unique_leaves)))
 
-        # Phase 2a: batch vertex-animation detection (2 scene evals total)
-        # Compare local-space vertex positions at two frames to find meshes
-        # with real vertex deformation (vs. AlembicNode only driving TRS).
-        original_time = cmds.currentTime(query=True)
-        mesh_leaves = [
-            lf for lf in unique_leaves
-            if cmds.listRelatives(
-                lf, shapes=True, type="mesh", fullPath=True)
-        ]
+        # Phase 2a: batch vertex-animation detection
+        vertex_anim_set = self.detect_vertex_anim_meshes(
+            picked_nodes, start_frame, end_frame)
 
-        vertex_anim_set = set()
-        if mesh_leaves:
-            sample_frame_a = int(start_frame)
-            sample_frame_b = int(end_frame)
-
-            # Collect positions at frame A
-            cmds.currentTime(sample_frame_a, edit=True)
-            positions_a = {}  # {long_name: (shape, indices, [pos, ...])}
-            for leaf in mesh_leaves:
-                long_name = cmds.ls(leaf, long=True)[0]
-                shapes = cmds.listRelatives(
-                    leaf, shapes=True, type="mesh", fullPath=True
-                ) or []
-                for shp in shapes:
-                    try:
-                        if cmds.getAttr(shp + ".intermediateObject"):
-                            continue
-                    except Exception:
-                        pass
-                    vtx_count = cmds.polyEvaluate(shp, vertex=True)
-                    if not vtx_count:
-                        continue
-                    indices = list(set(
-                        [0, vtx_count // 2, max(0, vtx_count - 1)]))
-                    pts = []
-                    for idx in indices:
-                        pts.append(cmds.pointPosition(
-                            "{}.vtx[{}]".format(shp, idx), local=True))
-                    positions_a[long_name] = (shp, indices, pts)
-                    break  # one non-intermediate shape is enough
-
-            # Collect positions at frame B and compare
-            if sample_frame_a != sample_frame_b:
-                cmds.currentTime(sample_frame_b, edit=True)
-                for long_name, (shp, indices, pts_a) in positions_a.items():
-                    found = False
-                    for i, idx in enumerate(indices):
-                        pos_b = cmds.pointPosition(
-                            "{}.vtx[{}]".format(shp, idx), local=True)
-                        for c in range(3):
-                            if abs(pts_a[i][c] - pos_b[c]) > 1e-5:
-                                vertex_anim_set.add(long_name)
-                                found = True
-                                break
-                        if found:
-                            break
-
-        cmds.currentTime(original_time, edit=True)
         # Phase 2b: classify and process each leaf
         for leaf in unique_leaves:
             long_name = cmds.ls(leaf, long=True)[0]
@@ -3354,6 +3453,7 @@ class MultiExportUI(object):
         self.ct_mov_checkbox = None
         self.ct_mov_format_menu = None
         self.ct_raw_playblast_cb = None
+        self.ct_custom_vt_cb = None
         self.ct_wireframe_shader_cb = None
         self.ct_aa16_cb = None
         # Matchmove tab (mm_)
@@ -3375,6 +3475,7 @@ class MultiExportUI(object):
         self.mm_mov_checkbox = None
         self.mm_mov_format_menu = None
         self.mm_raw_playblast_cb = None
+        self.mm_custom_vt_cb = None
         self.mm_aa16_cb = None
         # Preview mode state
         self._preview_active = False
@@ -3400,6 +3501,35 @@ class MultiExportUI(object):
         )
 
         cmds.separator(height=4, style="none")
+
+        # --- Support contact ---
+        support_row = cmds.rowLayout(
+            numberOfColumns=2, adjustableColumn=2,
+            columnWidth2=(200, 220),
+            columnAlign2=("left", "left"))
+        cmds.text(
+            label="For support or issues, please contact ")
+        cmds.iconTextButton(
+            style="textOnly",
+            label="Shannon Gold",
+            font="boldLabelFont",
+            command=lambda *_: __import__("webbrowser").open(
+                "mailto:sgold1@pdoexperts.fb.com"),
+            annotation="sgold1@pdoexperts.fb.com",
+        )
+        cmds.setParent("..")
+
+        # --- Collapsible content ---
+        self._compact_frame = cmds.frameLayout(
+            collapsable=True,
+            collapse=False,
+            label="Collapse All Settings",
+            borderVisible=False,
+            marginWidth=0,
+            marginHeight=0,
+            collapseCommand=partial(self._on_compact_toggle, True),
+            expandCommand=partial(self._on_compact_toggle, False),
+        )
 
         # --- Shared: Scene Info ---
         self._build_scene_info()
@@ -3432,6 +3562,8 @@ class MultiExportUI(object):
 
         # --- Shared: Frame Range ---
         self._build_frame_range()
+
+        cmds.setParent("..")  # end collapsible frame
 
         # --- Export Button ---
         cmds.separator(height=8, style="none")
@@ -3655,6 +3787,13 @@ class MultiExportUI(object):
                 "without modifications"),
             value=False,
         )
+        self.ct_custom_vt_cb = cmds.checkBox(
+            label="  Use Custom View Transform",
+            annotation=(
+                "When checked, the playblast uses your current "
+                "view transform instead of forcing Raw (sRGB)"),
+            value=False,
+        )
         cmds.separator(style="in", height=8)
         ct_preview_hint = cmds.text(
             label="Re-toggle preview to apply setting changes.",
@@ -3839,6 +3978,13 @@ class MultiExportUI(object):
             annotation=(
                 "Playblast uses your current VP2.0 settings "
                 "without modifications"),
+            value=False,
+        )
+        self.mm_custom_vt_cb = cmds.checkBox(
+            label="  Use Custom View Transform",
+            annotation=(
+                "When checked, the playblast uses your current "
+                "view transform instead of forcing Raw (sRGB)"),
             value=False,
         )
         cmds.separator(style="in", height=8)
@@ -4046,6 +4192,13 @@ class MultiExportUI(object):
             annotation=(
                 "Playblast uses your current VP2.0 settings "
                 "without modifications"),
+            value=False,
+        )
+        self.ft_custom_vt_cb = cmds.checkBox(
+            label="  Use Custom View Transform",
+            annotation=(
+                "When checked, the playblast uses your current "
+                "view transform instead of forcing Raw (sRGB)"),
             value=False,
         )
         cmds.separator(style="in", height=8)
@@ -5064,6 +5217,13 @@ class MultiExportUI(object):
         else:
             self._export_face_track()
 
+    def _on_compact_toggle(self, collapsed, *args):
+        """Resize the window when the Settings frame is collapsed/expanded."""
+        if collapsed:
+            cmds.window(self.window, edit=True, height=160, widthHeight=(440, 160))
+        else:
+            cmds.window(self.window, edit=True, height=480, widthHeight=(440, 480))
+
     def _on_window_close(self, *args):
         """Clean up preview mode when the window is closed."""
         if self._preview_active:
@@ -5126,16 +5286,22 @@ class MultiExportUI(object):
         if active_tab == TAB_CAMERA_TRACK:
             raw_pb = cmds.checkBox(
                 self.ct_raw_playblast_cb, query=True, value=True)
+            custom_vt = cmds.checkBox(
+                self.ct_custom_vt_cb, query=True, value=True)
             far_clip = cmds.intSliderGrp(
                 self.ct_far_clip, query=True, value=True)
         elif active_tab == TAB_MATCHMOVE:
             raw_pb = cmds.checkBox(
                 self.mm_raw_playblast_cb, query=True, value=True)
+            custom_vt = cmds.checkBox(
+                self.mm_custom_vt_cb, query=True, value=True)
             far_clip = cmds.intSliderGrp(
                 self.mm_far_clip, query=True, value=True)
         else:
             raw_pb = cmds.checkBox(
                 self.ft_raw_playblast_cb, query=True, value=True)
+            custom_vt = cmds.checkBox(
+                self.ft_custom_vt_cb, query=True, value=True)
             far_clip = cmds.intSliderGrp(
                 self.ft_far_clip, query=True, value=True)
 
@@ -5223,7 +5389,7 @@ class MultiExportUI(object):
             state["original_culling"] = original_culling
 
         # Set playblast colour management (persists in scene)
-        if not raw_pb:
+        if not raw_pb and not custom_vt:
             try:
                 exporter = Exporter(self._log)
                 exporter._ensure_playblast_raw_srgb()
@@ -6060,6 +6226,7 @@ class MultiExportUI(object):
         # Rename camera to cam_main for all exports
         renamed_cam = None
         original_cam_name = camera
+        baked_abc_cam = False
         try:
             if camera:
                 if camera == "cam_main" and cmds.objExists(camera):
@@ -6076,6 +6243,91 @@ class MultiExportUI(object):
                     self._log(
                         "Camera not found. See Script Editor.")
                     camera = None
+
+            # Detect Alembic-driven camera and bake before exports
+            if camera and cmds.objExists(camera):
+                cam_shapes = cmds.listRelatives(
+                    camera, shapes=True, type="camera") or []
+                abc_nodes = set()
+                # Check transform TRS channels
+                for attr in ("tx", "ty", "tz", "rx", "ry", "rz",
+                             "sx", "sy", "sz"):
+                    conns = cmds.listConnections(
+                        "{}.{}".format(camera, attr),
+                        source=True, destination=False) or []
+                    for c in conns:
+                        if cmds.nodeType(c) == "AlembicNode":
+                            abc_nodes.add(c)
+                # Check camera shape focalLength
+                for shp in cam_shapes:
+                    conns = cmds.listConnections(
+                        "{}.focalLength".format(shp),
+                        source=True, destination=False) or []
+                    for c in conns:
+                        if cmds.nodeType(c) == "AlembicNode":
+                            abc_nodes.add(c)
+                if abc_nodes:
+                    self._log("Baking Alembic camera...")
+                    cmds.undoInfo(openChunk=True)
+                    baked_abc_cam = True
+                    trs = ["tx", "ty", "tz", "rx", "ry", "rz",
+                           "sx", "sy", "sz"]
+                    # Unlock TRS channels
+                    for a in trs:
+                        try:
+                            cmds.setAttr(
+                                "{}.{}".format(camera, a),
+                                lock=False, keyable=True,
+                                channelBox=True)
+                        except Exception:
+                            pass
+                    # Bake transform channels
+                    cmds.bakeResults(
+                        camera,
+                        t=(int(start_frame), int(end_frame)),
+                        at=trs,
+                        simulation=True,
+                        preserveOutsideKeys=True,
+                        minimizeRotation=True,
+                    )
+                    # Bake focal length on camera shape
+                    for shp in cam_shapes:
+                        try:
+                            cmds.setAttr(
+                                "{}.focalLength".format(shp),
+                                lock=False, keyable=True)
+                        except Exception:
+                            pass
+                        cmds.bakeResults(
+                            shp,
+                            t=(int(start_frame), int(end_frame)),
+                            at=["focalLength"],
+                            simulation=True,
+                            preserveOutsideKeys=True,
+                        )
+                    # Disconnect Alembic sources (keep baked animCurves)
+                    all_plugs = ["{}.{}".format(camera, a) for a in trs]
+                    for shp in cam_shapes:
+                        all_plugs.append(
+                            "{}.focalLength".format(shp))
+                    for plug in all_plugs:
+                        conns = cmds.listConnections(
+                            plug, source=True, destination=False,
+                            plugs=True,
+                            skipConversionNodes=True) or []
+                        for src_plug in conns:
+                            src_node = src_plug.split(".")[0]
+                            if cmds.nodeType(src_node).startswith(
+                                    "animCurve"):
+                                continue
+                            try:
+                                cmds.disconnectAttr(src_plug, plug)
+                            except Exception:
+                                pass
+                    sys.stderr.write(
+                        "[ExportGenie] Baked Alembic camera: {} "
+                        "({} AlembicNode(s) disconnected).\n".format(
+                            camera, len(abc_nodes)))
 
             # JSX + OBJ export
             if do_jsx:
@@ -6188,6 +6440,9 @@ class MultiExportUI(object):
                     raw_pb = cmds.checkBox(
                         self.ct_raw_playblast_cb, query=True,
                         value=True)
+                    custom_vt = cmds.checkBox(
+                        self.ct_custom_vt_cb, query=True,
+                        value=True)
                     wf_shader = cmds.checkBox(
                         self.ct_wireframe_shader_cb, query=True,
                         value=True)
@@ -6199,6 +6454,7 @@ class MultiExportUI(object):
                         pb_path, camera, start_frame, end_frame,
                         camera_track_mode=True,
                         raw_playblast=raw_pb,
+                        render_raw_srgb=not custom_vt,
                         wireframe_shader=wf_shader,
                         wireframe_shader_geo=geo_roots,
                         msaa_16=aa16,
@@ -6210,6 +6466,14 @@ class MultiExportUI(object):
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
         finally:
+            # Undo Alembic camera bake (restores original connections)
+            if baked_abc_cam:
+                try:
+                    cmds.undoInfo(closeChunk=True)
+                    cmds.undo()
+                except Exception:
+                    self._log(
+                        "Undo camera bake failed. See Script Editor.")
             # Restore original camera name
             if renamed_cam and cmds.objExists(renamed_cam):
                 cmds.rename(renamed_cam, original_cam_name)
@@ -6359,10 +6623,27 @@ class MultiExportUI(object):
             if do_fbx:
                 self._log("Preparing FBX export...")
                 cmds.undoInfo(openChunk=True)
+                base_meshes = []
+                target_groups = []
                 try:
+                    # Detect vertex-animated meshes before prep
+                    # (Alembic connections must be intact for sampling)
+                    vertex_anim_set = exporter.detect_vertex_anim_meshes(
+                        geo_roots, tpose_start, end_frame)
+                    has_vertex_anim = bool(vertex_anim_set)
+                    if has_vertex_anim:
+                        sys.stderr.write(
+                            "[ExportGenie] Detected {} vertex-animated "
+                            "mesh(es) in Mesh Group.\n".format(
+                                len(vertex_anim_set)))
+
+                    # Standard UE5 prep — skips vertex-anim meshes
+                    # in Steps 4 (history) and 5 (freeze transforms)
                     exporter.prep_for_ue5_fbx_export(
                         geo_roots, rig_roots, tpose_start, end_frame,
-                        camera=camera)
+                        camera=camera,
+                        skip_mesh_xforms=vertex_anim_set)
+
                     # Namespace stripping in prep may have renamed nodes.
                     # Resolve to long (unique) names so select succeeds.
                     def _resolve_name(name):
@@ -6377,22 +6658,49 @@ class MultiExportUI(object):
                         long_names = cmds.ls(short, long=True)
                         if len(long_names) == 1:
                             return long_names[0]
-                        # Multiple matches — find by matching tail of
-                        # the original long path structure
+                        # Multiple matches — find by matching the
+                        # hierarchy tail (strip namespaces from each
+                        # segment of the original path)
                         if long_names:
+                            stripped_tail = "/".join(
+                                seg.rsplit(":", 1)[-1]
+                                for seg in name.split("|") if seg)
+                            for ln in long_names:
+                                ln_tail = "/".join(
+                                    seg for seg in ln.split("|") if seg)
+                                if ln_tail.endswith(stripped_tail):
+                                    return ln
                             return long_names[0]
                         return name
+
+                    # Convert vertex-animated meshes to blendshapes
+                    # (after prep so namespaces are stripped, but
+                    # Alembic connections are still intact on skipped
+                    # meshes)
+                    if has_vertex_anim:
+                        self._log("Converting vertex animation...")
+                        for old_long in list(vertex_anim_set):
+                            resolved = _resolve_name(old_long)
+                            conv = exporter.convert_abc_to_blendshape(
+                                resolved, tpose_start, end_frame)
+                            base_meshes.append(conv["base_mesh"])
+                            if conv.get("targets_group"):
+                                target_groups.append(conv["targets_group"])
+
                     fbx_geo = [_resolve_name(g) for g in geo_roots]
                     fbx_rigs = [_resolve_name(r) for r in rig_roots]
                     fbx_proxies = [_resolve_name(p) for p in proxy_geos]
                     fbx_cam = _resolve_name(camera) if camera else camera
                     results["fbx"] = exporter.export_fbx(
                         paths["fbx"], fbx_cam, fbx_geo, fbx_rigs,
-                        fbx_proxies, tpose_start, end_frame
+                        fbx_proxies, tpose_start, end_frame,
+                        export_input_connections=has_vertex_anim,
                     )
                 except Exception as exc:
                     self._log(
                         "FBX export failed. See Script Editor.")
+                    sys.stderr.write(
+                        "[ExportGenie] FBX error: {}\n".format(exc))
                     results["fbx"] = False
                 finally:
                     cmds.undoInfo(closeChunk=True)
@@ -6402,6 +6710,20 @@ class MultiExportUI(object):
                     except Exception:
                         self._log(
                             "Undo failed. See Script Editor.")
+                    # Safety net: delete any blendshape artifacts
+                    # that survived the undo
+                    for bm in base_meshes:
+                        if cmds.objExists(bm):
+                            try:
+                                cmds.delete(bm)
+                            except Exception:
+                                pass
+                    for tg in target_groups:
+                        if cmds.objExists(tg):
+                            try:
+                                cmds.delete(tg)
+                            except Exception:
+                                pass
                 self._log_result("FBX", results.get("fbx", False))
                 self._advance_progress()
 
@@ -6437,6 +6759,9 @@ class MultiExportUI(object):
                     raw_pb = cmds.checkBox(
                         self.mm_raw_playblast_cb, query=True,
                         value=True)
+                    custom_vt = cmds.checkBox(
+                        self.mm_custom_vt_cb, query=True,
+                        value=True)
                     chk_scale = cmds.intSliderGrp(
                         self.mm_checker_scale, query=True, value=True)
                     chk_color = tuple(cmds.colorSliderGrp(
@@ -6456,6 +6781,7 @@ class MultiExportUI(object):
                         checker_color=chk_color,
                         checker_opacity=chk_opacity,
                         raw_playblast=raw_pb,
+                        render_raw_srgb=not custom_vt,
                         msaa_16=aa16,
                         far_clip=far_clip,
                         png_mode=png_mode,
@@ -6668,6 +6994,9 @@ class MultiExportUI(object):
                     raw_pb = cmds.checkBox(
                         self.ft_raw_playblast_cb, query=True,
                         value=True)
+                    custom_vt = cmds.checkBox(
+                        self.ft_custom_vt_cb, query=True,
+                        value=True)
                     chk_scale = cmds.intSliderGrp(
                         self.ft_checker_scale, query=True, value=True)
                     chk_color = tuple(cmds.colorSliderGrp(
@@ -6687,6 +7016,7 @@ class MultiExportUI(object):
                         checker_color=chk_color,
                         checker_opacity=chk_opacity,
                         raw_playblast=raw_pb,
+                        render_raw_srgb=not custom_vt,
                         msaa_16=aa16,
                         far_clip=far_clip,
                         png_mode=png_mode,
