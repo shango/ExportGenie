@@ -24,8 +24,9 @@ import maya.mel as mel
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v11_beta_2"
+TOOL_VERSION = "v11_beta-8"
 WINDOW_NAME = "multiExportWindow"
+WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
 ICON_FILENAME = "ExportGenie.png"
 
@@ -148,6 +149,15 @@ class FolderManager(object):
         mp4_tmp_dir = os.path.join(dir_path, "_tmp_mp4")
         paths["mp4_tmp_dir"] = mp4_tmp_dir
         paths["mp4_tmp_file"] = os.path.join(mp4_tmp_dir, qc_base)
+        # Composite temp dirs for multi-pass MM/FT playblasts
+        composite_tmp = os.path.join(dir_path, "_tmp_composite")
+        paths["composite_tmp"] = composite_tmp
+        paths["composite_plate"] = os.path.join(
+            composite_tmp, "plate", qc_base)
+        paths["composite_color"] = os.path.join(
+            composite_tmp, "color", qc_base)
+        paths["composite_matte"] = os.path.join(
+            composite_tmp, "matte", qc_base)
         return paths
 
     @staticmethod
@@ -183,8 +193,12 @@ class FolderManager(object):
         )
         paths = {"jsx": os.path.join(ae_dir, jsx_name), "obj": {}}
         for geo_name in geo_names:
-            obj_name = "{base}_cam_{ver}_{geo}.obj".format(
-                base=scene_base_name, ver=version_str, geo=geo_name
+            # Strip DAG path and Maya namespaces
+            # e.g. "|grp|ns:GeoName" → "GeoName"
+            short_geo = geo_name.rsplit("|", 1)[-1]
+            short_geo = short_geo.rsplit(":", 1)[-1]
+            obj_name = "{base}_{ver}_{geo}.obj".format(
+                base=scene_base_name, ver=version_str, geo=short_geo
             )
             paths["obj"][geo_name] = os.path.join(ae_dir, obj_name)
         return paths
@@ -404,23 +418,29 @@ class Exporter(object):
 
     @staticmethod
     def _find_ffmpeg():
-        """Locate the bundled ffmpeg executable relative to this script.
+        """Locate the bundled ffmpeg executable.
 
         The expected layout after install is::
 
             {scripts_dir}/ExportGenie.py
-            {scripts_dir}/bin/win/ffmpeg.exe
+            {scripts_dir}/bin/win/ffmpeg.exe      (Windows)
+            {scripts_dir}/bin/mac/ffmpeg           (macOS)
 
         Returns:
-            str or None: Absolute path to ffmpeg.exe if found.
+            str or None: Absolute path to ffmpeg if found.
         """
-        if sys.platform != "win32":
-            return None
         scripts_dir = os.path.dirname(os.path.abspath(__file__))
         # If running from __pycache__, go up one level
         if os.path.basename(scripts_dir) == "__pycache__":
             scripts_dir = os.path.dirname(scripts_dir)
-        ffmpeg_path = os.path.join(scripts_dir, "bin", "win", "ffmpeg.exe")
+        if sys.platform == "win32":
+            ffmpeg_path = os.path.join(
+                scripts_dir, "bin", "win", "ffmpeg.exe")
+        elif sys.platform == "darwin":
+            ffmpeg_path = os.path.join(
+                scripts_dir, "bin", "mac", "ffmpeg")
+        else:
+            return None
         if os.path.isfile(ffmpeg_path):
             return ffmpeg_path
         return None
@@ -440,7 +460,7 @@ class Exporter(object):
         ffmpeg_path = self._find_ffmpeg()
         if not ffmpeg_path:
             self.log(
-                "ffmpeg.exe not found. See Script Editor.")
+                "ffmpeg not found. See Script Editor.")
             return False
 
         fps = self._get_fps()
@@ -489,6 +509,120 @@ class Exporter(object):
         except Exception as e:
             sys.stderr.write("ffmpeg exception: {}\n".format(e))
             self.log("MP4 encoding error. See Script Editor.")
+            return False
+
+    def _encode_composite(self, plate_dir, plate_base,
+                          color_dir, color_base,
+                          matte_dir, matte_base,
+                          start_frame, output_path,
+                          opacity=1.0, png_output=False):
+        """Composite 3 passes (plate, color, matte) via ffmpeg.
+
+        Uses the matte as an alpha channel on the solid-color pass,
+        then overlays it on the plate.
+
+        Args:
+            plate_dir: Directory of plate PNG sequence.
+            plate_base: Base filename for plate sequence.
+            color_dir: Directory of solid-color PNG sequence.
+            color_base: Base filename for color sequence.
+            matte_dir: Directory of B&W matte PNG sequence.
+            matte_base: Base filename for matte sequence.
+            start_frame: First frame number.
+            output_path: Output file path (.mp4, .mov, or directory
+                for PNG sequence when png_output=True).
+            opacity: Blend opacity 0.0–1.0 for the mesh overlay.
+            png_output: If True, output a PNG sequence instead of video.
+
+        Returns:
+            bool: True if encoding succeeded.
+        """
+        ffmpeg_path = self._find_ffmpeg()
+        if not ffmpeg_path:
+            self.log("ffmpeg not found — cannot composite.")
+            return False
+
+        fps = self._get_fps()
+        plate_pattern = os.path.join(
+            plate_dir, "{}.%04d.png".format(plate_base))
+        color_pattern = os.path.join(
+            color_dir, "{}.%04d.png".format(color_base))
+        matte_pattern = os.path.join(
+            matte_dir, "{}.%04d.png".format(matte_base))
+
+        start_num = str(int(start_frame))
+
+        # Build filter: matte -> alpha on color -> overlay on plate
+        opacity_val = max(0.0, min(1.0, opacity))
+        filter_complex = (
+            "[2:v]format=gray[matte];"
+            "[1:v][matte]alphamerge,format=rgba,"
+            "colorchannelmixer=aa={opacity:.4f}[fg];"
+            "[0:v][fg]overlay=format=auto[out]"
+        ).format(opacity=opacity_val)
+
+        cmd = [
+            ffmpeg_path, "-y",
+            "-framerate", str(fps),
+            "-start_number", start_num,
+            "-i", plate_pattern,
+            "-framerate", str(fps),
+            "-start_number", start_num,
+            "-i", color_pattern,
+            "-framerate", str(fps),
+            "-start_number", start_num,
+            "-i", matte_pattern,
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+        ]
+
+        if png_output:
+            # Output as PNG sequence
+            out_pattern = os.path.join(
+                output_path,
+                os.path.basename(output_path) + ".%04d.png")
+            cmd.extend([
+                "-start_number", start_num,
+                out_pattern,
+            ])
+        else:
+            cmd.extend([
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-crf", "18",
+                "-preset", "ultrafast",
+                "-movflags", "+faststart",
+                output_path,
+            ])
+
+        self.log("Compositing passes...")
+        sys.stderr.write("ffmpeg composite cmd: {}\n".format(
+            " ".join(cmd)))
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                creationflags=getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                sys.stderr.write(
+                    "ffmpeg composite failed (exit {}):\n{}\n".format(
+                        result.returncode, result.stderr))
+                self.log(
+                    "Composite encoding failed. See Script Editor.")
+                return False
+            self.log("Composite encoding complete.")
+            return True
+        except subprocess.TimeoutExpired:
+            self.log("Composite encoding timed out.")
+            return False
+        except Exception as e:
+            sys.stderr.write(
+                "ffmpeg composite exception: {}\n".format(e))
+            self.log("Composite encoding error. See Script Editor.")
             return False
 
     @staticmethod
@@ -702,9 +836,126 @@ class Exporter(object):
             sel.extend(proxy_geos)
             sel.extend(geo_roots)
             sel.extend(rig_roots)
+
+            # Auto-include deformation skeleton roots that are skin
+            # influences on the exported geo but live outside
+            # rig_roots (e.g. a separate Joint_GRP group).
+            sel_long = set()
+            for s in sel:
+                if s:
+                    sel_long.update(cmds.ls(s, long=True) or [])
+            for geo_root in geo_roots:
+                if not geo_root or not cmds.objExists(geo_root):
+                    continue
+                descendants = cmds.listRelatives(
+                    geo_root, allDescendents=True, type="transform",
+                    fullPath=True
+                ) or []
+                geo_long = (cmds.ls(geo_root, long=True)
+                            or [geo_root])
+                for desc in geo_long + descendants:
+                    shapes = cmds.listRelatives(
+                        desc, shapes=True, type="mesh",
+                        fullPath=True
+                    ) or []
+                    if not shapes:
+                        continue
+                    history = cmds.listHistory(
+                        desc, pruneDagObjects=True) or []
+                    for h in history:
+                        if cmds.objectType(h) != "skinCluster":
+                            continue
+                        influences = cmds.skinCluster(
+                            h, query=True, influence=True
+                        ) or []
+                        # Resolve to long paths
+                        influences = [
+                            p for i in influences
+                            for p in (cmds.ls(i, long=True) or [i])]
+                        for inf in influences:
+                            # Walk up to the topmost joint
+                            current = inf
+                            while True:
+                                parent = cmds.listRelatives(
+                                    current, parent=True,
+                                    fullPath=True
+                                )
+                                if (not parent
+                                        or cmds.objectType(
+                                            parent[0]) != "joint"):
+                                    break
+                                current = parent[0]
+                            # Check if already covered by selection
+                            long_inf = (cmds.ls(current, long=True)
+                                        or [current])[0]
+                            covered = any(
+                                long_inf.startswith(s + "|")
+                                or long_inf == s
+                                for s in sel_long)
+                            if not covered and current not in sel:
+                                # Include the parent group so the
+                                # full joint hierarchy is exported
+                                parent = cmds.listRelatives(
+                                    current, parent=True,
+                                    fullPath=True
+                                )
+                                include = parent[0] if parent else current
+                                if include not in sel:
+                                    sel.append(include)
+                                    sel_long.update(
+                                        cmds.ls(include,
+                                                long=True) or [])
+                                    sys.stderr.write(
+                                        "[ExportGenie]   Auto-added "
+                                        "skin influence root to FBX "
+                                        "selection: '{}'\n".format(
+                                            include))
+
             if not sel:
                 self.log("FBX skipped — nothing to export.")
                 return False
+
+            sys.stderr.write(
+                "[ExportGenie] FBX export selection: {}\n".format(sel))
+            sys.stderr.write(
+                "[ExportGenie]   geo_roots: {}\n".format(geo_roots))
+            sys.stderr.write(
+                "[ExportGenie]   rig_roots: {}\n".format(rig_roots))
+            sys.stderr.write(
+                "[ExportGenie]   proxy_geos: {}\n".format(proxy_geos))
+            sys.stderr.write(
+                "[ExportGenie]   camera: {} (under root: {})\n".format(
+                    camera, cam_under_root))
+            sys.stderr.write(
+                "[ExportGenie]   frame range: {} - {}\n".format(
+                    start_frame, end_frame))
+            sys.stderr.write(
+                "[ExportGenie]   export_input_connections: "
+                "{}\n".format(export_input_connections))
+
+            # Log skinCluster -> dagPose state at export time
+            sc_at_export = cmds.ls(type="skinCluster") or []
+            dp_at_export = cmds.ls(type="dagPose") or []
+            sys.stderr.write(
+                "[ExportGenie]   skinClusters at export: {}\n".format(
+                    sc_at_export))
+            sys.stderr.write(
+                "[ExportGenie]   dagPose nodes at export: {}\n".format(
+                    dp_at_export))
+            for sc in sc_at_export:
+                infs = cmds.skinCluster(
+                    sc, query=True, influence=True) or []
+                geo = cmds.skinCluster(
+                    sc, query=True, geometry=True) or []
+                sys.stderr.write(
+                    "[ExportGenie]     '{}': {} influences, "
+                    "geo={}\n".format(sc, len(infs), geo))
+            for dp in dp_at_export:
+                members = cmds.dagPose(
+                    dp, query=True, members=True) or []
+                sys.stderr.write(
+                    "[ExportGenie]     dagPose '{}': {} "
+                    "members\n".format(dp, len(members)))
 
             # Set FBX export options
             mel.eval("FBXResetExport")
@@ -1226,6 +1477,37 @@ class Exporter(object):
         skip_mesh_xforms = skip_mesh_xforms or set()
         trs = ["tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"]
 
+        sys.stderr.write(
+            "[ExportGenie] === prep_for_ue5_fbx_export ===\n")
+        sys.stderr.write(
+            "[ExportGenie]   geo_roots: {}\n".format(geo_roots))
+        sys.stderr.write(
+            "[ExportGenie]   rig_roots: {}\n".format(rig_roots))
+        sys.stderr.write(
+            "[ExportGenie]   frame range: {} - {}\n".format(
+                start_frame, end_frame))
+        sys.stderr.write(
+            "[ExportGenie]   camera: {}\n".format(camera))
+        sys.stderr.write(
+            "[ExportGenie]   skip_mesh_xforms: {}\n".format(
+                skip_mesh_xforms))
+
+        # --- Import references so nodes become editable ---
+        # Referenced nodes are read-only; importing converts them to
+        # local nodes.  Safe because caller wraps in an undo chunk.
+        all_refs = cmds.ls(type="reference") or []
+        refs_imported = 0
+        for ref_node in all_refs:
+            if ref_node == "sharedReferenceNode":
+                continue
+            try:
+                cmds.file(referenceNode=ref_node, importReference=True)
+                refs_imported += 1
+            except Exception:
+                pass
+        if refs_imported:
+            self.log("Importing references...")
+
         # --- Step 0: Bake camera animation ---
         if camera and cmds.objExists(camera):
             for a in trs:
@@ -1246,7 +1528,10 @@ class Exporter(object):
             self.log("Baking camera animation...")
 
         # --- Step 1: Bake animation to skeleton joints ---
-        # Must happen first while constraints are still live
+        # Must happen first while constraints are still live.
+        # Collect joints from rig_roots AND from skinCluster influences
+        # on geo_roots.  The deformation skeleton may live outside the
+        # rig hierarchy (e.g. GWoman_Joint_GRP vs GenWoman_rig_hrc).
         all_joints = []
         for root in (rig_roots or []):
             if cmds.objExists(root):
@@ -1257,6 +1542,86 @@ class Exporter(object):
                 all_joints.extend(joints)
                 if cmds.objectType(root) == "joint":
                     all_joints.append(root)
+
+        # Also discover joints that are skin influences on exported
+        # geo but live outside the rig_roots hierarchy.
+        skin_influence_roots = set()
+        for geo_root in (geo_roots or []):
+            if not cmds.objExists(geo_root):
+                continue
+            descendants = cmds.listRelatives(
+                geo_root, allDescendents=True, type="transform",
+                fullPath=True
+            ) or []
+            for desc in [cmds.ls(geo_root, long=True)[0]] + descendants:
+                shapes = cmds.listRelatives(
+                    desc, shapes=True, type="mesh", fullPath=True
+                ) or []
+                if not shapes:
+                    continue
+                history = cmds.listHistory(
+                    desc, pruneDagObjects=True) or []
+                for h in history:
+                    if cmds.objectType(h) == "skinCluster":
+                        influences = cmds.skinCluster(
+                            h, query=True, influence=True
+                        ) or []
+                        # Resolve to long paths
+                        influences = [
+                            p for i in influences
+                            for p in (cmds.ls(i, long=True) or [i])]
+                        for inf in influences:
+                            # Walk up to find the topmost joint or
+                            # the first non-joint parent's child
+                            current = inf
+                            while True:
+                                parent = cmds.listRelatives(
+                                    current, parent=True,
+                                    fullPath=True
+                                )
+                                if (not parent
+                                        or cmds.objectType(
+                                            parent[0]) != "joint"):
+                                    break
+                                current = parent[0]
+                            skin_influence_roots.add(current)
+
+        # Add any skin influence joints not already covered by
+        # rig_roots
+        rig_root_set = set()
+        for root in (rig_roots or []):
+            if cmds.objExists(root):
+                rig_root_set.update(
+                    cmds.ls(root, long=True) or [])
+        added_from_skin = 0
+        for inf_root in skin_influence_roots:
+            # Check if this joint is already a descendant of
+            # a rig_root
+            already_covered = False
+            long_inf = (cmds.ls(inf_root, long=True) or [inf_root])[0]
+            for rr in rig_root_set:
+                if long_inf.startswith(rr + "|"):
+                    already_covered = True
+                    break
+            if not already_covered:
+                extra_joints = cmds.listRelatives(
+                    inf_root, allDescendents=True, type="joint",
+                    fullPath=True
+                ) or []
+                if cmds.objectType(inf_root) == "joint":
+                    extra_joints.append(
+                        (cmds.ls(inf_root, long=True) or [inf_root])[0])
+                all_joints.extend(extra_joints)
+                added_from_skin += len(extra_joints)
+        if added_from_skin:
+            sys.stderr.write(
+                "[ExportGenie]   Added {} joints from skin "
+                "influences outside rig_roots\n".format(
+                    added_from_skin))
+            sys.stderr.write(
+                "[ExportGenie]   Skin influence roots: "
+                "{}\n".format(list(skin_influence_roots)))
+
         # De-duplicate preserving order
         seen = set()
         unique_joints = []
@@ -1266,7 +1631,249 @@ class Exporter(object):
                 unique_joints.append(j)
         all_joints = unique_joints
 
+        # Also bake TRS on non-skinned mesh transforms under
+        # geo_roots.  These may be driven by constraints, direct
+        # connections, expressions, or parenting to animated
+        # transforms (e.g. eyeball meshes following eye joints).
+        # Baking captures the animation regardless of the driving
+        # mechanism, so it survives constraint removal in Step 2.
+        nonskinned_meshes = []
+        for geo_root in (geo_roots or []):
+            if not cmds.objExists(geo_root):
+                continue
+            descendants = cmds.listRelatives(
+                geo_root, allDescendents=True, type="transform",
+                fullPath=True
+            ) or []
+            for desc in [cmds.ls(geo_root, long=True)[0]] + descendants:
+                if desc in skip_mesh_xforms:
+                    continue
+                shapes = cmds.listRelatives(
+                    desc, shapes=True, type="mesh", fullPath=True
+                ) or []
+                if not shapes:
+                    continue
+                # Skip skinned meshes — they animate via skeleton
+                history = cmds.listHistory(
+                    desc, pruneDagObjects=True) or []
+                if any(cmds.objectType(h) == "skinCluster"
+                       for h in history):
+                    continue
+                nonskinned_meshes.append(desc)
+
+        if nonskinned_meshes:
+            sys.stderr.write(
+                "[ExportGenie]   Baking {} non-skinned mesh "
+                "transform(s)\n".format(len(nonskinned_meshes)))
+
+            # --- PRE-BAKE DIAGNOSTICS ---
+            for cm in nonskinned_meshes:
+                short = cm.split("|")[-1]
+                sys.stderr.write(
+                    "[ExportGenie]   DIAG '{}' PRE-BAKE:\n".format(
+                        short))
+                # Parent
+                par = cmds.listRelatives(
+                    cm, parent=True, fullPath=True)
+                sys.stderr.write(
+                    "[ExportGenie]     parent: {}\n".format(
+                        par[0] if par else "NONE"))
+                # World-space position at start frame
+                cmds.currentTime(int(start_frame), edit=True)
+                ws_a = cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                sys.stderr.write(
+                    "[ExportGenie]     world pos @ {}: "
+                    "{:.3f} {:.3f} {:.3f}\n".format(
+                        int(start_frame),
+                        ws_a[0], ws_a[1], ws_a[2]))
+                # World-space position at end frame
+                cmds.currentTime(int(end_frame), edit=True)
+                ws_b = cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                sys.stderr.write(
+                    "[ExportGenie]     world pos @ {}: "
+                    "{:.3f} {:.3f} {:.3f}\n".format(
+                        int(end_frame),
+                        ws_b[0], ws_b[1], ws_b[2]))
+                # Connections on TRS channels
+                for a in trs:
+                    plug = "{}.{}".format(cm, a)
+                    conns = cmds.listConnections(
+                        plug, source=True, destination=False,
+                        plugs=True, skipConversionNodes=True
+                    ) or []
+                    if conns:
+                        for src in conns:
+                            src_node = src.split(".")[0]
+                            sys.stderr.write(
+                                "[ExportGenie]     {}: {} "
+                                "({})\n".format(
+                                    a, src,
+                                    cmds.nodeType(src_node)))
+
+                # Check for constraint children
+                for ctype in ["parentConstraint",
+                              "pointConstraint",
+                              "orientConstraint",
+                              "aimConstraint"]:
+                    cons = cmds.listRelatives(
+                        cm, children=True, type=ctype,
+                        fullPath=True
+                    ) or []
+                    for c in cons:
+                        targets = cmds.parentConstraint(
+                            c, query=True, targetList=True
+                        ) if ctype == "parentConstraint" else []
+                        sys.stderr.write(
+                            "[ExportGenie]     constraint: {} "
+                            "({}), targets: {}\n".format(
+                                c.split("|")[-1], ctype,
+                                targets))
+
+            cmds.currentTime(int(start_frame), edit=True)
+
+            # Unlock and bake TRS
+            for cm in nonskinned_meshes:
+                for a in trs:
+                    try:
+                        cmds.setAttr(
+                            "{}.{}".format(cm, a),
+                            lock=False, keyable=True, channelBox=True)
+                    except Exception:
+                        pass
+            cmds.bakeResults(
+                nonskinned_meshes,
+                t=(int(start_frame), int(end_frame)),
+                at=trs,
+                simulation=True,
+                preserveOutsideKeys=True,
+                minimizeRotation=True,
+            )
+
+            # --- POST-BAKE DIAGNOSTICS ---
+            for cm in nonskinned_meshes:
+                short = cm.split("|")[-1]
+                sys.stderr.write(
+                    "[ExportGenie]   DIAG '{}' POST-BAKE:\n".format(
+                        short))
+                for a in trs:
+                    plug = "{}.{}".format(cm, a)
+                    conns = cmds.listConnections(
+                        plug, source=True, destination=False,
+                        plugs=True, skipConversionNodes=True
+                    ) or []
+                    if conns:
+                        for src in conns:
+                            src_node = src.split(".")[0]
+                            sys.stderr.write(
+                                "[ExportGenie]     {}: {} "
+                                "({})\n".format(
+                                    a, src,
+                                    cmds.nodeType(src_node)))
+                    else:
+                        val = cmds.getAttr(plug)
+                        sys.stderr.write(
+                            "[ExportGenie]     {}: NO CONNECTION "
+                            "(static={:.4f})\n".format(a, val))
+
+            # Disconnect non-animCurve sources so baked curves
+            # are the sole driver.  bakeResults may leave the
+            # original constraint output connected alongside
+            # the new anim curve — when Step 2 deletes the
+            # constraint, the channel can lose its driver.
+            disconnected_count = 0
+            for cm in nonskinned_meshes:
+                for a in trs:
+                    plug = "{}.{}".format(cm, a)
+                    conns = cmds.listConnections(
+                        plug, source=True, destination=False,
+                        plugs=True, skipConversionNodes=True
+                    ) or []
+                    for src_plug in conns:
+                        src_node = src_plug.split(".")[0]
+                        if cmds.nodeType(
+                                src_node).startswith("animCurve"):
+                            continue
+                        try:
+                            cmds.disconnectAttr(src_plug, plug)
+                            disconnected_count += 1
+                            sys.stderr.write(
+                                "[ExportGenie]     disconnected: "
+                                "{} -> {}\n".format(
+                                    src_plug, plug))
+                        except Exception as exc:
+                            sys.stderr.write(
+                                "[ExportGenie]     FAILED to "
+                                "disconnect {} -> {}: {}\n".format(
+                                    src_plug, plug, exc))
+
+            # --- POST-DISCONNECT DIAGNOSTICS ---
+            sys.stderr.write(
+                "[ExportGenie]   Disconnected {} non-animCurve "
+                "source(s)\n".format(disconnected_count))
+            for cm in nonskinned_meshes:
+                short = cm.split("|")[-1]
+                sys.stderr.write(
+                    "[ExportGenie]   DIAG '{}' POST-DISCONNECT"
+                    ":\n".format(short))
+                # Verify world pos still correct
+                cmds.currentTime(int(start_frame), edit=True)
+                ws_a = cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                cmds.currentTime(int(end_frame), edit=True)
+                ws_b = cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                sys.stderr.write(
+                    "[ExportGenie]     world pos @ {}: "
+                    "{:.3f} {:.3f} {:.3f}\n".format(
+                        int(start_frame),
+                        ws_a[0], ws_a[1], ws_a[2]))
+                sys.stderr.write(
+                    "[ExportGenie]     world pos @ {}: "
+                    "{:.3f} {:.3f} {:.3f}\n".format(
+                        int(end_frame),
+                        ws_b[0], ws_b[1], ws_b[2]))
+                for a in trs:
+                    plug = "{}.{}".format(cm, a)
+                    conns = cmds.listConnections(
+                        plug, source=True, destination=False,
+                        plugs=True, skipConversionNodes=True
+                    ) or []
+                    if conns:
+                        for src in conns:
+                            src_node = src.split(".")[0]
+                            sys.stderr.write(
+                                "[ExportGenie]     {}: {} "
+                                "({})\n".format(
+                                    a, src,
+                                    cmds.nodeType(src_node)))
+                    else:
+                        val = cmds.getAttr(plug)
+                        sys.stderr.write(
+                            "[ExportGenie]     {}: NO CONNECTION "
+                            "(static={:.4f})\n".format(a, val))
+            cmds.currentTime(int(start_frame), edit=True)
+            sys.stderr.write(
+                "[ExportGenie]   Non-skinned mesh bake complete\n")
+
+        sys.stderr.write(
+            "[ExportGenie] Step 1: Bake animation\n")
         if all_joints:
+            sys.stderr.write(
+                "[ExportGenie]   Found {} joints to bake\n".format(
+                    len(all_joints)))
+            for jnt in all_joints[:10]:
+                sys.stderr.write(
+                    "[ExportGenie]     {}\n".format(jnt))
+            if len(all_joints) > 10:
+                sys.stderr.write(
+                    "[ExportGenie]     ... and {} more\n".format(
+                        len(all_joints) - 10))
             self.log("Baking animation...")
             # Unlock TRS channels before baking
             for jnt in all_joints:
@@ -1285,6 +1892,12 @@ class Exporter(object):
                 preserveOutsideKeys=True,
                 minimizeRotation=True,
             )
+            sys.stderr.write(
+                "[ExportGenie]   Bake complete\n")
+        else:
+            sys.stderr.write(
+                "[ExportGenie]   WARNING: No joints found under "
+                "rig_roots!\n")
 
         # --- Step 2: Remove constraints ---
         constraint_types = [
@@ -1347,6 +1960,9 @@ class Exporter(object):
         all_mesh_xforms = []
         for root in all_roots:
             if not cmds.objExists(root):
+                sys.stderr.write(
+                    "[ExportGenie] Step 4: root '{}' does not "
+                    "exist!\n".format(root))
                 continue
             descendants = cmds.listRelatives(
                 root, allDescendents=True, type="transform",
@@ -1359,9 +1975,40 @@ class Exporter(object):
                 if shapes and desc not in all_mesh_xforms:
                     all_mesh_xforms.append(desc)
 
+        sys.stderr.write(
+            "[ExportGenie] Step 4: Delete non-deformer history\n")
+        sys.stderr.write(
+            "[ExportGenie]   Found {} mesh transforms\n".format(
+                len(all_mesh_xforms)))
+        # Log skinCluster status for each mesh
+        for mx in all_mesh_xforms:
+            history = cmds.listHistory(
+                mx, pruneDagObjects=True) or []
+            skins = [h for h in history
+                     if cmds.objectType(h) == "skinCluster"]
+            short = mx.split("|")[-1]
+            if skins:
+                for sc in skins:
+                    inf_count = len(
+                        cmds.skinCluster(
+                            sc, query=True, influence=True
+                        ) or [])
+                    sys.stderr.write(
+                        "[ExportGenie]     '{}' -> skinCluster '{}' "
+                        "({} influences)\n".format(
+                            short, sc, inf_count))
+            else:
+                sys.stderr.write(
+                    "[ExportGenie]     '{}' -> no skinCluster\n".format(
+                        short))
+
         history_deleted = 0
+        baked_mesh_set = set(
+            nonskinned_meshes) if nonskinned_meshes else set()
         for mesh_xform in all_mesh_xforms:
             if mesh_xform in skip_mesh_xforms:
+                continue
+            if mesh_xform in baked_mesh_set:
                 continue
             try:
                 cmds.bakePartialHistory(
@@ -1372,10 +2019,40 @@ class Exporter(object):
         if history_deleted:
             self.log("Cleaning up history...")
 
+        # Verify skinClusters survived Step 4
+        sys.stderr.write(
+            "[ExportGenie] Step 4 POST-CHECK: skinCluster status "
+            "after history bake\n")
+        for mx in all_mesh_xforms:
+            history = cmds.listHistory(
+                mx, pruneDagObjects=True) or []
+            skins = [h for h in history
+                     if cmds.objectType(h) == "skinCluster"]
+            short = mx.split("|")[-1]
+            if skins:
+                for sc in skins:
+                    inf_count = len(
+                        cmds.skinCluster(
+                            sc, query=True, influence=True
+                        ) or [])
+                    sys.stderr.write(
+                        "[ExportGenie]     '{}' -> skinCluster '{}' "
+                        "({} influences) OK\n".format(
+                            short, sc, inf_count))
+            else:
+                sys.stderr.write(
+                    "[ExportGenie]     '{}' -> LOST skinCluster "
+                    "after Step 4!\n".format(short))
+
         # --- Step 5: Freeze transforms on non-skinned non-joint geo ---
+        # Build set of meshes with baked anim curves (from the
+        # non-skinned mesh bake above) so we don't freeze them.
+        baked_mesh_set = set(nonskinned_meshes) if nonskinned_meshes else set()
         transforms_frozen = 0
         for mesh_xform in all_mesh_xforms:
             if mesh_xform in skip_mesh_xforms:
+                continue
+            if mesh_xform in baked_mesh_set:
                 continue
             # Skip skinned meshes
             history = cmds.listHistory(
@@ -1400,6 +2077,24 @@ class Exporter(object):
                 pass
         if transforms_frozen:
             self.log("Freezing transforms...")
+
+        # Verify skinClusters survived Step 5
+        sys.stderr.write(
+            "[ExportGenie] Step 5 POST-CHECK: skinCluster status "
+            "after freeze transforms\n")
+        sc_after_5 = cmds.ls(type="skinCluster") or []
+        sys.stderr.write(
+            "[ExportGenie]   Total skinClusters in scene: "
+            "{}\n".format(len(sc_after_5)))
+        for sc in sc_after_5:
+            inf_count = len(
+                cmds.skinCluster(
+                    sc, query=True, influence=True) or [])
+            geo = cmds.skinCluster(
+                sc, query=True, geometry=True) or []
+            sys.stderr.write(
+                "[ExportGenie]     '{}': {} influences, "
+                "geo={}\n".format(sc, inf_count, geo))
 
         # --- Step 6: Strip namespaces ---
         all_ns = cmds.namespaceInfo(
@@ -1439,6 +2134,51 @@ class Exporter(object):
         if namespaces_stripped:
             self.log("Stripping namespaces...")
 
+        # Verify skinClusters survived Step 6
+        sys.stderr.write(
+            "[ExportGenie] Step 6 POST-CHECK: skinCluster status "
+            "after namespace strip\n")
+        sc_after_6 = cmds.ls(type="skinCluster") or []
+        sys.stderr.write(
+            "[ExportGenie]   Total skinClusters in scene: "
+            "{}\n".format(len(sc_after_6)))
+        for sc in sc_after_6:
+            inf_count = len(
+                cmds.skinCluster(
+                    sc, query=True, influence=True) or [])
+            geo = cmds.skinCluster(
+                sc, query=True, geometry=True) or []
+            sys.stderr.write(
+                "[ExportGenie]     '{}': {} influences, "
+                "geo={}\n".format(sc, inf_count, geo))
+
+        # --- Step 7: Delete ALL dagPose nodes ---
+        # dagPose (bindPose) nodes store the rest-pose of each
+        # influence and every ancestor transform must be registered.
+        # Complex rigs often have incomplete dagPose definitions that
+        # cause the FBX exporter to fail silently (meshes export but
+        # don't animate).  Patching existing dagPose nodes with
+        # addToPose can corrupt the stored bind pose.
+        #
+        # The safest approach: delete every dagPose in the scene.
+        # The FBX plugin's built-in bake (FBXExportBakeComplexAnimation)
+        # will re-evaluate animation from the baked anim curves on
+        # joints — it does not need a dagPose to do this.  Removing
+        # dagPose eliminates "not part of the BindPose definition"
+        # errors entirely.
+        sys.stderr.write(
+            "[ExportGenie] Step 7: Delete dagPose nodes\n")
+        dag_poses = cmds.ls(type="dagPose") or []
+        if dag_poses:
+            sys.stderr.write(
+                "[ExportGenie]   Deleting {} dagPose node(s): "
+                "{}\n".format(len(dag_poses), dag_poses))
+            cmds.delete(dag_poses)
+            self.log("Removing bind pose nodes...")
+        else:
+            sys.stderr.write(
+                "[ExportGenie]   No dagPose nodes found\n")
+
     def detect_vertex_anim_meshes(self, geo_roots, start_frame, end_frame):
         """Detect meshes with per-vertex animation under geo_roots.
 
@@ -1475,6 +2215,17 @@ class Exporter(object):
                 ]
                 if shapes and desc not in mesh_xforms:
                     mesh_xforms.append(desc)
+
+        # Exclude meshes driven by a skinCluster — their vertices move
+        # due to skeletal deformation, not Alembic vertex caching.
+        skinned = set()
+        for xform in mesh_xforms:
+            history = cmds.listHistory(
+                xform, pruneDagObjects=True) or []
+            if any(cmds.objectType(h) == "skinCluster"
+                   for h in history):
+                skinned.add(xform)
+        mesh_xforms = [m for m in mesh_xforms if m not in skinned]
 
         vertex_anim_set = set()
         if not mesh_xforms:
@@ -1647,7 +2398,12 @@ class Exporter(object):
                          far_clip=800000,
                          png_mode=False,
                          mp4_mode=False,
-                         mp4_output=None):
+                         mp4_output=None,
+                         show_hud=False,
+                         composite_plate_path=None,
+                         composite_color_path=None,
+                         composite_matte_path=None,
+                         composite_tmp_dir=None):
         """Export a QC playblast at 1920x1080.
 
         Supports H.264 .mov (via QuickTime), PNG image sequence, or
@@ -1685,29 +2441,38 @@ class Exporter(object):
             if mp4_mode:
                 pb_format = "image"
                 if not self._find_ffmpeg():
+                    if sys.platform == "win32":
+                        fix_msg = (
+                            "How to fix:\n"
+                            "Re-install Export Genie by dragging "
+                            "the .py file (from the folder "
+                            "containing bin/) into Maya's "
+                            "viewport.\n\n"
+                            "Expected location:\n"
+                            "{}".format(
+                                os.path.join(
+                                    os.path.dirname(
+                                        os.path.abspath(__file__)),
+                                    "bin", "win", "ffmpeg.exe")))
+                    else:
+                        fix_msg = (
+                            "How to fix:\n"
+                            "Install ffmpeg via your system "
+                            "package manager:\n"
+                            "  macOS:  brew install ffmpeg\n"
+                            "  Linux:  sudo apt install ffmpeg")
                     cmds.confirmDialog(
                         title="Cannot Create QC Movie",
                         message=(
                             "Export Genie {}\n\n"
-                            "ffmpeg.exe was not found.\n\n"
-                            "The H.264 (.mp4 Win) format requires "
-                            "ffmpeg.exe to be installed alongside "
-                            "this script.\n\n"
-                            "How to fix:\n"
-                            "Re-install Export Genie by dragging the "
-                            ".py file (from the folder containing "
-                            "bin/) into Maya's viewport.\n\n"
-                            "Expected location:\n"
-                            "{}".format(
-                                TOOL_VERSION,
-                                os.path.join(
-                                    os.path.dirname(
-                                        os.path.abspath(__file__)),
-                                    "bin", "win", "ffmpeg.exe"))),
+                            "ffmpeg was not found.\n\n"
+                            "The H.264 .mp4 format requires "
+                            "ffmpeg.\n\n"
+                            "{}".format(TOOL_VERSION, fix_msg)),
                         button=["OK"],
                     )
                     return False
-                self.log("Checking for ffmpeg.exe...")
+                self.log("Checking for ffmpeg...")
             elif png_mode:
                 pb_format = "image"
                 self.log("Setting up viewport...")
@@ -1826,6 +2591,79 @@ class Exporter(object):
             # Clear selection so no highlight appears in the playblast
             original_sel = cmds.ls(selection=True)
             cmds.select(clear=True)
+
+            # --- HUD overlay for frame / focal length ---
+            original_hud_vis = {}
+            hud_names_to_remove = []
+            original_font_mode = None
+            original_font_size = None
+
+            if show_hud:
+                # Bump VP2.0 HUD font to max (24) for readability
+                try:
+                    original_font_mode = cmds.displayPref(
+                        query=True, fontSettingMode=True)
+                    original_font_size = cmds.displayPref(
+                        query=True, defaultFontSize=True)
+                    cmds.displayPref(fontSettingMode=2,
+                                     defaultFontSize=24)
+                    cmds.refresh(force=True)
+                except Exception:
+                    pass
+
+                # Save and hide all existing HUDs
+                existing_huds = (
+                    cmds.headsUpDisplay(listHeadsUpDisplays=True) or [])
+                for hud_name in existing_huds:
+                    try:
+                        original_hud_vis[hud_name] = cmds.headsUpDisplay(
+                            hud_name, query=True, visible=True)
+                        cmds.headsUpDisplay(
+                            hud_name, edit=True, visible=False)
+                    except Exception:
+                        pass
+
+                # Resolve camera shape for focal length
+                hud_cam_shape = None
+                if camera:
+                    cam_shapes = cmds.listRelatives(
+                        camera, shapes=True, type="camera") or []
+                    if cam_shapes:
+                        hud_cam_shape = cam_shapes[0]
+
+                # Frame number HUD (bottom-center)
+                hud_frame = "ExportGenie_FrameHUD"
+                if cmds.headsUpDisplay(hud_frame, exists=True):
+                    cmds.headsUpDisplay(hud_frame, remove=True)
+                cmds.headsUpDisplay(
+                    hud_frame, section=7,
+                    block=cmds.headsUpDisplay(nextFreeBlock=7),
+                    label="Frame:",
+                    labelFontSize="large",
+                    dataFontSize="large",
+                    blockSize="medium",
+                    command=lambda: int(cmds.currentTime(query=True)),
+                    attachToRefresh=True,
+                )
+                hud_names_to_remove.append(hud_frame)
+
+                # Focal length HUD (bottom-right)
+                if hud_cam_shape:
+                    hud_fl = "ExportGenie_FocalLengthHUD"
+                    if cmds.headsUpDisplay(hud_fl, exists=True):
+                        cmds.headsUpDisplay(hud_fl, remove=True)
+                    fl_shape = hud_cam_shape
+                    cmds.headsUpDisplay(
+                        hud_fl, section=9,
+                        block=cmds.headsUpDisplay(nextFreeBlock=9),
+                        label="FL:", labelFontSize="large",
+                        dataFontSize="large", blockSize="medium",
+                        command=lambda: cmds.getAttr(
+                            fl_shape + ".focalLength"),
+                        attachToRefresh=True,
+                        decimalPrecision=1,
+                    )
+                    hud_names_to_remove.append(hud_fl)
 
             # Playblast colour management — set once and persist.
             # When render_raw_srgb is True we ensure the Preferences >
@@ -1975,6 +2813,7 @@ class Exporter(object):
             original_image_plane = None
             original_nurbs_curves = None
             mm_meshes = []
+            composite_rendered = False
 
             if matchmove_geo and model_panel and not raw_playblast:
                 # 1. Force all display layers visible so nothing is
@@ -2087,9 +2926,8 @@ class Exporter(object):
                 except Exception:
                     pass
 
-                # 6. UV checker overlay
+                # 6. Collect meshes and save original shading
                 try:
-                    # Collect mesh transforms under the geo roots
                     for geo_root in matchmove_geo:
                         descendants = cmds.listRelatives(
                             geo_root, allDescendents=True,
@@ -2101,7 +2939,6 @@ class Exporter(object):
                                     mm_meshes.append(m)
                             except Exception:
                                 pass
-                    # Resolve to transforms for shader assignment
                     mm_transforms = list(set(
                         cmds.listRelatives(
                             mm_meshes, parent=True,
@@ -2109,11 +2946,10 @@ class Exporter(object):
                     )) if mm_meshes else []
 
                     sys.stderr.write(
-                        "[MME] UV Checker: {} meshes, "
+                        "[MME] Composite: {} meshes, "
                         "{} transforms found\n".format(
                             len(mm_meshes), len(mm_transforms)))
 
-                    # Save original shading assignments
                     for mesh in mm_meshes:
                         try:
                             sgs = cmds.listConnections(
@@ -2123,124 +2959,423 @@ class Exporter(object):
                         except Exception:
                             pass
 
-                    # Create checker shader network
-                    chk_lambert = cmds.shadingNode(
-                        "lambert", asShader=True,
-                        name="mme_uvChecker_mtl")
-                    checker_nodes.append(chk_lambert)
-                    transp = 1.0 - (checker_opacity / 100.0)
-                    cmds.setAttr(
-                        "{}.transparency".format(chk_lambert),
-                        transp, transp, transp, type="double3")
+                    # Check ffmpeg + composite paths for multi-pass
+                    use_composite = (
+                        bool(self._find_ffmpeg())
+                        and composite_plate_path
+                        and composite_color_path
+                        and composite_matte_path)
+                    if not use_composite:
+                        sys.stderr.write(
+                            "[MME] ffmpeg not found — falling back "
+                            "to single-pass checker overlay\n")
+                        self.log(
+                            "ffmpeg not found — using single-pass "
+                            "checker overlay.")
 
-                    chk_sg = cmds.sets(
-                        renderable=True, noSurfaceShader=True,
-                        empty=True, name="mme_uvChecker_SG")
-                    checker_nodes.append(chk_sg)
-                    cmds.connectAttr(
-                        "{}.outColor".format(chk_lambert),
-                        "{}.surfaceShader".format(chk_sg),
-                        force=True)
+                    if use_composite:
+                        # --- Multi-pass composite mode ---
+                        # Save original background colors
+                        original_bg = cmds.displayRGBColor(
+                            "background", query=True)
+                        original_bg_top = cmds.displayRGBColor(
+                            "backgroundTop", query=True)
+                        original_bg_bottom = cmds.displayRGBColor(
+                            "backgroundBottom", query=True)
+                        original_gradient = cmds.displayPref(
+                            query=True, displayGradient=True)
 
-                    chk_color = checker_color or (0.75, 0.75, 0.75)
-                    chk_color2 = (
-                        chk_color[0] * 0.33,
-                        chk_color[1] * 0.33,
-                        chk_color[2] * 0.33,
-                    )
-                    chk_tex = cmds.shadingNode(
-                        "checker", asTexture=True,
-                        name="mme_uvChecker_tex")
-                    checker_nodes.append(chk_tex)
-                    cmds.setAttr(
-                        "{}.color1".format(chk_tex),
-                        chk_color[0], chk_color[1], chk_color[2],
-                        type="double3")
-                    cmds.setAttr(
-                        "{}.color2".format(chk_tex),
-                        chk_color2[0], chk_color2[1], chk_color2[2],
-                        type="double3")
+                        # Disable useDefaultMaterial
+                        original_use_default_mtl = cmds.modelEditor(
+                            model_panel, query=True,
+                            useDefaultMaterial=True)
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            useDefaultMaterial=False)
 
-                    chk_place = cmds.shadingNode(
-                        "place2dTexture", asUtility=True,
-                        name="mme_uvChecker_place")
-                    checker_nodes.append(chk_place)
-                    repeat = max(1, 33 - checker_scale)
-                    cmds.setAttr("{}.repeatU".format(chk_place),
-                                 repeat)
-                    cmds.setAttr("{}.repeatV".format(chk_place),
-                                 repeat)
+                        # Enable textured display with default light
+                        original_display_textures = cmds.modelEditor(
+                            model_panel, query=True,
+                            displayTextures=True)
+                        original_display_lights = cmds.modelEditor(
+                            model_panel, query=True,
+                            displayLights=True)
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            displayTextures=True,
+                            displayLights="default")
 
-                    # Standard place2dTexture -> checker connections
-                    # (VP2.0 requires the full set for proper display)
-                    for attr in (
-                        "coverage", "translateFrame", "rotateFrame",
-                        "mirrorU", "mirrorV", "stagger", "wrapU",
-                        "wrapV", "repeatUV", "offset", "rotateUV",
-                        "noiseUV", "vertexUvOne", "vertexUvTwo",
-                        "vertexUvThree", "vertexCameraOne",
-                    ):
-                        if (cmds.attributeQuery(
-                                attr, node=chk_place, exists=True)
-                                and cmds.attributeQuery(
-                                    attr, node=chk_tex, exists=True)):
-                            cmds.connectAttr(
-                                "{}.{}".format(chk_place, attr),
-                                "{}.{}".format(chk_tex, attr),
-                                force=True)
-                    cmds.connectAttr(
-                        "{}.outUV".format(chk_place),
-                        "{}.uvCoord".format(chk_tex),
-                        force=True)
-                    cmds.connectAttr(
-                        "{}.outUvFilterSize".format(chk_place),
-                        "{}.uvFilterSize".format(chk_tex),
-                        force=True)
-                    cmds.connectAttr(
-                        "{}.outColor".format(chk_tex),
-                        "{}.color".format(chk_lambert),
-                        force=True)
+                        # Create temp directories
+                        composite_plate_dir = os.path.dirname(
+                            composite_plate_path)
+                        composite_color_dir = os.path.dirname(
+                            composite_color_path)
+                        composite_matte_dir = os.path.dirname(
+                            composite_matte_path)
+                        for d in (composite_plate_dir,
+                                  composite_color_dir,
+                                  composite_matte_dir):
+                            if not os.path.exists(d):
+                                os.makedirs(d)
 
-                    # Assign checker via hyperShade (the standard Maya
-                    # API for shader assignment — more reliable than
-                    # cmds.sets for VP2.0 texture display).
-                    if mm_transforms:
-                        cmds.select(mm_transforms, replace=True)
-                        cmds.hyperShade(assign=chk_lambert)
-                        cmds.select(clear=True)
+                        # --- Pass 1: Plate (background only) ---
+                        self.log("Rendering plate pass...")
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            imagePlane=True, polymeshes=False,
+                            nurbsSurfaces=False,
+                            subdivSurfaces=False)
+                        cmds.refresh(force=True)
+                        cmds.playblast(
+                            filename=composite_plate_path,
+                            format="image",
+                            compression="png",
+                            startTime=start_frame,
+                            endTime=end_frame,
+                            forceOverwrite=True,
+                            sequenceTime=False,
+                            clearCache=True,
+                            viewer=False,
+                            showOrnaments=show_hud,
+                            framePadding=4,
+                            percent=100,
+                            quality=100,
+                            widthHeight=[1920, 1080],
+                        )
 
-                    sys.stderr.write(
-                        "[MME] UV Checker: assigned to "
-                        "{} transforms\n".format(len(mm_transforms)))
+                        # --- Pass 2: Solid Color Mesh ---
+                        self.log("Rendering color pass...")
+                        # Black background, no gradient
+                        cmds.displayRGBColor(
+                            "background", 0, 0, 0)
+                        cmds.displayRGBColor(
+                            "backgroundTop", 0, 0, 0)
+                        cmds.displayRGBColor(
+                            "backgroundBottom", 0, 0, 0)
+                        cmds.displayPref(displayGradient=False)
 
-                    # Disable useDefaultMaterial so our checker
-                    # actually shows (not the default grey lambert)
-                    original_use_default_mtl = cmds.modelEditor(
-                        model_panel, query=True,
-                        useDefaultMaterial=True)
-                    cmds.modelEditor(
-                        model_panel, edit=True,
-                        useDefaultMaterial=False)
+                        # Flat lighting — no viewport shading or
+                        # shadows so self-shadowing doesn't affect
+                        # the composite.
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            displayLights="flat",
+                            shadows=False)
 
-                    # Enable textured display with default lighting
-                    original_display_textures = cmds.modelEditor(
-                        model_panel, query=True, displayTextures=True)
-                    original_display_lights = cmds.modelEditor(
-                        model_panel, query=True, displayLights=True)
-                    cmds.modelEditor(
-                        model_panel, edit=True,
-                        displayTextures=True,
-                        displayLights="default")
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            imagePlane=False, polymeshes=True,
+                            nurbsSurfaces=True,
+                            subdivSurfaces=True)
 
-                    # Force VP2.0 to fully rebuild its render cache
-                    # so the new procedural checker texture is
-                    # evaluated and ready for playblast capture.
-                    cmds.ogs(reset=True)
-                    cmds.currentTime(
-                        cmds.currentTime(query=True))
-                    cmds.refresh(force=True)
+                        # Create solid Lambert
+                        solid_lambert = cmds.shadingNode(
+                            "lambert", asShader=True,
+                            name="mme_solidColor_mtl")
+                        checker_nodes.append(solid_lambert)
+                        solid_sg = cmds.sets(
+                            renderable=True,
+                            noSurfaceShader=True,
+                            empty=True,
+                            name="mme_solidColor_SG")
+                        checker_nodes.append(solid_sg)
+                        cmds.connectAttr(
+                            "{}.outColor".format(solid_lambert),
+                            "{}.surfaceShader".format(solid_sg),
+                            force=True)
+                        chk_color = checker_color or (0.75, 0.75, 0.75)
+                        cmds.setAttr(
+                            "{}.color".format(solid_lambert),
+                            chk_color[0], chk_color[1], chk_color[2],
+                            type="double3")
+                        cmds.setAttr(
+                            "{}.transparency".format(solid_lambert),
+                            0, 0, 0, type="double3")
+
+                        if mm_transforms:
+                            cmds.select(mm_transforms, replace=True)
+                            cmds.hyperShade(assign=solid_lambert)
+                            cmds.select(clear=True)
+
+                        cmds.ogs(reset=True)
+                        cmds.refresh(force=True)
+                        cmds.playblast(
+                            filename=composite_color_path,
+                            format="image",
+                            compression="png",
+                            startTime=start_frame,
+                            endTime=end_frame,
+                            forceOverwrite=True,
+                            sequenceTime=False,
+                            clearCache=True,
+                            viewer=False,
+                            showOrnaments=False,
+                            framePadding=4,
+                            percent=100,
+                            quality=100,
+                            widthHeight=[1920, 1080],
+                        )
+
+                        # Restore shading before pass 3
+                        for ms, sg in original_shading.items():
+                            try:
+                                if (cmds.objExists(ms)
+                                        and cmds.objExists(sg)):
+                                    cmds.sets(
+                                        ms, edit=True,
+                                        forceElement=sg)
+                            except Exception:
+                                pass
+                        # Delete solid shader
+                        for node in (solid_sg, solid_lambert):
+                            try:
+                                if cmds.objExists(node):
+                                    cmds.delete(node)
+                            except Exception:
+                                pass
+                        checker_nodes = [
+                            n for n in checker_nodes
+                            if n not in (solid_lambert, solid_sg)]
+
+                        # --- Pass 3: B&W Checker Matte ---
+                        self.log("Rendering matte pass...")
+                        chk_lambert = cmds.shadingNode(
+                            "lambert", asShader=True,
+                            name="mme_matteCk_mtl")
+                        checker_nodes.append(chk_lambert)
+                        cmds.setAttr(
+                            "{}.transparency".format(chk_lambert),
+                            0, 0, 0, type="double3")
+
+                        chk_sg = cmds.sets(
+                            renderable=True,
+                            noSurfaceShader=True,
+                            empty=True,
+                            name="mme_matteCk_SG")
+                        checker_nodes.append(chk_sg)
+                        cmds.connectAttr(
+                            "{}.outColor".format(chk_lambert),
+                            "{}.surfaceShader".format(chk_sg),
+                            force=True)
+
+                        chk_tex = cmds.shadingNode(
+                            "checker", asTexture=True,
+                            name="mme_matteCk_tex")
+                        checker_nodes.append(chk_tex)
+                        cmds.setAttr(
+                            "{}.color1".format(chk_tex),
+                            1, 1, 1, type="double3")
+                        cmds.setAttr(
+                            "{}.color2".format(chk_tex),
+                            0, 0, 0, type="double3")
+
+                        chk_place = cmds.shadingNode(
+                            "place2dTexture", asUtility=True,
+                            name="mme_matteCk_place")
+                        checker_nodes.append(chk_place)
+                        repeat = max(1, 33 - checker_scale)
+                        cmds.setAttr(
+                            "{}.repeatU".format(chk_place), repeat)
+                        cmds.setAttr(
+                            "{}.repeatV".format(chk_place), repeat)
+
+                        for attr in (
+                            "coverage", "translateFrame",
+                            "rotateFrame",
+                            "mirrorU", "mirrorV", "stagger",
+                            "wrapU", "wrapV", "repeatUV",
+                            "offset", "rotateUV", "noiseUV",
+                            "vertexUvOne", "vertexUvTwo",
+                            "vertexUvThree", "vertexCameraOne",
+                        ):
+                            if (cmds.attributeQuery(
+                                    attr, node=chk_place,
+                                    exists=True)
+                                    and cmds.attributeQuery(
+                                        attr, node=chk_tex,
+                                        exists=True)):
+                                cmds.connectAttr(
+                                    "{}.{}".format(
+                                        chk_place, attr),
+                                    "{}.{}".format(
+                                        chk_tex, attr),
+                                    force=True)
+                        cmds.connectAttr(
+                            "{}.outUV".format(chk_place),
+                            "{}.uvCoord".format(chk_tex),
+                            force=True)
+                        cmds.connectAttr(
+                            "{}.outUvFilterSize".format(chk_place),
+                            "{}.uvFilterSize".format(chk_tex),
+                            force=True)
+                        cmds.connectAttr(
+                            "{}.outColor".format(chk_tex),
+                            "{}.color".format(chk_lambert),
+                            force=True)
+
+                        if mm_transforms:
+                            cmds.select(mm_transforms, replace=True)
+                            cmds.hyperShade(assign=chk_lambert)
+                            cmds.select(clear=True)
+
+                        cmds.ogs(reset=True)
+                        cmds.refresh(force=True)
+                        cmds.playblast(
+                            filename=composite_matte_path,
+                            format="image",
+                            compression="png",
+                            startTime=start_frame,
+                            endTime=end_frame,
+                            forceOverwrite=True,
+                            sequenceTime=False,
+                            clearCache=True,
+                            viewer=False,
+                            showOrnaments=False,
+                            framePadding=4,
+                            percent=100,
+                            quality=100,
+                            widthHeight=[1920, 1080],
+                        )
+
+                        # Restore background
+                        cmds.displayRGBColor(
+                            "background", *original_bg)
+                        cmds.displayRGBColor(
+                            "backgroundTop", *original_bg_top)
+                        cmds.displayRGBColor(
+                            "backgroundBottom", *original_bg_bottom)
+                        cmds.displayPref(
+                            displayGradient=original_gradient)
+
+                        # Restore polymesh visibility for cleanup
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            imagePlane=True, polymeshes=True,
+                            nurbsSurfaces=True,
+                            subdivSurfaces=True)
+
+                        # Flag that composite renders are done;
+                        # the playblast section below will composite
+                        composite_rendered = True
+
+                    else:
+                        # --- Fallback: single-pass checker overlay ---
+                        composite_rendered = False
+
+                        chk_lambert = cmds.shadingNode(
+                            "lambert", asShader=True,
+                            name="mme_uvChecker_mtl")
+                        checker_nodes.append(chk_lambert)
+                        transp = 1.0 - (checker_opacity / 100.0)
+                        cmds.setAttr(
+                            "{}.transparency".format(chk_lambert),
+                            transp, transp, transp, type="double3")
+
+                        chk_sg = cmds.sets(
+                            renderable=True,
+                            noSurfaceShader=True,
+                            empty=True,
+                            name="mme_uvChecker_SG")
+                        checker_nodes.append(chk_sg)
+                        cmds.connectAttr(
+                            "{}.outColor".format(chk_lambert),
+                            "{}.surfaceShader".format(chk_sg),
+                            force=True)
+
+                        chk_color = checker_color or (0.75, 0.75, 0.75)
+                        chk_color2 = (
+                            chk_color[0] * 0.33,
+                            chk_color[1] * 0.33,
+                            chk_color[2] * 0.33,
+                        )
+                        chk_tex = cmds.shadingNode(
+                            "checker", asTexture=True,
+                            name="mme_uvChecker_tex")
+                        checker_nodes.append(chk_tex)
+                        cmds.setAttr(
+                            "{}.color1".format(chk_tex),
+                            chk_color[0], chk_color[1], chk_color[2],
+                            type="double3")
+                        cmds.setAttr(
+                            "{}.color2".format(chk_tex),
+                            chk_color2[0], chk_color2[1],
+                            chk_color2[2],
+                            type="double3")
+
+                        chk_place = cmds.shadingNode(
+                            "place2dTexture", asUtility=True,
+                            name="mme_uvChecker_place")
+                        checker_nodes.append(chk_place)
+                        repeat = max(1, 33 - checker_scale)
+                        cmds.setAttr(
+                            "{}.repeatU".format(chk_place), repeat)
+                        cmds.setAttr(
+                            "{}.repeatV".format(chk_place), repeat)
+
+                        for attr in (
+                            "coverage", "translateFrame",
+                            "rotateFrame",
+                            "mirrorU", "mirrorV", "stagger",
+                            "wrapU", "wrapV", "repeatUV",
+                            "offset", "rotateUV", "noiseUV",
+                            "vertexUvOne", "vertexUvTwo",
+                            "vertexUvThree", "vertexCameraOne",
+                        ):
+                            if (cmds.attributeQuery(
+                                    attr, node=chk_place,
+                                    exists=True)
+                                    and cmds.attributeQuery(
+                                        attr, node=chk_tex,
+                                        exists=True)):
+                                cmds.connectAttr(
+                                    "{}.{}".format(
+                                        chk_place, attr),
+                                    "{}.{}".format(
+                                        chk_tex, attr),
+                                    force=True)
+                        cmds.connectAttr(
+                            "{}.outUV".format(chk_place),
+                            "{}.uvCoord".format(chk_tex),
+                            force=True)
+                        cmds.connectAttr(
+                            "{}.outUvFilterSize".format(chk_place),
+                            "{}.uvFilterSize".format(chk_tex),
+                            force=True)
+                        cmds.connectAttr(
+                            "{}.outColor".format(chk_tex),
+                            "{}.color".format(chk_lambert),
+                            force=True)
+
+                        if mm_transforms:
+                            cmds.select(mm_transforms, replace=True)
+                            cmds.hyperShade(assign=chk_lambert)
+                            cmds.select(clear=True)
+
+                        original_use_default_mtl = cmds.modelEditor(
+                            model_panel, query=True,
+                            useDefaultMaterial=True)
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            useDefaultMaterial=False)
+
+                        original_display_textures = cmds.modelEditor(
+                            model_panel, query=True,
+                            displayTextures=True)
+                        original_display_lights = cmds.modelEditor(
+                            model_panel, query=True,
+                            displayLights=True)
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            displayTextures=True,
+                            displayLights="default")
+
+                        cmds.ogs(reset=True)
+                        cmds.currentTime(
+                            cmds.currentTime(query=True))
+                        cmds.refresh(force=True)
+
                 except Exception as exc:
-                    self._log_error("UV Checker", exc)
+                    self._log_error("MM/FT Checker", exc)
 
             # --- Flat lighting (all playblast paths) ---
             original_flat_lighting = None
@@ -2280,7 +3415,66 @@ class Exporter(object):
 
                 cmds.refresh(force=True)
 
-                if mp4_mode:
+                if composite_rendered:
+                    # Multi-pass composite: 3 passes already rendered,
+                    # now composite them via ffmpeg.
+                    plate_dir = os.path.dirname(
+                        composite_plate_path)
+                    plate_base = os.path.basename(
+                        composite_plate_path)
+                    color_dir = os.path.dirname(
+                        composite_color_path)
+                    color_base = os.path.basename(
+                        composite_color_path)
+                    matte_dir = os.path.dirname(
+                        composite_matte_path)
+                    matte_base = os.path.basename(
+                        composite_matte_path)
+                    opacity_01 = checker_opacity / 100.0
+
+                    if png_mode:
+                        # Composite to PNG sequence
+                        out_dir = os.path.dirname(file_path)
+                        if not os.path.exists(out_dir):
+                            os.makedirs(out_dir)
+                        encode_ok = self._encode_composite(
+                            plate_dir, plate_base,
+                            color_dir, color_base,
+                            matte_dir, matte_base,
+                            start_frame, out_dir,
+                            opacity=opacity_01,
+                            png_output=True)
+                    elif mp4_mode:
+                        encode_ok = self._encode_composite(
+                            plate_dir, plate_base,
+                            color_dir, color_base,
+                            matte_dir, matte_base,
+                            start_frame, mp4_output,
+                            opacity=opacity_01)
+                    else:
+                        # .mov output via composite
+                        encode_ok = self._encode_composite(
+                            plate_dir, plate_base,
+                            color_dir, color_base,
+                            matte_dir, matte_base,
+                            start_frame, file_path,
+                            opacity=opacity_01)
+
+                    if encode_ok:
+                        # Cleanup composite temp dirs
+                        if composite_tmp_dir:
+                            self._cleanup_temp_pngs(
+                                composite_tmp_dir)
+                        # Also remove the mp4 temp dir if it was
+                        # created empty by the caller
+                        if mp4_mode and mp4_output:
+                            mp4_tmp = os.path.dirname(file_path)
+                            self._cleanup_temp_pngs(mp4_tmp)
+                    else:
+                        self.log(
+                            "Composite failed — temp PNGs kept.")
+                    return encode_ok
+                elif mp4_mode:
                     # H.264 MP4 via ffmpeg: playblast temp PNGs, encode
                     png_dir = os.path.dirname(file_path)
                     if not os.path.exists(png_dir):
@@ -2296,7 +3490,7 @@ class Exporter(object):
                         sequenceTime=False,
                         clearCache=True,
                         viewer=False,
-                        showOrnaments=False,
+                        showOrnaments=show_hud,
                         framePadding=4,
                         percent=100,
                         quality=100,
@@ -2327,7 +3521,7 @@ class Exporter(object):
                         sequenceTime=False,
                         clearCache=True,
                         viewer=False,
-                        showOrnaments=False,
+                        showOrnaments=show_hud,
                         framePadding=4,
                         percent=100,
                         quality=100,
@@ -2349,7 +3543,7 @@ class Exporter(object):
                         sequenceTime=False,
                         clearCache=True,
                         viewer=False,
-                        showOrnaments=False,
+                        showOrnaments=show_hud,
                         framePadding=4,
                         percent=100,
                         quality=70,
@@ -2575,6 +3769,32 @@ class Exporter(object):
                 if original_sel:
                     try:
                         cmds.select(original_sel, replace=True)
+                    except Exception:
+                        pass
+                # --- HUD overlay cleanup ---
+                for hud_name in hud_names_to_remove:
+                    try:
+                        if cmds.headsUpDisplay(hud_name, exists=True):
+                            cmds.headsUpDisplay(hud_name, remove=True)
+                    except Exception:
+                        pass
+                for hud_name, was_visible in original_hud_vis.items():
+                    try:
+                        if cmds.headsUpDisplay(hud_name, exists=True):
+                            cmds.headsUpDisplay(
+                                hud_name, edit=True,
+                                visible=was_visible)
+                    except Exception:
+                        pass
+                # Restore VP2.0 font settings
+                if original_font_mode is not None:
+                    try:
+                        kwargs = {
+                            "fontSettingMode": original_font_mode}
+                        if original_font_size is not None:
+                            kwargs["defaultFontSize"] = (
+                                original_font_size)
+                        cmds.displayPref(**kwargs)
                     except Exception:
                         pass
                 # Playblast colour management is intentionally NOT
@@ -3063,8 +4283,9 @@ class Exporter(object):
         to match the Maya plane's world-space extent.
         """
         jsx = []
-        layer_var = "solid_{}".format(self._sanitize_jsx_var(geo_child))
-        layer_name = self._escape_jsx_string(geo_child)
+        short_name = geo_child.rsplit("|", 1)[-1]
+        layer_var = "solid_{}".format(self._sanitize_jsx_var(short_name))
+        layer_name = self._escape_jsx_string(short_name)
         comp_cx = comp_width / 2.0
         comp_cy = comp_height / 2.0
 
@@ -3114,10 +4335,11 @@ class Exporter(object):
         3-D geometry is visible in After Effects, rather than a bare null.
         """
         jsx = []
-        layer_var = "mesh_{}".format(self._sanitize_jsx_var(geo_child))
+        short_name = geo_child.rsplit("|", 1)[-1]
+        layer_var = "mesh_{}".format(self._sanitize_jsx_var(short_name))
         footage_var = "objFootage_{}".format(
-            self._sanitize_jsx_var(geo_child))
-        layer_name = self._escape_jsx_string(geo_child)
+            self._sanitize_jsx_var(short_name))
+        layer_name = self._escape_jsx_string(short_name)
         obj_fn_escaped = self._escape_jsx_string(obj_filename)
 
         comp_cx = comp_width / 2.0
@@ -3209,8 +4431,9 @@ class Exporter(object):
         Used for SynthEyes tracking markers — no OBJ, no rotation/scale.
         """
         jsx = []
-        layer_var = "loc_{}".format(self._sanitize_jsx_var(locator_node))
-        layer_name = self._escape_jsx_string(locator_node)
+        short_name = locator_node.rsplit("|", 1)[-1]
+        layer_var = "loc_{}".format(self._sanitize_jsx_var(short_name))
+        layer_name = self._escape_jsx_string(short_name)
         comp_cx = comp_width / 2.0
         comp_cy = comp_height / 2.0
 
@@ -3330,11 +4553,13 @@ class Exporter(object):
             # Export OBJs and generate null layers
             if geo_root:
                 children = cmds.listRelatives(
-                    geo_root, children=True, type="transform"
+                    geo_root, children=True, type="transform",
+                    fullPath=True,
                 ) or []
                 if not children:
                     # geo_root itself is the only geo
-                    children = [geo_root]
+                    gr_long = cmds.ls(geo_root, long=True)
+                    children = gr_long if gr_long else [geo_root]
                 # Skip camera (and its parent groups) from geo children
                 if camera:
                     children = [
@@ -3342,7 +4567,10 @@ class Exporter(object):
                         if not self._is_descendant_of(camera, c)
                     ]
                 for child in children:
-                    child_lower = child.lower()
+                    # Use short name for display/keys, long path
+                    # for Maya commands to avoid ambiguity
+                    child_short = child.rsplit("|", 1)[-1]
+                    child_lower = child_short.lower()
 
                     # Skip chisels groups entirely
                     if "chisels" in child_lower:
@@ -3377,8 +4605,13 @@ class Exporter(object):
                         jsx_lines.extend(geo_jsx)
                         continue
 
-                    # Regular geo: OBJ import
+                    # Regular geo: OBJ import (skip if no mesh)
                     if child not in obj_paths:
+                        continue
+                    meshes = cmds.listRelatives(
+                        child, allDescendents=True,
+                        type="mesh", fullPath=True) or []
+                    if not meshes:
                         continue
                     obj_path = obj_paths[child]
                     obj_filename = os.path.basename(obj_path)
@@ -3452,10 +4685,17 @@ class MultiExportUI(object):
         self.ct_abc_checkbox = None
         self.ct_mov_checkbox = None
         self.ct_mov_format_menu = None
-        self.ct_raw_playblast_cb = None
-        self.ct_custom_vt_cb = None
-        self.ct_wireframe_shader_cb = None
-        self.ct_aa16_cb = None
+        # Playblast settings (consolidated in Playblast Settings tab)
+        self.pb_context_menu = None
+        self.pb_raw_playblast_cb = None
+        self.pb_custom_vt_cb = None
+        self.pb_wireframe_shader_cb = None
+        self.pb_aa16_cb = None
+        self.pb_hud_overlay_cb = None
+        self.pb_far_clip = None
+        self.pb_checker_color = None
+        self.pb_checker_scale = None
+        self.pb_checker_opacity = None
         # Matchmove tab (mm_)
         self.mm_camera_field = None
         self.mm_static_geo_fields = []
@@ -3469,14 +4709,8 @@ class MultiExportUI(object):
         self.mm_ma_checkbox = None
         self.mm_fbx_checkbox = None
         self.mm_abc_checkbox = None
-        self.mm_checker_scale = None
-        self.mm_checker_color = None
-        self.mm_checker_opacity = None
         self.mm_mov_checkbox = None
         self.mm_mov_format_menu = None
-        self.mm_raw_playblast_cb = None
-        self.mm_custom_vt_cb = None
-        self.mm_aa16_cb = None
         # Preview mode state
         self._preview_active = False
         self._preview_state = {}
@@ -3484,16 +4718,17 @@ class MultiExportUI(object):
         self._preview_hints = []
 
     def show(self):
-        """Build and display the UI window."""
-        if cmds.window(WINDOW_NAME, exists=True):
-            cmds.deleteUI(WINDOW_NAME)
+        """Launch the Export Genie UI via workspaceControl."""
+        launch()
 
-        self.window = cmds.window(
-            WINDOW_NAME,
-            title="Export Genie  {}".format(TOOL_VERSION),
-            widthHeight=(440, 480),
-            sizeable=True,
-            closeCommand=self._on_window_close,
+    def _build_ui_contents(self):
+        """Build all UI contents inside the workspaceControl."""
+        self.window = WORKSPACE_CONTROL_NAME
+
+        cmds.scrollLayout(
+            childResizable=True,
+            verticalScrollBarThickness=16,
+            horizontalScrollBarThickness=0,
         )
 
         cmds.columnLayout(
@@ -3514,22 +4749,11 @@ class MultiExportUI(object):
             label="Shannon Gold",
             font="boldLabelFont",
             command=lambda *_: __import__("webbrowser").open(
-                "mailto:sgold1@pdoexperts.fb.com"),
+                "mailto:sgold1@pdoexperts.fb.com"
+                "?subject=Export Genie {}".format(TOOL_VERSION)),
             annotation="sgold1@pdoexperts.fb.com",
         )
         cmds.setParent("..")
-
-        # --- Collapsible content ---
-        self._compact_frame = cmds.frameLayout(
-            collapsable=True,
-            collapse=False,
-            label="Collapse All Settings",
-            borderVisible=False,
-            marginWidth=0,
-            marginHeight=0,
-            collapseCommand=partial(self._on_compact_toggle, True),
-            expandCommand=partial(self._on_compact_toggle, False),
-        )
 
         # --- Shared: Scene Info ---
         self._build_scene_info()
@@ -3549,21 +4773,23 @@ class MultiExportUI(object):
         # Tab 3: Face Track Export
         ft_tab = self._build_face_track_tab()
 
+        # Tab 4: Playblast Settings
+        pb_tab = self._build_playblast_tab()
+
         cmds.tabLayout(
             self.tab_layout,
             edit=True,
             tabLabel=(
-                (ct_tab, "Camera Track Export"),
-                (mm_tab, "Matchmove Export"),
-                (ft_tab, "Face Track Export"),
+                (ct_tab, "Camera Track"),
+                (mm_tab, "Matchmove"),
+                (ft_tab, "Face Track"),
+                (pb_tab, "Playblast Settings"),
             ),
         )
         cmds.setParent("..")
 
         # --- Shared: Frame Range ---
         self._build_frame_range()
-
-        cmds.setParent("..")  # end collapsible frame
 
         # --- Export Button ---
         cmds.separator(height=8, style="none")
@@ -3579,11 +4805,10 @@ class MultiExportUI(object):
         # --- Progress Bar ---
         cmds.rowLayout(
             numberOfColumns=2,
-            columnWidth2=(380, 50),
             adjustableColumn=1,
         )
         self.progress_bar = cmds.progressBar(
-            maxValue=100, width=380, height=20, visible=False
+            maxValue=100, height=20, visible=False
         )
         self.progress_label = cmds.text(
             label="", align="right", font="smallPlainLabelFont",
@@ -3611,10 +4836,8 @@ class MultiExportUI(object):
             )
             self._scene_jobs.append(job_id)
 
-        # Auto-set timeline range
-        self._set_timeline_range()
-
-        cmds.showWindow(self.window)
+        # Frame range fields default to 1001/1001 until a camera is loaded
+        # or the user clicks "Use Timeline Range".
 
     # --- UI Builders ---
 
@@ -3746,72 +4969,7 @@ class MultiExportUI(object):
         cmds.setParent("..")
         cmds.setParent("..")
 
-        # Viewport Settings
-        cmds.frameLayout(
-            label="Viewport Settings",
-            collapsable=True,
-            marginWidth=8,
-            marginHeight=6,
-        )
-        cmds.columnLayout(adjustableColumn=True, rowSpacing=2)
-        self.ct_wireframe_shader_cb = cmds.checkBox(
-            label="  useBackground Shader + Wireframe",
-            annotation=(
-                "Applies a useBackground shader to all geo with "
-                "wireframe-on-shaded for the playblast"),
-            value=True,
-        )
-        self.ct_aa16_cb = cmds.checkBox(
-            label="  Anti-Aliasing 16x (increased RAM)",
-            annotation=(
-                "Sets VP2.0 MSAA to 16 samples instead of 8. "
-                "Higher quality but requires more GPU memory."),
-            value=False,
-        )
-        self.ct_far_clip = cmds.intSliderGrp(
-            label="Far Clip:",
-            field=True,
-            minValue=10000,
-            maxValue=2000000,
-            fieldMinValue=1000,
-            fieldMaxValue=10000000,
-            value=800000,
-            columnWidth3=(50, 70, 1),
-            annotation="Camera far clipping plane for playblast",
-        )
-        cmds.separator(style="in", height=8)
-        self.ct_raw_playblast_cb = cmds.checkBox(
-            label="  Use Current Viewport Settings",
-            annotation=(
-                "Playblast uses your current VP2.0 settings "
-                "without modifications"),
-            value=False,
-        )
-        self.ct_custom_vt_cb = cmds.checkBox(
-            label="  Use Custom View Transform",
-            annotation=(
-                "When checked, the playblast uses your current "
-                "view transform instead of forcing Raw (sRGB)"),
-            value=False,
-        )
-        cmds.separator(style="in", height=8)
-        ct_preview_hint = cmds.text(
-            label="Re-toggle preview to apply setting changes.",
-            visible=False, font="smallObliqueLabelFont")
-        self._preview_hints.append(ct_preview_hint)
-        ct_preview_btn = cmds.button(
-            label="Preview Playblast",
-            height=28,
-            command=partial(self._on_preview_playblast),
-            annotation=(
-                "Toggle live viewport preview of playblast settings. "
-                "Click again to exit preview mode."),
-        )
-        self._preview_buttons.append(ct_preview_btn)
-        cmds.setParent("..")
-        cmds.setParent("..")
-
-        cmds.setParent("..")
+        cmds.setParent("..")  # out of tab_col, back to tabLayout
         return tab_col
 
     def _build_matchmove_tab(self):
@@ -3909,98 +5067,6 @@ class MultiExportUI(object):
                 self.mm_mov_format_menu, edit=True,
                 value="H.264 (.mp4 Win)")
         cmds.setParent("..")  # out of rowLayout
-        cmds.setParent("..")
-        cmds.setParent("..")
-
-        # Viewport Settings
-        cmds.frameLayout(
-            label="Viewport Settings",
-            collapsable=True,
-            marginWidth=8,
-            marginHeight=6,
-        )
-        cmds.columnLayout(adjustableColumn=True, rowSpacing=2)
-        self.mm_aa16_cb = cmds.checkBox(
-            label="  Anti-Aliasing 16x (increased RAM)",
-            annotation=(
-                "Sets VP2.0 MSAA to 16 samples instead of 8. "
-                "Higher quality but requires more GPU memory."),
-            value=False,
-        )
-        self.mm_far_clip = cmds.intSliderGrp(
-            label="Far Clip:",
-            field=True,
-            minValue=10000,
-            maxValue=2000000,
-            fieldMinValue=1000,
-            fieldMaxValue=10000000,
-            value=800000,
-            columnWidth3=(50, 70, 1),
-            annotation="Camera far clipping plane for playblast",
-        )
-        cmds.separator(style="in", height=12)
-        cmds.text(label="QC Checker Overlay", align="left",
-                  font="smallBoldLabelFont")
-        cmds.separator(style="none", height=4)
-        self.mm_checker_color = cmds.colorSliderGrp(
-            label="Color:",
-            rgb=(0.6, 0.1, 0.1),
-            columnWidth3=(40, 80, 1),
-            annotation="Color of the UV checker overlay",
-        )
-        cmds.separator(style="none", height=6)
-        self.mm_checker_scale = cmds.intSliderGrp(
-            label="Scale:",
-            field=True,
-            minValue=1,
-            maxValue=32,
-            fieldMinValue=1,
-            fieldMaxValue=32,
-            value=15,
-            columnWidth3=(40, 50, 1),
-            annotation="Scale of the UV checker pattern",
-        )
-        cmds.separator(style="none", height=6)
-        self.mm_checker_opacity = cmds.intSliderGrp(
-            label="Opacity:",
-            field=True,
-            minValue=0,
-            maxValue=100,
-            fieldMinValue=0,
-            fieldMaxValue=100,
-            value=30,
-            columnWidth3=(40, 50, 1),
-            annotation="Opacity of the UV checker overlay",
-        )
-        cmds.separator(style="in", height=8)
-        self.mm_raw_playblast_cb = cmds.checkBox(
-            label="  Use Current Viewport Settings",
-            annotation=(
-                "Playblast uses your current VP2.0 settings "
-                "without modifications"),
-            value=False,
-        )
-        self.mm_custom_vt_cb = cmds.checkBox(
-            label="  Use Custom View Transform",
-            annotation=(
-                "When checked, the playblast uses your current "
-                "view transform instead of forcing Raw (sRGB)"),
-            value=False,
-        )
-        cmds.separator(style="in", height=8)
-        mm_preview_hint = cmds.text(
-            label="Re-toggle preview to apply setting changes.",
-            visible=False, font="smallObliqueLabelFont")
-        self._preview_hints.append(mm_preview_hint)
-        mm_preview_btn = cmds.button(
-            label="Preview Playblast",
-            height=28,
-            command=partial(self._on_preview_playblast),
-            annotation=(
-                "Toggle live viewport preview of playblast settings. "
-                "Click again to exit preview mode."),
-        )
-        self._preview_buttons.append(mm_preview_btn)
         cmds.setParent("..")
         cmds.setParent("..")
 
@@ -4126,22 +5192,47 @@ class MultiExportUI(object):
         cmds.setParent("..")
         cmds.setParent("..")
 
-        # Viewport Settings
+        cmds.setParent("..")
+        return tab_col
+
+    def _build_playblast_tab(self):
+        """Build Tab 4: Playblast Settings (shared across all export tabs)."""
+        tab_col = cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
+
+        # --- Preview / Export Context ---
+        cmds.rowLayout(
+            numberOfColumns=2,
+            columnWidth2=(110, 200),
+            columnAttach=[(1, "left", 8), (2, "left", 0)],
+        )
+        cmds.text(label="Export Context:")
+        self.pb_context_menu = cmds.optionMenu(
+            annotation="Which export tab these settings apply to for preview",
+        )
+        cmds.menuItem(label="-- Choose --")
+        cmds.menuItem(label="Camera Track")
+        cmds.menuItem(label="Matchmove")
+        cmds.menuItem(label="Face Track")
+        cmds.setParent("..")
+
+        cmds.separator(style="in", height=8)
+
+        # --- General ---
         cmds.frameLayout(
-            label="Viewport Settings",
+            label="General",
             collapsable=True,
             marginWidth=8,
             marginHeight=6,
         )
         cmds.columnLayout(adjustableColumn=True, rowSpacing=2)
-        self.ft_aa16_cb = cmds.checkBox(
+        self.pb_aa16_cb = cmds.checkBox(
             label="  Anti-Aliasing 16x (increased RAM)",
             annotation=(
                 "Sets VP2.0 MSAA to 16 samples instead of 8. "
                 "Higher quality but requires more GPU memory."),
             value=False,
         )
-        self.ft_far_clip = cmds.intSliderGrp(
+        self.pb_far_clip = cmds.intSliderGrp(
             label="Far Clip:",
             field=True,
             minValue=10000,
@@ -4152,18 +5243,68 @@ class MultiExportUI(object):
             columnWidth3=(50, 70, 1),
             annotation="Camera far clipping plane for playblast",
         )
-        cmds.separator(style="in", height=12)
+        cmds.separator(style="in", height=8)
+        self.pb_raw_playblast_cb = cmds.checkBox(
+            label="  Use Current Viewport Settings",
+            annotation=(
+                "Playblast uses your current VP2.0 settings "
+                "without modifications"),
+            value=False,
+        )
+        self.pb_custom_vt_cb = cmds.checkBox(
+            label="  Use Custom View Transform",
+            annotation=(
+                "When checked, the playblast uses your current "
+                "view transform instead of forcing Raw (sRGB)"),
+            value=False,
+        )
+        self.pb_hud_overlay_cb = cmds.checkBox(
+            label="  Show Frame / Focal Length HUD",
+            annotation=(
+                "Burn frame number and focal length "
+                "into the playblast"),
+            value=True,
+        )
+        cmds.setParent("..")
+        cmds.setParent("..")
+
+        # --- Camera Track ---
+        cmds.frameLayout(
+            label="Camera Track",
+            collapsable=True,
+            marginWidth=8,
+            marginHeight=6,
+        )
+        cmds.columnLayout(adjustableColumn=True, rowSpacing=2)
+        self.pb_wireframe_shader_cb = cmds.checkBox(
+            label="  useBackground Shader + Wireframe",
+            annotation=(
+                "Applies a useBackground shader to all geo with "
+                "wireframe-on-shaded for the playblast"),
+            value=True,
+        )
+        cmds.setParent("..")
+        cmds.setParent("..")
+
+        # --- Matchmove / Face Track ---
+        cmds.frameLayout(
+            label="Matchmove / Face Track",
+            collapsable=True,
+            marginWidth=8,
+            marginHeight=6,
+        )
+        cmds.columnLayout(adjustableColumn=True, rowSpacing=2)
         cmds.text(label="QC Checker Overlay", align="left",
                   font="smallBoldLabelFont")
         cmds.separator(style="none", height=4)
-        self.ft_checker_color = cmds.colorSliderGrp(
+        self.pb_checker_color = cmds.colorSliderGrp(
             label="Color:",
             rgb=(0.6, 0.1, 0.1),
             columnWidth3=(40, 80, 1),
             annotation="Color of the UV checker overlay",
         )
         cmds.separator(style="none", height=6)
-        self.ft_checker_scale = cmds.intSliderGrp(
+        self.pb_checker_scale = cmds.intSliderGrp(
             label="Scale:",
             field=True,
             minValue=1,
@@ -4175,8 +5316,8 @@ class MultiExportUI(object):
             annotation="Scale of the UV checker pattern",
         )
         cmds.separator(style="none", height=6)
-        self.ft_checker_opacity = cmds.intSliderGrp(
-            label="Opacity:",
+        self.pb_checker_opacity = cmds.intSliderGrp(
+            label="Blend:",
             field=True,
             minValue=0,
             maxValue=100,
@@ -4184,29 +5325,19 @@ class MultiExportUI(object):
             fieldMaxValue=100,
             value=30,
             columnWidth3=(40, 50, 1),
-            annotation="Opacity of the UV checker overlay",
+            annotation="Overlay blend opacity (0=plate only, "
+            "100=full mesh overlay)",
         )
+        cmds.setParent("..")
+        cmds.setParent("..")
+
+        # --- Preview ---
         cmds.separator(style="in", height=8)
-        self.ft_raw_playblast_cb = cmds.checkBox(
-            label="  Use Current Viewport Settings",
-            annotation=(
-                "Playblast uses your current VP2.0 settings "
-                "without modifications"),
-            value=False,
-        )
-        self.ft_custom_vt_cb = cmds.checkBox(
-            label="  Use Custom View Transform",
-            annotation=(
-                "When checked, the playblast uses your current "
-                "view transform instead of forcing Raw (sRGB)"),
-            value=False,
-        )
-        cmds.separator(style="in", height=8)
-        ft_preview_hint = cmds.text(
+        pb_preview_hint = cmds.text(
             label="Re-toggle preview to apply setting changes.",
             visible=False, font="smallObliqueLabelFont")
-        self._preview_hints.append(ft_preview_hint)
-        ft_preview_btn = cmds.button(
+        self._preview_hints.append(pb_preview_hint)
+        pb_preview_btn = cmds.button(
             label="Preview Playblast",
             height=28,
             command=partial(self._on_preview_playblast),
@@ -4214,11 +5345,9 @@ class MultiExportUI(object):
                 "Toggle live viewport preview of playblast settings. "
                 "Click again to exit preview mode."),
         )
-        self._preview_buttons.append(ft_preview_btn)
-        cmds.setParent("..")
-        cmds.setParent("..")
+        self._preview_buttons.append(pb_preview_btn)
 
-        cmds.setParent("..")
+        cmds.setParent("..")  # out of tab_col, back to tabLayout
         return tab_col
 
     def _build_frame_range(self):
@@ -4238,7 +5367,7 @@ class MultiExportUI(object):
         self.start_frame_field = cmds.intField(value=1001, width=65, annotation="First frame of the export range")
         cmds.text(label="")
         cmds.text(label="End: ")
-        self.end_frame_field = cmds.intField(value=100, width=65, annotation="Last frame of the export range")
+        self.end_frame_field = cmds.intField(value=1001, width=65, annotation="Last frame of the export range")
         cmds.setParent("..")
         cmds.button(
             label="Use Timeline Range",
@@ -4263,13 +5392,32 @@ class MultiExportUI(object):
     # --- Tab Helpers ---
 
     def _get_active_tab(self):
-        """Return the active tab identifier based on selected tab index."""
+        """Return the active export tab identifier based on selected tab index.
+
+        If the Playblast Settings tab (4) is active, returns the last
+        export tab the user was on so preview/export work correctly.
+        """
         idx = cmds.tabLayout(self.tab_layout, query=True, selectTabIndex=True)
         if idx == 1:
+            self._last_export_tab = TAB_CAMERA_TRACK
             return TAB_CAMERA_TRACK
         elif idx == 2:
+            self._last_export_tab = TAB_MATCHMOVE
             return TAB_MATCHMOVE
-        return TAB_FACE_TRACK
+        elif idx == 3:
+            self._last_export_tab = TAB_FACE_TRACK
+            return TAB_FACE_TRACK
+        # Tab 4 = Playblast Settings — use context menu selection
+        if self.pb_context_menu:
+            ctx = cmds.optionMenu(self.pb_context_menu, query=True, value=True)
+            if ctx == "Camera Track":
+                return TAB_CAMERA_TRACK
+            elif ctx == "Matchmove":
+                return TAB_MATCHMOVE
+            elif ctx == "Face Track":
+                return TAB_FACE_TRACK
+        # "-- Choose --" or unset
+        return None
 
     # --- Callbacks ---
 
@@ -4341,20 +5489,66 @@ class MultiExportUI(object):
             self._set_frame_range_from_camera(obj)
 
     def _set_frame_range_from_camera(self, cam_xform):
-        """Set start frame to 1001 and end frame from the camera's last key."""
-        # Query all keyframes on the camera transform's TRS channels
-        keys = cmds.keyframe(cam_xform, query=True, timeChange=True) or []
-        # Also check the camera shape (focal length, etc.)
+        """Set start/end frames from the camera's animation curve extents.
+
+        Queries all anim curves connected to the camera hierarchy
+        (transform, shape, and ancestors).  Falls back to AlembicNode
+        time range for cache-driven cameras.
+        """
+        keys = []
+
+        # Collect all nodes to check: the transform, its shapes,
+        # and every ancestor up to the root
+        nodes_to_check = [cam_xform]
         shapes = cmds.listRelatives(
             cam_xform, shapes=True, type="camera") or []
-        for shp in shapes:
-            shp_keys = cmds.keyframe(
-                shp, query=True, timeChange=True) or []
-            keys.extend(shp_keys)
+        nodes_to_check.extend(shapes)
+        node = cam_xform
+        while True:
+            parents = cmds.listRelatives(
+                node, parent=True, fullPath=False)
+            if not parents:
+                break
+            node = parents[0]
+            nodes_to_check.append(node)
+
+        # Query keyframes from all connected animCurve nodes
+        for n in nodes_to_check:
+            anim_curves = cmds.listConnections(
+                n, source=True, destination=False,
+                type="animCurve") or []
+            for ac in anim_curves:
+                ac_keys = cmds.keyframe(
+                    ac, query=True, timeChange=True) or []
+                keys.extend(ac_keys)
+
+        # Alembic-driven cameras: no keyframes, but an AlembicNode
+        # holds the authoritative time range
+        if not keys:
+            all_descendants = cmds.listRelatives(
+                cam_xform, allDescendents=True,
+                fullPath=True) or [cam_xform]
+            all_descendants.append(cam_xform)
+            for desc in all_descendants:
+                conns = cmds.listConnections(
+                    desc, source=True, type="AlembicNode") or []
+                for abc_node in conns:
+                    try:
+                        start_t = cmds.getAttr(
+                            abc_node + ".startFrame")
+                        end_t = cmds.getAttr(
+                            abc_node + ".endFrame")
+                        keys.extend([start_t, end_t])
+                    except Exception:
+                        pass
+                if keys:
+                    break
+
         if keys:
+            first_frame = int(min(keys))
             last_frame = int(max(keys))
             cmds.intField(
-                self.start_frame_field, edit=True, value=1001)
+                self.start_frame_field, edit=True, value=first_frame)
             cmds.intField(
                 self.end_frame_field, edit=True, value=last_frame)
 
@@ -4448,10 +5642,6 @@ class MultiExportUI(object):
 
         self._rebuild_ct_geo_buttons()
 
-        if len(self.ct_geo_fields) > 1:
-            cur_h = cmds.window(self.window, query=True, height=True)
-            cmds.window(self.window, edit=True, height=cur_h + 30)
-
     def _remove_ct_geo_field(self, *args):
         """Remove the last Geo Group picker field from camera track tab."""
         if len(self.ct_geo_fields) <= 1:
@@ -4461,9 +5651,6 @@ class MultiExportUI(object):
         cmds.deleteUI(entry["row"])
 
         self._rebuild_ct_geo_buttons()
-
-        cur_h = cmds.window(self.window, query=True, height=True)
-        cmds.window(self.window, edit=True, height=cur_h - 30)
 
     # --- Matchmove dynamic rig/geo pairs ---
 
@@ -4543,11 +5730,6 @@ class MultiExportUI(object):
         # Rebuild buttons at the bottom
         self._rebuild_rig_geo_buttons()
 
-        # Grow window to fit new pair
-        if len(self.mm_rig_geo_pairs) > 1:
-            cur_h = cmds.window(self.window, query=True, height=True)
-            cmds.window(self.window, edit=True, height=cur_h + 52)
-
     def _remove_rig_geo_pair(self, *args):
         """Remove the last Main Rig Group / Mesh Group pair."""
         if len(self.mm_rig_geo_pairs) <= 1:
@@ -4558,10 +5740,6 @@ class MultiExportUI(object):
 
         # Rebuild buttons (updates minus visibility)
         self._rebuild_rig_geo_buttons()
-
-        # Shrink window
-        cur_h = cmds.window(self.window, query=True, height=True)
-        cmds.window(self.window, edit=True, height=cur_h - 52)
 
     # --- Matchmove dynamic static geo fields ---
 
@@ -4626,10 +5804,6 @@ class MultiExportUI(object):
 
         self._rebuild_mm_static_geo_buttons()
 
-        if len(self.mm_static_geo_fields) > 1:
-            cur_h = cmds.window(self.window, query=True, height=True)
-            cmds.window(self.window, edit=True, height=cur_h + 30)
-
     def _remove_mm_static_geo_field(self, *args):
         """Remove the last Static Geo picker field from matchmove tab."""
         if len(self.mm_static_geo_fields) <= 1:
@@ -4639,9 +5813,6 @@ class MultiExportUI(object):
         cmds.deleteUI(entry["row"])
 
         self._rebuild_mm_static_geo_buttons()
-
-        cur_h = cmds.window(self.window, query=True, height=True)
-        cmds.window(self.window, edit=True, height=cur_h - 30)
 
     # --- Face Track dynamic face mesh entries ---
 
@@ -4706,10 +5877,6 @@ class MultiExportUI(object):
 
         self._rebuild_face_mesh_buttons()
 
-        if len(self.ft_face_mesh_entries) > 1:
-            cur_h = cmds.window(self.window, query=True, height=True)
-            cmds.window(self.window, edit=True, height=cur_h + 30)
-
     def _remove_face_mesh_entry(self, *args):
         """Remove the last Face Mesh picker field."""
         if len(self.ft_face_mesh_entries) <= 1:
@@ -4720,14 +5887,11 @@ class MultiExportUI(object):
 
         self._rebuild_face_mesh_buttons()
 
-        cur_h = cmds.window(self.window, query=True, height=True)
-        cmds.window(self.window, edit=True, height=cur_h - 30)
-
     def _set_timeline_range(self, *args):
         start = cmds.playbackOptions(query=True, animationStartTime=True)
         end = cmds.playbackOptions(query=True, animationEndTime=True)
         cmds.intField(self.start_frame_field, edit=True,
-                       value=max(int(start), 1001))
+                       value=int(start))
         cmds.intField(self.end_frame_field, edit=True, value=int(end))
 
     def _on_tpose_toggled(self, checked, *args):
@@ -5210,19 +6374,22 @@ class MultiExportUI(object):
         cmds.scrollField(self.log_field, edit=True, text="")
 
         active_tab = self._get_active_tab()
+        if active_tab is None:
+            cmds.confirmDialog(
+                title="Export Context Required",
+                message="Please select an Export Context (Camera Track, "
+                        "Matchmove, or Face Track) in the Playblast "
+                        "Settings tab before exporting.",
+                button=["OK"],
+                defaultButton="OK",
+            )
+            return
         if active_tab == TAB_CAMERA_TRACK:
             self._export_camera_track()
         elif active_tab == TAB_MATCHMOVE:
             self._export_matchmove()
         else:
             self._export_face_track()
-
-    def _on_compact_toggle(self, collapsed, *args):
-        """Resize the window when the Settings frame is collapsed/expanded."""
-        if collapsed:
-            cmds.window(self.window, edit=True, height=160, widthHeight=(440, 160))
-        else:
-            cmds.window(self.window, edit=True, height=480, widthHeight=(440, 480))
 
     def _on_window_close(self, *args):
         """Clean up preview mode when the window is closed."""
@@ -5243,6 +6410,16 @@ class MultiExportUI(object):
     def _enter_preview_mode(self):
         """Apply all playblast viewport overrides for live preview."""
         active_tab = self._get_active_tab()
+        if active_tab is None:
+            cmds.confirmDialog(
+                title="Export Context Required",
+                message="Please select an Export Context (Camera Track, "
+                        "Matchmove, or Face Track) in the Playblast "
+                        "Settings tab before previewing.",
+                button=["OK"],
+                defaultButton="OK",
+            )
+            return
 
         # --- Resolve camera ---
         if active_tab == TAB_CAMERA_TRACK:
@@ -5282,28 +6459,13 @@ class MultiExportUI(object):
                 pass
         cmds.refresh(currentView=True)
 
-        # Read "Use Current Viewport Settings" checkbox and far clip per tab
-        if active_tab == TAB_CAMERA_TRACK:
-            raw_pb = cmds.checkBox(
-                self.ct_raw_playblast_cb, query=True, value=True)
-            custom_vt = cmds.checkBox(
-                self.ct_custom_vt_cb, query=True, value=True)
-            far_clip = cmds.intSliderGrp(
-                self.ct_far_clip, query=True, value=True)
-        elif active_tab == TAB_MATCHMOVE:
-            raw_pb = cmds.checkBox(
-                self.mm_raw_playblast_cb, query=True, value=True)
-            custom_vt = cmds.checkBox(
-                self.mm_custom_vt_cb, query=True, value=True)
-            far_clip = cmds.intSliderGrp(
-                self.mm_far_clip, query=True, value=True)
-        else:
-            raw_pb = cmds.checkBox(
-                self.ft_raw_playblast_cb, query=True, value=True)
-            custom_vt = cmds.checkBox(
-                self.ft_custom_vt_cb, query=True, value=True)
-            far_clip = cmds.intSliderGrp(
-                self.ft_far_clip, query=True, value=True)
+        # Read shared playblast settings from Playblast Settings tab
+        raw_pb = cmds.checkBox(
+            self.pb_raw_playblast_cb, query=True, value=True)
+        custom_vt = cmds.checkBox(
+            self.pb_custom_vt_cb, query=True, value=True)
+        far_clip = cmds.intSliderGrp(
+            self.pb_far_clip, query=True, value=True)
 
         state = {"tab": active_tab, "raw_playblast": raw_pb}
 
@@ -5444,9 +6606,9 @@ class MultiExportUI(object):
     def _enter_preview_ct(self, state, model_panel):
         """Apply Camera Track viewport overrides for preview."""
         wf_shader = cmds.checkBox(
-            self.ct_wireframe_shader_cb, query=True, value=True)
+            self.pb_wireframe_shader_cb, query=True, value=True)
         aa16 = cmds.checkBox(
-            self.ct_aa16_cb, query=True, value=True)
+            self.pb_aa16_cb, query=True, value=True)
         geo_roots = []
         for entry in self.ct_geo_fields:
             g = cmds.textFieldButtonGrp(
@@ -5562,16 +6724,23 @@ class MultiExportUI(object):
 
     def _enter_preview_mm_ft(self, state, active_tab, model_panel,
                              camera):
-        """Apply Matchmove / Face Track viewport overrides for preview."""
+        """Apply Matchmove / Face Track viewport overrides for preview.
+
+        Preview uses a single-pass semi-transparent Lambert checker
+        overlay (not the multi-pass composite pipeline used for export).
+        This is intentional — preview is interactive and doesn't need
+        the full composite; the checker gives a good enough
+        approximation for viewport QC.
+        """
+        aa16 = cmds.checkBox(
+            self.pb_aa16_cb, query=True, value=True)
+        chk_scale = cmds.intSliderGrp(
+            self.pb_checker_scale, query=True, value=True)
+        chk_color = tuple(cmds.colorSliderGrp(
+            self.pb_checker_color, query=True, rgbValue=True))
+        chk_opacity = cmds.intSliderGrp(
+            self.pb_checker_opacity, query=True, value=True)
         if active_tab == TAB_MATCHMOVE:
-            aa16 = cmds.checkBox(
-                self.mm_aa16_cb, query=True, value=True)
-            chk_scale = cmds.intSliderGrp(
-                self.mm_checker_scale, query=True, value=True)
-            chk_color = tuple(cmds.colorSliderGrp(
-                self.mm_checker_color, query=True, rgbValue=True))
-            chk_opacity = cmds.intSliderGrp(
-                self.mm_checker_opacity, query=True, value=True)
             geo_roots = []
             for pair in self.mm_rig_geo_pairs:
                 g = cmds.textFieldButtonGrp(
@@ -5579,14 +6748,6 @@ class MultiExportUI(object):
                 if g:
                     geo_roots.append(g)
         else:  # TAB_FACE_TRACK
-            aa16 = cmds.checkBox(
-                self.ft_aa16_cb, query=True, value=True)
-            chk_scale = cmds.intSliderGrp(
-                self.ft_checker_scale, query=True, value=True)
-            chk_color = tuple(cmds.colorSliderGrp(
-                self.ft_checker_color, query=True, rgbValue=True))
-            chk_opacity = cmds.intSliderGrp(
-                self.ft_checker_opacity, query=True, value=True)
             geo_roots = []
             for entry in self.ft_face_mesh_entries:
                 fm = cmds.textFieldButtonGrp(
@@ -6334,12 +7495,15 @@ class MultiExportUI(object):
                 geo_children = []
                 for gr in geo_roots:
                     children = cmds.listRelatives(
-                        gr, children=True, type="transform"
+                        gr, children=True, type="transform",
+                        fullPath=True,
                     ) or []
                     if children:
                         geo_children.extend(children)
                     else:
-                        geo_children.append(gr)
+                        gr_long = cmds.ls(gr, long=True)
+                        geo_children.extend(
+                            gr_long if gr_long else [gr])
                 # Exclude camera, chisels, and nulls from OBJ paths
                 # (nulls/locators are handled separately inside export_jsx)
                 if camera:
@@ -6418,7 +7582,7 @@ class MultiExportUI(object):
                 mp4_mode = ".mp4" in fmt_choice
                 if mp4_mode and not Exporter._find_ffmpeg():
                     self._log(
-                        "Playblast skipped — ffmpeg.exe not found.")
+                        "Playblast skipped — ffmpeg not found.")
                     results["mov"] = False
                 else:
                     if mp4_mode:
@@ -6438,18 +7602,21 @@ class MultiExportUI(object):
                         all_paths["mov"] = paths["mov"]
                     self._log("Preparing playblast...")
                     raw_pb = cmds.checkBox(
-                        self.ct_raw_playblast_cb, query=True,
+                        self.pb_raw_playblast_cb, query=True,
                         value=True)
                     custom_vt = cmds.checkBox(
-                        self.ct_custom_vt_cb, query=True,
+                        self.pb_custom_vt_cb, query=True,
                         value=True)
                     wf_shader = cmds.checkBox(
-                        self.ct_wireframe_shader_cb, query=True,
+                        self.pb_wireframe_shader_cb, query=True,
                         value=True)
                     aa16 = cmds.checkBox(
-                        self.ct_aa16_cb, query=True, value=True)
+                        self.pb_aa16_cb, query=True, value=True)
                     far_clip = cmds.intSliderGrp(
-                        self.ct_far_clip, query=True, value=True)
+                        self.pb_far_clip, query=True, value=True)
+                    show_hud = cmds.checkBox(
+                        self.pb_hud_overlay_cb, query=True,
+                        value=True)
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         camera_track_mode=True,
@@ -6462,6 +7629,7 @@ class MultiExportUI(object):
                         png_mode=png_mode,
                         mp4_mode=mp4_mode,
                         mp4_output=paths.get("mp4"),
+                        show_hud=show_hud,
                     )
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
@@ -6581,7 +7749,9 @@ class MultiExportUI(object):
         FolderManager.ensure_directories(
             {k: v for k, v in paths.items()
              if k not in ("png_dir", "png_file",
-                          "mp4_tmp_dir", "mp4_tmp_file")})
+                          "mp4_tmp_dir", "mp4_tmp_file",
+                          "composite_tmp", "composite_plate",
+                          "composite_color", "composite_matte")})
 
         dir_path = os.path.dirname(paths.get("ma", paths.get("fbx", "")))
         self._log("Exporting to: {}".format(dir_path))
@@ -6742,7 +7912,7 @@ class MultiExportUI(object):
                 mp4_mode = ".mp4" in fmt_choice
                 if mp4_mode and not Exporter._find_ffmpeg():
                     self._log(
-                        "Playblast skipped — ffmpeg.exe not found.")
+                        "Playblast skipped — ffmpeg not found.")
                     results["mov"] = False
                 else:
                     if mp4_mode:
@@ -6757,23 +7927,26 @@ class MultiExportUI(object):
                         pb_path = paths["mov"]
                     self._log("Preparing playblast...")
                     raw_pb = cmds.checkBox(
-                        self.mm_raw_playblast_cb, query=True,
+                        self.pb_raw_playblast_cb, query=True,
                         value=True)
                     custom_vt = cmds.checkBox(
-                        self.mm_custom_vt_cb, query=True,
+                        self.pb_custom_vt_cb, query=True,
                         value=True)
                     chk_scale = cmds.intSliderGrp(
-                        self.mm_checker_scale, query=True, value=True)
+                        self.pb_checker_scale, query=True, value=True)
                     chk_color = tuple(cmds.colorSliderGrp(
-                        self.mm_checker_color, query=True,
+                        self.pb_checker_color, query=True,
                         rgbValue=True))
                     chk_opacity = cmds.intSliderGrp(
-                        self.mm_checker_opacity, query=True,
+                        self.pb_checker_opacity, query=True,
                         value=True)
                     aa16 = cmds.checkBox(
-                        self.mm_aa16_cb, query=True, value=True)
+                        self.pb_aa16_cb, query=True, value=True)
                     far_clip = cmds.intSliderGrp(
-                        self.mm_far_clip, query=True, value=True)
+                        self.pb_far_clip, query=True, value=True)
+                    show_hud = cmds.checkBox(
+                        self.pb_hud_overlay_cb, query=True,
+                        value=True)
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
@@ -6787,6 +7960,15 @@ class MultiExportUI(object):
                         png_mode=png_mode,
                         mp4_mode=mp4_mode,
                         mp4_output=paths.get("mp4"),
+                        show_hud=show_hud,
+                        composite_plate_path=paths.get(
+                            "composite_plate"),
+                        composite_color_path=paths.get(
+                            "composite_color"),
+                        composite_matte_path=paths.get(
+                            "composite_matte"),
+                        composite_tmp_dir=paths.get(
+                            "composite_tmp"),
                     )
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
@@ -6877,7 +8059,9 @@ class MultiExportUI(object):
         FolderManager.ensure_directories(
             {k: v for k, v in paths.items()
              if k not in ("png_dir", "png_file",
-                          "mp4_tmp_dir", "mp4_tmp_file")})
+                          "mp4_tmp_dir", "mp4_tmp_file",
+                          "composite_tmp", "composite_plate",
+                          "composite_color", "composite_matte")})
 
         dir_path = os.path.dirname(paths.get("ma", paths.get("fbx", "")))
         self._log("Exporting to: {}".format(dir_path))
@@ -6892,6 +8076,7 @@ class MultiExportUI(object):
         # Rename camera to cam_main for all exports
         renamed_cam = None
         original_cam_name = camera
+        baked_abc_cam = False
         try:
             if camera:
                 if camera == "cam_main" and cmds.objExists(camera):
@@ -6908,13 +8093,187 @@ class MultiExportUI(object):
                         "Camera not found. See Script Editor.")
                     camera = None
 
+            # Detect Alembic-driven camera and bake before exports
+            if camera and cmds.objExists(camera):
+                cam_shapes = cmds.listRelatives(
+                    camera, shapes=True, type="camera") or []
+                abc_nodes = set()
+                # Check transform TRS channels
+                for attr in ("tx", "ty", "tz", "rx", "ry", "rz",
+                             "sx", "sy", "sz"):
+                    conns = cmds.listConnections(
+                        "{}.{}".format(camera, attr),
+                        source=True, destination=False) or []
+                    for c in conns:
+                        if cmds.nodeType(c) == "AlembicNode":
+                            abc_nodes.add(c)
+                # Check camera shape focalLength
+                for shp in cam_shapes:
+                    conns = cmds.listConnections(
+                        "{}.focalLength".format(shp),
+                        source=True, destination=False) or []
+                    for c in conns:
+                        if cmds.nodeType(c) == "AlembicNode":
+                            abc_nodes.add(c)
+                if abc_nodes:
+                    self._log("Baking Alembic camera...")
+                    cmds.undoInfo(openChunk=True)
+                    baked_abc_cam = True
+                    trs = ["tx", "ty", "tz", "rx", "ry", "rz",
+                           "sx", "sy", "sz"]
+                    # Unlock TRS channels
+                    for a in trs:
+                        try:
+                            cmds.setAttr(
+                                "{}.{}".format(camera, a),
+                                lock=False, keyable=True,
+                                channelBox=True)
+                        except Exception:
+                            pass
+                    # Bake transform channels
+                    cmds.bakeResults(
+                        camera,
+                        t=(int(start_frame), int(end_frame)),
+                        at=trs,
+                        simulation=True,
+                        preserveOutsideKeys=True,
+                        minimizeRotation=True,
+                    )
+                    # Bake focal length on camera shape
+                    for shp in cam_shapes:
+                        try:
+                            cmds.setAttr(
+                                "{}.focalLength".format(shp),
+                                lock=False, keyable=True)
+                        except Exception:
+                            pass
+                        cmds.bakeResults(
+                            shp,
+                            t=(int(start_frame), int(end_frame)),
+                            at=["focalLength"],
+                            simulation=True,
+                            preserveOutsideKeys=True,
+                        )
+                    # Disconnect Alembic sources (keep baked animCurves)
+                    all_plugs = ["{}.{}".format(camera, a)
+                                 for a in trs]
+                    for shp in cam_shapes:
+                        all_plugs.append(
+                            "{}.focalLength".format(shp))
+                    for plug in all_plugs:
+                        conns = cmds.listConnections(
+                            plug, source=True, destination=False,
+                            plugs=True,
+                            skipConversionNodes=True) or []
+                        for src_plug in conns:
+                            src_node = src_plug.split(".")[0]
+                            if cmds.nodeType(src_node).startswith(
+                                    "animCurve"):
+                                continue
+                            try:
+                                cmds.disconnectAttr(src_plug, plug)
+                            except Exception:
+                                pass
+                    sys.stderr.write(
+                        "[ExportGenie] Baked Alembic camera: {} "
+                        "({} AlembicNode(s) disconnected).\n".format(
+                            camera, len(abc_nodes)))
+
             if do_ma:
-                # MA export: no conversion, Alembic animation stays intact
+                # MA export: import references, convert Alembic
+                # vertex animation to blendshapes, and strip
+                # namespaces so the exported .ma is fully
+                # self-contained (no external .ma/.mb/.abc
+                # dependencies).  Restored via undo.
                 static_geos = [static_geo] if static_geo else []
-                results["ma"] = exporter.export_ma(
-                    paths["ma"], camera, face_meshes, [], static_geos,
-                    start_frame=start_frame, end_frame=end_frame,
-                )
+                cmds.undoInfo(openChunk=True)
+                ma_prep = {"base_meshes": []}
+                try:
+                    # Import references
+                    all_refs = cmds.ls(type="reference") or []
+                    refs_imported = 0
+                    for ref_node in all_refs:
+                        if ref_node == "sharedReferenceNode":
+                            continue
+                        try:
+                            cmds.file(
+                                referenceNode=ref_node,
+                                importReference=True)
+                            refs_imported += 1
+                        except Exception:
+                            pass
+                    if refs_imported:
+                        self._log("Importing references...")
+
+                    # Strip namespaces
+                    all_ns = cmds.namespaceInfo(
+                        listOnlyNamespaces=True, recurse=True
+                    ) or []
+                    skip_ns = {"UI", "shared"}
+                    all_ns = [ns for ns in all_ns if ns not in skip_ns]
+                    all_ns.sort(key=len, reverse=True)
+                    for ns in all_ns:
+                        try:
+                            cmds.namespace(
+                                removeNamespace=ns,
+                                mergeNamespaceWithRoot=True)
+                        except Exception:
+                            pass
+
+                    # Resolve names after namespace strip
+                    def _resolve(name):
+                        if not name:
+                            return name
+                        long_names = cmds.ls(name, long=True)
+                        if long_names:
+                            return long_names[0]
+                        short = name.rsplit(":", 1)[-1]
+                        long_names = cmds.ls(short, long=True)
+                        if len(long_names) == 1:
+                            return long_names[0]
+                        return name
+
+                    resolved_meshes = [_resolve(fm) for fm in face_meshes]
+                    resolved_statics = [_resolve(sg) for sg in static_geos]
+                    resolved_cam = _resolve(camera) if camera else camera
+
+                    # Convert Alembic vertex animation to
+                    # blendshapes so the .ma has no .abc dependency.
+                    self._log("Preparing MA export...")
+                    ma_prep = exporter.prepare_face_track_for_export(
+                        resolved_meshes, start_frame, end_frame
+                    )
+
+                    # Export the converted meshes (blendshape bases
+                    # replace the originals in the selection)
+                    export_nodes = ma_prep.get(
+                        "select_for_export", resolved_meshes)
+                    results["ma"] = exporter.export_ma(
+                        paths["ma"], resolved_cam,
+                        export_nodes, [], resolved_statics,
+                        start_frame=start_frame, end_frame=end_frame,
+                    )
+                except Exception as exc:
+                    self._log(
+                        "MA export failed. See Script Editor.")
+                    sys.stderr.write(
+                        "[ExportGenie] MA error: {}\n".format(exc))
+                    results["ma"] = False
+                finally:
+                    cmds.undoInfo(closeChunk=True)
+                    try:
+                        cmds.undo()
+                        self._log("Scene restored.")
+                    except Exception:
+                        self._log(
+                            "Undo failed. See Script Editor.")
+                    # Safety net: delete any surviving artifacts
+                    for bm in ma_prep.get("base_meshes", []):
+                        if cmds.objExists(bm):
+                            try:
+                                cmds.delete(bm)
+                            except Exception:
+                                pass
                 self._log_result("MA", results["ma"])
                 self._advance_progress()
 
@@ -6977,7 +8336,7 @@ class MultiExportUI(object):
                 mp4_mode = ".mp4" in fmt_choice
                 if mp4_mode and not Exporter._find_ffmpeg():
                     self._log(
-                        "Playblast skipped — ffmpeg.exe not found.")
+                        "Playblast skipped — ffmpeg not found.")
                     results["mov"] = False
                 else:
                     if mp4_mode:
@@ -6992,23 +8351,26 @@ class MultiExportUI(object):
                         pb_path = paths["mov"]
                     self._log("Preparing playblast...")
                     raw_pb = cmds.checkBox(
-                        self.ft_raw_playblast_cb, query=True,
+                        self.pb_raw_playblast_cb, query=True,
                         value=True)
                     custom_vt = cmds.checkBox(
-                        self.ft_custom_vt_cb, query=True,
+                        self.pb_custom_vt_cb, query=True,
                         value=True)
                     chk_scale = cmds.intSliderGrp(
-                        self.ft_checker_scale, query=True, value=True)
+                        self.pb_checker_scale, query=True, value=True)
                     chk_color = tuple(cmds.colorSliderGrp(
-                        self.ft_checker_color, query=True,
+                        self.pb_checker_color, query=True,
                         rgbValue=True))
                     chk_opacity = cmds.intSliderGrp(
-                        self.ft_checker_opacity, query=True,
+                        self.pb_checker_opacity, query=True,
                         value=True)
                     aa16 = cmds.checkBox(
-                        self.ft_aa16_cb, query=True, value=True)
+                        self.pb_aa16_cb, query=True, value=True)
                     far_clip = cmds.intSliderGrp(
-                        self.ft_far_clip, query=True, value=True)
+                        self.pb_far_clip, query=True, value=True)
+                    show_hud = cmds.checkBox(
+                        self.pb_hud_overlay_cb, query=True,
+                        value=True)
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=face_meshes,
@@ -7022,10 +8384,27 @@ class MultiExportUI(object):
                         png_mode=png_mode,
                         mp4_mode=mp4_mode,
                         mp4_output=paths.get("mp4"),
+                        show_hud=show_hud,
+                        composite_plate_path=paths.get(
+                            "composite_plate"),
+                        composite_color_path=paths.get(
+                            "composite_color"),
+                        composite_matte_path=paths.get(
+                            "composite_matte"),
+                        composite_tmp_dir=paths.get(
+                            "composite_tmp"),
                     )
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
         finally:
+            # Undo Alembic camera bake (restores original connections)
+            if baked_abc_cam:
+                try:
+                    cmds.undoInfo(closeChunk=True)
+                    cmds.undo()
+                except Exception:
+                    self._log(
+                        "Undo camera bake failed. See Script Editor.")
             # Restore original camera name
             if renamed_cam and cmds.objExists(renamed_cam):
                 cmds.rename(renamed_cam, original_cam_name)
@@ -7065,10 +8444,58 @@ class MultiExportUI(object):
 # Entry Points
 # ---------------------------------------------------------------------------
 def launch():
-    """Open the Export Genie UI. Called by the shelf button."""
+    """Open the Export Genie UI. Called by the shelf button.
+
+    Forces a module reload so dropping a new ExportGenie.py into the
+    scripts folder and clicking the shelf button is enough to upgrade.
+    """
+    import importlib
+    import ExportGenie as _self_mod
+    importlib.reload(_self_mod)
+    _self_mod._launch_inner()
+
+
+def _launch_inner():
+    """Internal launcher — called after the module has been reloaded."""
     global _ui_instance
+
+    # Tear down existing workspace control if present
+    if cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True):
+        cmds.deleteUI(WORKSPACE_CONTROL_NAME)
+
     _ui_instance = MultiExportUI()
-    _ui_instance.show()
+
+    cmds.workspaceControl(
+        WORKSPACE_CONTROL_NAME,
+        label="Export Genie  {}".format(TOOL_VERSION),
+        floating=True,
+        initialWidth=440,
+        initialHeight=480,
+        minimumWidth=380,
+        retain=False,
+        uiScript="import ExportGenie; ExportGenie._restore_ui()",
+        closeCommand="import ExportGenie; ExportGenie._on_workspace_close()",
+    )
+
+
+def _restore_ui():
+    """Called by workspaceControl uiScript to (re)build UI contents."""
+    global _ui_instance
+    # Force a module reload so the latest code is always used
+    import importlib
+    import ExportGenie as _self_mod
+    importlib.reload(_self_mod)
+    _self_mod._ui_instance = MultiExportUI()
+    _ui_instance = _self_mod._ui_instance
+    cmds.setParent(WORKSPACE_CONTROL_NAME)
+    _ui_instance._build_ui_contents()
+
+
+def _on_workspace_close():
+    """Called by workspaceControl closeCommand."""
+    global _ui_instance
+    if _ui_instance is not None:
+        _ui_instance._on_window_close()
 
 
 # ---------------------------------------------------------------------------
@@ -7186,32 +8613,65 @@ def install():
         sys.modules.pop(old_mod, None)
 
     # Copy self to Maya's scripts directory (if not already there)
-    if os.path.normpath(source_file) != os.path.normpath(dest_file):
+    same_file = False
+    try:
+        same_file = os.path.samefile(source_file, dest_file)
+    except (OSError, ValueError):
+        same_file = (os.path.normpath(source_file)
+                     == os.path.normpath(dest_file))
+    if not same_file:
         if not os.path.exists(scripts_dir):
             os.makedirs(scripts_dir)
         shutil.copy2(source_file, dest_file)
     installed_items.append(("Script", dest_file))
 
-    # Copy bundled bin/ directory (contains ffmpeg.exe for Windows)
+    # Copy bundled bin/ directory (contains ffmpeg for Windows/macOS)
     source_dir = os.path.dirname(source_file)
+
     source_bin = os.path.join(source_dir, "bin")
     dest_bin = os.path.join(scripts_dir, "bin")
-    dest_ffmpeg = os.path.join(dest_bin, "win", "ffmpeg.exe")
-    if os.path.isdir(source_bin):
+    if sys.platform == "win32":
+        dest_ffmpeg = os.path.join(dest_bin, "win", "ffmpeg.exe")
+    elif sys.platform == "darwin":
+        dest_ffmpeg = os.path.join(dest_bin, "mac", "ffmpeg")
+    else:
+        dest_ffmpeg = None
+    same_bin = False
+    try:
+        same_bin = (os.path.isdir(dest_bin)
+                    and os.path.samefile(source_bin, dest_bin))
+    except (OSError, ValueError):
+        pass
+    if os.path.isdir(source_bin) and not same_bin:
         shutil.copytree(source_bin, dest_bin, dirs_exist_ok=True)
+        # Ensure macOS ffmpeg binary is executable and
+        # clear Gatekeeper quarantine attribute
+        if sys.platform == "darwin" and dest_ffmpeg:
+            try:
+                os.chmod(dest_ffmpeg, 0o755)
+            except OSError:
+                pass
+            try:
+                subprocess.run(
+                    ["xattr", "-d",
+                     "com.apple.quarantine", dest_ffmpeg],
+                    check=False,
+                    capture_output=True)
+            except Exception:
+                pass
         for root, _dirs, files in os.walk(dest_bin):
             for fname in files:
                 fpath = os.path.join(root, fname)
                 installed_items.append(("Bundled", fpath))
-    elif os.path.isfile(dest_ffmpeg):
+    elif dest_ffmpeg and os.path.isfile(dest_ffmpeg):
         # No bin/ shipped with this drop, but a previous install
         # already placed ffmpeg — report it so the user knows.
         installed_items.append(("Already installed", dest_ffmpeg))
-    elif sys.platform == "win32":
+    elif dest_ffmpeg:
         # Neither source nor destination has ffmpeg — warn the user.
         installed_items.append((
             "NOT FOUND",
-            "ffmpeg.exe  (expected at {})".format(dest_ffmpeg)))
+            "ffmpeg  (expected at {})".format(dest_ffmpeg)))
 
     # Clear compiled .pyc cache to ensure a fresh import
     pycache_dir = os.path.join(scripts_dir, "__pycache__")
