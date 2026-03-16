@@ -24,7 +24,7 @@ import maya.mel as mel
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v11_beta-8"
+TOOL_VERSION = "v11_beta-9"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -1303,8 +1303,6 @@ class Exporter(object):
             pass
 
         # --- Pass 1: create all targets and add to blendShape ---
-        # Targets must remain alive for FBX export to properly include
-        # blendshape animation channels.
         for i, f in enumerate(frames):
             cmds.currentTime(f, e=True)
 
@@ -1361,11 +1359,18 @@ class Exporter(object):
         self.log("Keyed {}/{} blendshape weights on '{}'.".format(
             keyed_count, len(frames), bs_node))
 
-        # Keep target shapes alive — the FBX plugin follows
-        # InputConnections from base_mesh -> blendShape -> targets.
-        # Without them the exported FBX contains no blendshape data.
-        # The undo chunk in _export_face_track restores the scene
-        # after export.
+        # Delete target shapes and their group — the blendShape node
+        # stores deltas internally, so the physical targets are no
+        # longer needed.  Keeping them causes FBX InputConnections to
+        # pull them into the export as extra geometry (visible in
+        # other DCCs even though hidden in Maya).
+        if cmds.objExists(grp):
+            try:
+                cmds.delete(grp)
+            except Exception as exc:
+                sys.stderr.write(
+                    "[ExportGenie] WARNING: Could not delete targets "
+                    "group '{}': {}\n".format(grp, exc))
 
         # Delete original Alembic source mesh — prevents the FBX
         # exporter from including the original (still Alembic-driven)
@@ -8641,24 +8646,10 @@ def install():
         same_bin = (os.path.isdir(dest_bin)
                     and os.path.samefile(source_bin, dest_bin))
     except (OSError, ValueError):
-        pass
+        same_bin = (os.path.normpath(source_bin)
+                    == os.path.normpath(dest_bin))
     if os.path.isdir(source_bin) and not same_bin:
         shutil.copytree(source_bin, dest_bin, dirs_exist_ok=True)
-        # Ensure macOS ffmpeg binary is executable and
-        # clear Gatekeeper quarantine attribute
-        if sys.platform == "darwin" and dest_ffmpeg:
-            try:
-                os.chmod(dest_ffmpeg, 0o755)
-            except OSError:
-                pass
-            try:
-                subprocess.run(
-                    ["xattr", "-d",
-                     "com.apple.quarantine", dest_ffmpeg],
-                    check=False,
-                    capture_output=True)
-            except Exception:
-                pass
         for root, _dirs, files in os.walk(dest_bin):
             for fname in files:
                 fpath = os.path.join(root, fname)
@@ -8672,6 +8663,23 @@ def install():
         installed_items.append((
             "NOT FOUND",
             "ffmpeg  (expected at {})".format(dest_ffmpeg)))
+
+    # Ensure macOS ffmpeg binary is executable and
+    # clear Gatekeeper quarantine attribute (runs on every install)
+    if sys.platform == "darwin" and dest_ffmpeg and os.path.isfile(
+            dest_ffmpeg):
+        try:
+            os.chmod(dest_ffmpeg, 0o755)
+        except OSError:
+            pass
+        try:
+            subprocess.run(
+                ["xattr", "-d",
+                 "com.apple.quarantine", dest_ffmpeg],
+                check=False,
+                capture_output=True)
+        except Exception:
+            pass
 
     # Clear compiled .pyc cache to ensure a fresh import
     pycache_dir = os.path.join(scripts_dir, "__pycache__")
