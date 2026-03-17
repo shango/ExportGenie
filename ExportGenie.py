@@ -24,7 +24,7 @@ import maya.mel as mel
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v11_beta-9"
+TOOL_VERSION = "v11_beta-11"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -488,6 +488,7 @@ class Exporter(object):
         try:
             result = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=600,
@@ -601,6 +602,7 @@ class Exporter(object):
         try:
             result = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=600,
@@ -3457,12 +3459,17 @@ class Exporter(object):
                             start_frame, mp4_output,
                             opacity=opacity_01)
                     else:
-                        # .mov output via composite
+                        # Composite output — use .mp4 on macOS for
+                        # reliable ffmpeg encoding; .mov on Windows.
+                        composite_out = file_path
+                        if sys.platform == "darwin":
+                            composite_out = os.path.splitext(
+                                file_path)[0] + ".mp4"
                         encode_ok = self._encode_composite(
                             plate_dir, plate_base,
                             color_dir, color_base,
                             matte_dir, matte_base,
-                            start_frame, file_path,
+                            start_frame, composite_out,
                             opacity=opacity_01)
 
                     if encode_ok:
@@ -7786,6 +7793,32 @@ class MultiExportUI(object):
                     self._log(
                         "Camera not found. See Script Editor.")
                     camera = None
+
+            # Unlock any locked locators in the export groups so that
+            # FBX/ABC exporters can bake and export their transforms.
+            _all_export_roots = geo_roots + rig_roots + proxy_geos
+            if camera and cmds.objExists(camera):
+                _all_export_roots.append(camera)
+            _lock_attrs = [
+                "tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"]
+            for root in _all_export_roots:
+                if not root or not cmds.objExists(root):
+                    continue
+                descendants = cmds.listRelatives(
+                    root, allDescendents=True, fullPath=True) or []
+                all_nodes = (cmds.ls(root, long=True) or []) + descendants
+                for node in all_nodes:
+                    loc_shapes = cmds.listRelatives(
+                        node, shapes=True, type="locator") or []
+                    if not loc_shapes:
+                        continue
+                    for attr in _lock_attrs:
+                        plug = "{}.{}".format(node, attr)
+                        try:
+                            if cmds.getAttr(plug, lock=True):
+                                cmds.setAttr(plug, lock=False)
+                        except Exception:
+                            pass
 
             if do_ma:
                 results["ma"] = exporter.export_ma(
