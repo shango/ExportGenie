@@ -2686,7 +2686,7 @@ class Exporter(object):
                 cmds.headsUpDisplay(
                     hud_frame, section=7,
                     block=cmds.headsUpDisplay(nextFreeBlock=7),
-                    label="Frame:",
+                    label="",
                     labelFontSize="large",
                     dataFontSize="large",
                     blockSize="large",
