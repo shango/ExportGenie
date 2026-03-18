@@ -791,7 +791,7 @@ class Exporter(object):
                    export_input_connections=False):
         """Export camera + geo + rig + proxy geo as FBX with baked keyframes.
 
-        UE5-conforming settings: Resample All ON, Tangents ON, Up Axis Y.
+        UE5-conforming settings: Resample All ON, Tangents ON, Up Axis Z.
 
         Args:
             geo_roots: list of geo root transforms (or empty list).
@@ -1002,7 +1002,7 @@ class Exporter(object):
 
             try:
                 cmds.select(sel, replace=True)
-                mel_path = file_path.replace("\\", "/")
+                mel_path = file_path.replace("\\", "/").replace('"', '\\"')
                 mel.eval('FBXExport -f "{}" -s'.format(mel_path))
             finally:
                 if cmds.objExists(info_grp):
@@ -1017,16 +1017,18 @@ class Exporter(object):
             return False
 
     def export_abc(self, file_path, camera, geo_roots, proxy_geos,
-                   start_frame, end_frame):
-        """Export camera + geo roots + proxy geo as Alembic cache.
+                   start_frame, end_frame, rig_roots=None):
+        """Export camera + geo roots + rig roots + proxy geo as Alembic cache.
 
         Args:
             geo_roots: list of geo root transforms (or empty list).
             proxy_geos: list of static/proxy geo transforms (or empty list).
+            rig_roots: list of rig root transforms (or empty list).
         """
         try:
             geo_roots = geo_roots or []
             proxy_geos = proxy_geos or []
+            rig_roots = rig_roots or []
             # Ensure Alembic plugin is loaded
             if not cmds.pluginInfo("AbcExport", query=True, loaded=True):
                 try:
@@ -1046,13 +1048,13 @@ class Exporter(object):
                     )
                     return False
 
-            if not camera and not geo_roots and not proxy_geos:
+            if not camera and not geo_roots and not proxy_geos and not rig_roots:
                 self.log("ABC skipped — nothing to export.")
                 return False
 
             # Build root flags — skip camera if it's already under
             # any assigned group.
-            all_roots = geo_roots + proxy_geos
+            all_roots = geo_roots + rig_roots + proxy_geos
             cam_under_root = any(
                 self._is_descendant_of(camera, gr)
                 for gr in all_roots if gr
@@ -1061,7 +1063,8 @@ class Exporter(object):
             info_grp = self._create_metadata_grp()
 
             root_flags = ""
-            root_nodes = [camera] + geo_roots + proxy_geos + [info_grp]
+            root_nodes = ([camera] + geo_roots + rig_roots
+                          + proxy_geos + [info_grp])
             for node in root_nodes:
                 if not node:
                     continue
@@ -1075,7 +1078,8 @@ class Exporter(object):
                         "ABC failed — '{}' not found.".format(node)
                     )
                     return False
-                root_flags += "-root {} ".format(long_names[0])
+                root_flags += "-root '{}' ".format(
+                    long_names[0].replace("'", "\\'"))
 
             abc_path = file_path.replace("\\", "/")
 
@@ -1091,7 +1095,7 @@ class Exporter(object):
                 start=int(start_frame),
                 end=int(end_frame),
                 roots=root_flags,
-                file=abc_path,
+                file=abc_path.replace("'", "\\'"),
             )
 
             try:
@@ -1102,6 +1106,10 @@ class Exporter(object):
                         cmds.delete(info_grp)
                     except Exception:
                         pass
+            if not os.path.isfile(file_path):
+                self.log(
+                    "ABC export completed but file not found.")
+                return False
             return True
         except Exception as e:
             self._log_error("ABC", e)
@@ -1114,8 +1122,10 @@ class Exporter(object):
 
         Maya's OBJ exporter writes vertices in world space.  To avoid a
         double-offset in After Effects (where the JSX also sets position/
-        rotation/scale), we temporarily reset the node's world matrix to
-        identity so vertices are written in local (object) space.
+        rotation/scale), we duplicate the node, zero its transforms, and
+        export the duplicate so vertices are written in local space.
+        This handles locked, constrained, or Alembic-driven channels
+        that would cause a direct xform set to silently fail.
 
         Args:
             file_path: Output .obj path.
@@ -1128,18 +1138,24 @@ class Exporter(object):
             if not cmds.pluginInfo("objExport", query=True, loaded=True):
                 cmds.loadPlugin("objExport")
 
-            # Save the current world matrix and reset to identity so the
-            # OBJ exporter writes vertices in local space.
-            orig_m = cmds.xform(geo_node, query=True,
-                                worldSpace=True, matrix=True)
+            # Duplicate the geo and zero its transforms so the OBJ
+            # exporter writes vertices in local space.  This avoids
+            # issues with locked/constrained/Alembic-driven channels
+            # where cmds.xform would silently fail.
+            dup = cmds.duplicate(geo_node, rr=True, name="_obj_tmp_")[0]
+            cmds.delete(dup, ch=True)
+            try:
+                cmds.parent(dup, world=True)
+            except Exception:
+                pass
             identity = [1, 0, 0, 0,
                         0, 1, 0, 0,
                         0, 0, 1, 0,
                         0, 0, 0, 1]
-            cmds.xform(geo_node, worldSpace=True, matrix=identity)
+            cmds.xform(dup, worldSpace=True, matrix=identity)
 
             try:
-                cmds.select(geo_node, replace=True)
+                cmds.select(dup, replace=True)
                 cmds.file(
                     file_path,
                     exportSelected=True,
@@ -1148,8 +1164,8 @@ class Exporter(object):
                     options="groups=1;ptgroups=1;materials=0;smoothing=1;normals=1",
                 )
             finally:
-                # Always restore the original transform.
-                cmds.xform(geo_node, worldSpace=True, matrix=orig_m)
+                if cmds.objExists(dup):
+                    cmds.delete(dup)
 
             return True
         except Exception as e:
@@ -1231,7 +1247,6 @@ class Exporter(object):
             at=["tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"],
             simulation=True,
             preserveOutsideKeys=True,
-            minimizeRotation=True,
         )
 
         cmds.delete(pc)
@@ -1340,16 +1355,23 @@ class Exporter(object):
             if f > start:
                 cmds.setKeyframe(w, t=f - 1, v=0.0)
             cmds.setKeyframe(w, t=f, v=1.0)
-            cmds.setKeyframe(w, t=f + 1, v=0.0)
 
-            # Step tangents for hold
+            # Step tangent on the peak key
             try:
                 cmds.keyTangent(
                     w, time=(f, f), itt="stepnext", ott="step")
-                cmds.keyTangent(
-                    w, time=(f + 1, f + 1), itt="stepnext", ott="step")
             except Exception:
                 pass
+
+            # Decay key at f+1 only if within the export range
+            if f < end:
+                cmds.setKeyframe(w, t=f + 1, v=0.0)
+                try:
+                    cmds.keyTangent(
+                        w, time=(f + 1, f + 1),
+                        itt="stepnext", ott="step")
+                except Exception:
+                    pass
 
         # Diagnostic: verify keyframes were set
         keyed_count = 0
@@ -1395,7 +1417,6 @@ class Exporter(object):
         return {
             "base_mesh": base_mesh,
             "blendshape_node": bs_node,
-            "targets_group": grp,
         }
 
     # --- Face Track: classification helpers ---
@@ -1444,7 +1465,6 @@ class Exporter(object):
             at=trs,
             simulation=True,
             preserveOutsideKeys=True,
-            minimizeRotation=True,
         )
         # Disconnect any non-animCurve sources that survived the bake
         # (e.g. AlembicNode connections). Keeps animCurve connections
@@ -2189,9 +2209,11 @@ class Exporter(object):
     def detect_vertex_anim_meshes(self, geo_roots, start_frame, end_frame):
         """Detect meshes with per-vertex animation under geo_roots.
 
-        Samples 3 vertex positions at start_frame vs end_frame to find
-        meshes with real vertex deformation (vs. AlembicNode only driving
-        TRS).  Read-only — does not modify the scene.
+        Samples 3 vertex positions across 4 frames (start, 1/3, 2/3,
+        end) to find meshes with real vertex deformation (vs.
+        AlembicNode only driving TRS).  Multiple sample frames avoid
+        false negatives when a mesh returns to rest pose at the
+        endpoints.  Read-only — does not modify the scene.
 
         Args:
             geo_roots: list of root transforms to search under.
@@ -2239,12 +2261,21 @@ class Exporter(object):
             return vertex_anim_set
 
         original_time = cmds.currentTime(query=True)
-        sample_frame_a = int(start_frame)
-        sample_frame_b = int(end_frame)
+        sf = int(start_frame)
+        ef = int(end_frame)
 
-        # Collect positions at frame A
-        cmds.currentTime(sample_frame_a, edit=True)
-        positions_a = {}  # {long_name: (shape, indices, [pos, ...])}
+        # Sample at start, 1/3, 2/3, and end for robust detection
+        # (avoids missing meshes that return to rest pose at endpoints)
+        sample_frames = sorted(set([
+            sf,
+            sf + max(1, (ef - sf) // 3),
+            sf + max(1, (ef - sf) * 2 // 3),
+            ef,
+        ]))
+
+        # Collect reference positions at first sample frame
+        cmds.currentTime(sample_frames[0], edit=True)
+        positions_ref = {}  # {long_name: (shape, indices, [pos, ...])}
         for xform in mesh_xforms:
             shapes = cmds.listRelatives(
                 xform, shapes=True, type="mesh", fullPath=True
@@ -2264,13 +2295,18 @@ class Exporter(object):
                 for idx in indices:
                     pts.append(cmds.pointPosition(
                         "{}.vtx[{}]".format(shp, idx), local=True))
-                positions_a[xform] = (shp, indices, pts)
+                positions_ref[xform] = (shp, indices, pts)
                 break  # one non-intermediate shape is enough
 
-        # Collect positions at frame B and compare
-        if sample_frame_a != sample_frame_b:
-            cmds.currentTime(sample_frame_b, edit=True)
-            for long_name, (shp, indices, pts_a) in positions_a.items():
+        # Compare against remaining sample frames
+        for sample_frame in sample_frames[1:]:
+            if not positions_ref:
+                break
+            cmds.currentTime(sample_frame, edit=True)
+            still_checking = {}
+            for long_name, (shp, indices, pts_a) in positions_ref.items():
+                if long_name in vertex_anim_set:
+                    continue
                 found = False
                 for i, idx in enumerate(indices):
                     pos_b = cmds.pointPosition(
@@ -2282,6 +2318,9 @@ class Exporter(object):
                             break
                     if found:
                         break
+                if not found:
+                    still_checking[long_name] = (shp, indices, pts_a)
+            positions_ref = still_checking
 
         cmds.currentTime(original_time, edit=True)
         return vertex_anim_set
@@ -2327,8 +2366,10 @@ class Exporter(object):
                     for child in children:
                         leaves.extend(_collect_leaves(child))
                 else:
-                    # Non-mesh leaf (locator, null, etc.) — include if animated
-                    leaves.append(node)
+                    # Non-mesh leaf (locator, null, etc.) — only
+                    # include if it has driven transforms
+                    if self._has_driven_transforms(node):
+                        leaves.append(node)
             return leaves
 
         # Phase 1: collect all leaf transforms
@@ -2648,7 +2689,7 @@ class Exporter(object):
                     label="Frame:",
                     labelFontSize="large",
                     dataFontSize="large",
-                    blockSize="medium",
+                    blockSize="large",
                     command=lambda: int(cmds.currentTime(query=True)),
                     attachToRefresh=True,
                 )
@@ -2661,10 +2702,10 @@ class Exporter(object):
                         cmds.headsUpDisplay(hud_fl, remove=True)
                     fl_shape = hud_cam_shape
                     cmds.headsUpDisplay(
-                        hud_fl, section=9,
-                        block=cmds.headsUpDisplay(nextFreeBlock=9),
+                        hud_fl, section=8,
+                        block=cmds.headsUpDisplay(nextFreeBlock=8),
                         label="FL:", labelFontSize="large",
-                        dataFontSize="large", blockSize="medium",
+                        dataFontSize="large", blockSize="large",
                         command=lambda: cmds.getAttr(
                             fl_shape + ".focalLength"),
                         attachToRefresh=True,
@@ -2819,6 +2860,7 @@ class Exporter(object):
             original_use_default_mtl = None
             original_image_plane = None
             original_nurbs_curves = None
+            original_shadows = None
             mm_meshes = []
             composite_rendered = False
 
@@ -3026,6 +3068,9 @@ class Exporter(object):
                                 os.makedirs(d)
 
                         # --- Pass 1: Plate (background only) ---
+                        # All composite passes use showOrnaments=False
+                        # for clean compositing; HUD is added by the
+                        # single-pass fallback path instead.
                         self.log("Rendering plate pass...")
                         cmds.modelEditor(
                             model_panel, edit=True,
@@ -3043,7 +3088,7 @@ class Exporter(object):
                             sequenceTime=False,
                             clearCache=True,
                             viewer=False,
-                            showOrnaments=show_hud,
+                            showOrnaments=False,
                             framePadding=4,
                             percent=100,
                             quality=100,
@@ -3064,6 +3109,8 @@ class Exporter(object):
                         # Flat lighting — no viewport shading or
                         # shadows so self-shadowing doesn't affect
                         # the composite.
+                        original_shadows = cmds.modelEditor(
+                            model_panel, query=True, shadows=True)
                         cmds.modelEditor(
                             model_panel, edit=True,
                             displayLights="flat",
@@ -3385,8 +3432,12 @@ class Exporter(object):
                     self._log_error("MM/FT Checker", exc)
 
             # --- Flat lighting (all playblast paths) ---
+            # Skip if the composite path already saved/set displayLights
+            # (original_display_lights is not None), to avoid overwriting
+            # the correct saved value.
             original_flat_lighting = None
-            if not raw_playblast and model_panel:
+            if (not raw_playblast and model_panel
+                    and original_display_lights is None):
                 try:
                     original_flat_lighting = cmds.modelEditor(
                         model_panel, query=True, displayLights=True)
@@ -3641,6 +3692,13 @@ class Exporter(object):
                         cmds.modelEditor(
                             model_panel, edit=True,
                             displayLights=original_display_lights)
+                    except Exception:
+                        pass
+                if original_shadows is not None and model_panel:
+                    try:
+                        cmds.modelEditor(
+                            model_panel, edit=True,
+                            shadows=original_shadows)
                     except Exception:
                         pass
                 if original_use_default_mtl is not None and model_panel:
@@ -4189,10 +4247,8 @@ class Exporter(object):
             return jsx
         cam_shape = shapes[0]
 
-        focal_length = cmds.getAttr(cam_shape + ".focalLength")
         h_aperture_inches = cmds.getAttr(cam_shape + ".horizontalFilmAperture")
         h_aperture_mm = h_aperture_inches * 25.4
-        ae_zoom = focal_length * comp_width / h_aperture_mm
 
         layer_var = "camera_{}".format(self._sanitize_jsx_var(camera))
         layer_name = self._escape_jsx_string(camera)
@@ -4209,12 +4265,16 @@ class Exporter(object):
         jsx.append("var rotXArray = new Array();")
         jsx.append("var rotYArray = new Array();")
         jsx.append("var rotZArray = new Array();")
+        jsx.append("var zoomArray = new Array();")
 
         for frame in range(int(start_frame), int(end_frame) + 1):
             cmds.currentTime(frame)
             pos, rot, _ = self._world_matrix_to_ae(
                 camera, ae_scale, comp_cx, comp_cy
             )
+
+            focal_length = cmds.getAttr(cam_shape + ".focalLength")
+            ae_zoom = focal_length * comp_width / h_aperture_mm
 
             time_sec = (frame - start_frame + 1) / fps
 
@@ -4224,13 +4284,14 @@ class Exporter(object):
             jsx.append("rotXArray.push({:.10f});".format(rot[0]))
             jsx.append("rotYArray.push({:.10f});".format(rot[1]))
             jsx.append("rotZArray.push({:.10f});".format(rot[2]))
+            jsx.append("zoomArray.push({:.10f});".format(ae_zoom))
 
         jsx.append("")
         jsx.append("{v}.position.setValuesAtTimes(timesArray, posArray);".format(v=layer_var))
         jsx.append("{v}.rotationX.setValuesAtTimes(timesArray, rotXArray);".format(v=layer_var))
         jsx.append("{v}.rotationY.setValuesAtTimes(timesArray, rotYArray);".format(v=layer_var))
         jsx.append("{v}.rotationZ.setValuesAtTimes(timesArray, rotZArray);".format(v=layer_var))
-        jsx.append("{v}.zoom.setValue({z:.10f});".format(v=layer_var, z=ae_zoom))
+        jsx.append("{v}.zoom.setValuesAtTimes(timesArray, zoomArray);".format(v=layer_var))
         jsx.append("")
         return jsx
 
@@ -4501,7 +4562,7 @@ class Exporter(object):
 
     # --- JSX Orchestrator ---
 
-    def export_jsx(self, jsx_path, obj_paths, camera, geo_root,
+    def export_jsx(self, jsx_path, obj_paths, camera, geo_children,
                    start_frame, end_frame):
         """Export After Effects JSX + OBJ files.
 
@@ -4509,7 +4570,7 @@ class Exporter(object):
             jsx_path: Output .jsx file path.
             obj_paths: dict of {geo_child_name: obj_file_path}.
             camera: Maya camera transform (or None).
-            geo_root: Maya geo root transform (or None).
+            geo_children: list of pre-filtered geo child transforms.
             start_frame: First frame.
             end_frame: Last frame.
 
@@ -4561,24 +4622,13 @@ class Exporter(object):
                     comp_width, comp_height, ae_scale
                 )
                 jsx_lines.extend(cam_jsx)
+                # Camera scrub leaves Maya at end_frame — reset to
+                # start_frame so static geo is sampled correctly.
+                cmds.currentTime(int(start_frame), edit=True)
 
             # Export OBJs and generate null layers
-            if geo_root:
-                children = cmds.listRelatives(
-                    geo_root, children=True, type="transform",
-                    fullPath=True,
-                ) or []
-                if not children:
-                    # geo_root itself is the only geo
-                    gr_long = cmds.ls(geo_root, long=True)
-                    children = gr_long if gr_long else [geo_root]
-                # Skip camera (and its parent groups) from geo children
-                if camera:
-                    children = [
-                        c for c in children
-                        if not self._is_descendant_of(camera, c)
-                    ]
-                for child in children:
+            if geo_children:
+                for child in geo_children:
                     # Use short name for display/keys, long path
                     # for Maya commands to avoid ambiguity
                     child_short = child.rsplit("|", 1)[-1]
@@ -6134,10 +6184,38 @@ class MultiExportUI(object):
             assigned.append(("Geo Group{}".format(suffix), g))
         self._check_name_collisions(errors, assigned)
 
-        if do_jsx:
+        if do_jsx and geo_roots:
+            # Collect all geo children across all roots and check for
+            # cross-root name collisions (OBJ files use short names).
+            all_jsx_children = []
             for g in geo_roots:
-                if g and cmds.objExists(g):
-                    self._check_obj_name_collisions(errors, g, camera)
+                if not g or not cmds.objExists(g):
+                    continue
+                children = cmds.listRelatives(
+                    g, children=True, type="transform") or []
+                if not children:
+                    gr_long = cmds.ls(g, long=True)
+                    children = gr_long if gr_long else [g]
+                if camera:
+                    children = [
+                        c for c in children
+                        if not Exporter._is_descendant_of(camera, c)]
+                children = [
+                    c for c in children
+                    if "chisels" not in c.lower()
+                    and "nulls" not in c.lower()]
+                all_jsx_children.extend(children)
+            name_count = {}
+            for c in all_jsx_children:
+                short = c.rsplit("|", 1)[-1].rsplit(":", 1)[-1]
+                name_count.setdefault(short, []).append(c)
+            for short, nodes in name_count.items():
+                if len(nodes) > 1:
+                    errors.append(
+                        "Name collision: Multiple geo children share "
+                        "the name '{}'. OBJ files would overwrite "
+                        "each other. Please rename them to be "
+                        "unique.".format(short))
 
         return errors, warnings
 
@@ -6204,8 +6282,10 @@ class MultiExportUI(object):
             errors.append(
                 "FBX export enabled but no Mesh Group or Main Rig Group assigned."
             )
-        if do_abc and not geo_roots:
-            errors.append("Alembic export enabled but no Mesh Group assigned.")
+        if do_abc and not (geo_roots or rig_roots):
+            errors.append(
+                "Alembic export enabled but no Mesh Group or "
+                "Main Rig Group assigned.")
 
         if camera and not cmds.objExists(camera):
             errors.append(
@@ -6232,6 +6312,16 @@ class MultiExportUI(object):
             if g:
                 assigned.append(("Mesh Group{}".format(suffix), g))
         self._check_name_collisions(errors, assigned)
+
+        # T-pose frame validation
+        if cmds.checkBox(self.tpose_checkbox, query=True, value=True):
+            tpose_frame = cmds.intField(
+                self.tpose_frame_field, query=True, value=True)
+            if tpose_frame >= start_frame:
+                warnings.append(
+                    "T-pose frame ({}) is not before start frame "
+                    "({}). The T-pose will not be a distinct frame "
+                    "in the export.".format(tpose_frame, start_frame))
 
         return errors, warnings
 
@@ -6543,13 +6633,17 @@ class MultiExportUI(object):
                                           camera)
 
             # --- Flat lighting (all tabs) ---
-            try:
-                state["original_flat_lighting"] = cmds.modelEditor(
-                    model_panel, query=True, displayLights=True)
-                cmds.modelEditor(
-                    model_panel, edit=True, displayLights="flat")
-            except Exception:
-                pass
+            # Skip if the MM/FT preview already saved/set displayLights
+            # (original_display_lights is in state), to avoid overwriting
+            # the correct saved value on exit.
+            if "original_display_lights" not in state:
+                try:
+                    state["original_flat_lighting"] = cmds.modelEditor(
+                        model_panel, query=True, displayLights=True)
+                    cmds.modelEditor(
+                        model_panel, edit=True, displayLights="flat")
+                except Exception:
+                    pass
 
             # --- Backface culling (all tabs) ---
             original_culling = {}
@@ -7409,8 +7503,8 @@ class MultiExportUI(object):
                     renamed_cam = cmds.rename(camera, "cam_main")
                     camera = renamed_cam
                 elif cmds.objExists("cam_main"):
-                    # Previous run may have renamed without restoring
-                    renamed_cam = "cam_main"
+                    # cam_main already exists (e.g. from a prior
+                    # export) — use it but don't mark for restore
                     camera = "cam_main"
                 else:
                     self._log(
@@ -7454,14 +7548,14 @@ class MultiExportUI(object):
                                 channelBox=True)
                         except Exception:
                             pass
-                    # Bake transform channels
+                    # Bake transform channels (no minimizeRotation —
+                    # camera tracking requires exact rotation curves)
                     cmds.bakeResults(
                         camera,
                         t=(int(start_frame), int(end_frame)),
                         at=trs,
                         simulation=True,
                         preserveOutsideKeys=True,
-                        minimizeRotation=True,
                     )
                     # Bake focal length on camera shape
                     for shp in cam_shapes:
@@ -7536,11 +7630,9 @@ class MultiExportUI(object):
                 all_paths["jsx"] = ae_paths["jsx"]
                 self._advance_progress()  # step 1: setup complete
 
-                # JSX export uses the first geo root as the primary group
-                jsx_geo_root = geo_roots[0] if geo_roots else None
                 results["jsx"] = exporter.export_jsx(
-                    ae_paths["jsx"], ae_paths["obj"], camera, jsx_geo_root,
-                    start_frame, end_frame
+                    ae_paths["jsx"], ae_paths["obj"], camera,
+                    geo_children, start_frame, end_frame
                 )
                 self._log_result("JSX + OBJ", results["jsx"])
                 self._advance_progress()  # step 2: JSX scrub complete
@@ -7650,13 +7742,19 @@ class MultiExportUI(object):
             if baked_abc_cam:
                 try:
                     cmds.undoInfo(closeChunk=True)
+                except Exception:
+                    pass
+                try:
                     cmds.undo()
                 except Exception:
                     self._log(
                         "Undo camera bake failed. See Script Editor.")
             # Restore original camera name
             if renamed_cam and cmds.objExists(renamed_cam):
-                cmds.rename(renamed_cam, original_cam_name)
+                try:
+                    cmds.rename(renamed_cam, original_cam_name)
+                except Exception:
+                    pass
 
         self._finish_export(results, all_paths, original_sel)
 
@@ -7736,6 +7834,11 @@ class MultiExportUI(object):
             tpose_frame = cmds.intField(
                 self.tpose_frame_field, query=True, value=True
             )
+            if tpose_frame >= start_frame:
+                self._log(
+                    "Warning: T-pose frame {} is not before start "
+                    "frame {} — T-pose will not be distinct.".format(
+                        tpose_frame, start_frame))
             tpose_start = min(start_frame, tpose_frame)
 
         # Read version from UI field
@@ -7787,7 +7890,8 @@ class MultiExportUI(object):
                     renamed_cam = cmds.rename(camera, "cam_main")
                     camera = renamed_cam
                 elif cmds.objExists("cam_main"):
-                    renamed_cam = "cam_main"
+                    # cam_main already exists (e.g. from a prior
+                    # export) — use it but don't mark for restore
                     camera = "cam_main"
                 else:
                     self._log(
@@ -7832,7 +7936,6 @@ class MultiExportUI(object):
                 self._log("Preparing FBX export...")
                 cmds.undoInfo(openChunk=True)
                 base_meshes = []
-                target_groups = []
                 try:
                     # Detect vertex-animated meshes before prep
                     # (Alembic connections must be intact for sampling)
@@ -7892,8 +7995,6 @@ class MultiExportUI(object):
                             conv = exporter.convert_abc_to_blendshape(
                                 resolved, tpose_start, end_frame)
                             base_meshes.append(conv["base_mesh"])
-                            if conv.get("targets_group"):
-                                target_groups.append(conv["targets_group"])
 
                     fbx_geo = [_resolve_name(g) for g in geo_roots]
                     fbx_rigs = [_resolve_name(r) for r in rig_roots]
@@ -7926,19 +8027,13 @@ class MultiExportUI(object):
                                 cmds.delete(bm)
                             except Exception:
                                 pass
-                    for tg in target_groups:
-                        if cmds.objExists(tg):
-                            try:
-                                cmds.delete(tg)
-                            except Exception:
-                                pass
                 self._log_result("FBX", results.get("fbx", False))
                 self._advance_progress()
 
             if do_abc:
                 results["abc"] = exporter.export_abc(
                     paths["abc"], camera, geo_roots, proxy_geos,
-                    tpose_start, end_frame
+                    tpose_start, end_frame, rig_roots=rig_roots,
                 )
                 self._log_result("ABC", results["abc"])
                 self._advance_progress()
@@ -8013,7 +8108,10 @@ class MultiExportUI(object):
         finally:
             # Restore original camera name
             if renamed_cam and cmds.objExists(renamed_cam):
-                cmds.rename(renamed_cam, original_cam_name)
+                try:
+                    cmds.rename(renamed_cam, original_cam_name)
+                except Exception:
+                    pass
 
         self._finish_export(results, paths, original_sel)
 
@@ -8124,7 +8222,8 @@ class MultiExportUI(object):
                     renamed_cam = cmds.rename(camera, "cam_main")
                     camera = renamed_cam
                 elif cmds.objExists("cam_main"):
-                    renamed_cam = "cam_main"
+                    # cam_main already exists (e.g. from a prior
+                    # export) — use it but don't mark for restore
                     camera = "cam_main"
                 else:
                     self._log(
@@ -8168,14 +8267,14 @@ class MultiExportUI(object):
                                 channelBox=True)
                         except Exception:
                             pass
-                    # Bake transform channels
+                    # Bake transform channels (no minimizeRotation —
+                    # camera tracking requires exact rotation curves)
                     cmds.bakeResults(
                         camera,
                         t=(int(start_frame), int(end_frame)),
                         at=trs,
                         simulation=True,
                         preserveOutsideKeys=True,
-                        minimizeRotation=True,
                     )
                     # Bake focal length on camera shape
                     for shp in cam_shapes:
@@ -8268,6 +8367,14 @@ class MultiExportUI(object):
                         short = name.rsplit(":", 1)[-1]
                         long_names = cmds.ls(short, long=True)
                         if len(long_names) == 1:
+                            return long_names[0]
+                        if len(long_names) > 1:
+                            sys.stderr.write(
+                                "[ExportGenie] WARNING: '{}' is "
+                                "ambiguous after namespace strip "
+                                "({} matches). MA may be "
+                                "incomplete.\n".format(
+                                    short, len(long_names)))
                             return long_names[0]
                         return name
 
@@ -8439,13 +8546,19 @@ class MultiExportUI(object):
             if baked_abc_cam:
                 try:
                     cmds.undoInfo(closeChunk=True)
+                except Exception:
+                    pass
+                try:
                     cmds.undo()
                 except Exception:
                     self._log(
                         "Undo camera bake failed. See Script Editor.")
             # Restore original camera name
             if renamed_cam and cmds.objExists(renamed_cam):
-                cmds.rename(renamed_cam, original_cam_name)
+                try:
+                    cmds.rename(renamed_cam, original_cam_name)
+                except Exception:
+                    pass
 
         self._finish_export(results, paths, original_sel)
 
