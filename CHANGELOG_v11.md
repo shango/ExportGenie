@@ -2,6 +2,65 @@
 
 ---
 
+## v10 to v11
+
+### Scene Protection (FBX Export)
+
+- FBX export no longer relies on Maya's undo chunk to restore the scene after destructive prep (bake, import references, strip namespaces)
+- New save-snapshot/reopen approach: saves the scene to a temp file before prep, reopens it after export — guaranteed clean restore
+- Snapshot preserves unsaved changes; falls back to the original file on disk if the snapshot fails
+- Matchmove tab: export order changed to MA → ABC → Playblast → FBX (non-destructive first, FBX last)
+- Face Track tab: export order changed to Playblast → MA → FBX (destructive exports last)
+
+### Smarter Animation Bake
+
+- Constraint-driven non-joint transforms (IK controls, locators, space-switch nodes) are now discovered and baked alongside joints in `prep_for_ue5_fbx_export`
+- Scans all constraints under rig_roots, identifies their parent transforms, and includes them in the `simulation=True` bake pass
+- Disconnects non-animCurve sources on all baked nodes (joints and transforms) after bake
+- Fixes broken animation in rigs where external locators drive IK chains through pointConstraints (e.g. SynthPipe tracker locators → IK anim controls)
+
+### Alembic Camera Bake on Matchmove
+
+- Matchmove tab now detects AlembicNode-driven cameras and bakes TRS + focal length before any exports (matching Camera Track and Face Track behavior)
+- Fixes 0-byte ABC exports when the source .abc tracking file is missing or on another drive
+- Bake runs in an undo chunk and is restored in the `finally` block
+
+### Custom Export Naming
+
+- New "Export Name" text field in the Export Directory section (between Path and Version)
+- Auto-populated from the scene filename via `get_scene_base_name`; fully editable for custom names
+- Folder name is now exactly the export name (no more `_track_v##` appended)
+- File names inside use `{exportName}_{tag}_{version}.ext` pattern
+- All three tabs (Camera Track, Matchmove, Face Track) read from this field
+- `build_export_paths` and `build_ae_export_paths` updated to use the custom name
+- `resolve_versioned_dir` and `resolve_ae_dir` simplified — no more old-version folder renaming logic
+
+### HUD in Composite Playblasts
+
+- Frame number and focal length HUD now renders on the plate pass in multi-pass composite playblasts (Matchmove and Face Track)
+- Previously all three composite passes used `showOrnaments=False`; now the plate pass uses `showOrnaments=show_hud`
+
+### Playblast Color Management Fix
+
+- `_ensure_playblast_raw_srgb` now explicitly sets `outputUseViewTransform=False` for the playblast target before setting the output transform name
+- Previously, if "Use View Transform" was enabled for playblast, Maya would ignore the explicit `outputTransformName` and use the viewport's view transform instead
+- Added diagnostic logging: current output transform name, useViewTransform state, and target name are logged to Script Editor before applying changes
+
+### Cache-Proof Shelf Button
+
+- `launch()` now clears `sys.modules`, calls `importlib.invalidate_caches()`, and deletes all `ExportGenie.*.pyc` files from `__pycache__/` before importing
+- `_restore_ui()` (workspace control restore on Maya startup) does the same cleanup
+- Shelf button command string updated to include the same cache-clearing logic
+- `_restore_ui()` now updates the workspace control tab label via `cmds.workspaceControl(..., edit=True, label=...)` so the version is always current after restart
+
+### ABC Export Diagnostics
+
+- ABC export now logs the full `AbcExport` job string to Script Editor before running
+- Checks for 0-byte output files after export and reports failure
+- Full Python traceback printed on exception for easier debugging
+
+---
+
 ## v6 to v7
 
 ### UE5 FBX Conformance
