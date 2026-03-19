@@ -1,78 +1,66 @@
 # Export Genie
 
-**Version v10**
+**Version v11** — Maya 2025+ / Windows & macOS
 
-Export Maya scenes to multiple formats (.ma, .fbx, .abc, .jsx, .mov) in a single operation with automatic folder structure and versioning. Three-tab interface serving camera trackers, matchmove/animation artists, and face track artists.
+One-click export from Maya to .ma, .fbx, .abc, .jsx, and playblast QC. Three tabs for three workflows: Camera Track, Matchmove, and Face Track.
 
-Requires **Maya 2025+**. Windows and macOS.
+---
 
-## Features
+## Quick Start — Camera Track
 
-- Three-tab workflow for Camera Track, Matchmove, and Face Track pipelines
-- Export to Maya ASCII (.ma), FBX (.fbx), Alembic (.abc), After Effects (.jsx + .obj), and Playblast QC (.mov) in one click
-- Automatic versioned folder structure based on scene filename
-- Editable version number with auto-detection from `_v##` scene naming
-- Camera automatically renamed to `cam_main` during export and restored afterward
-- Custom shaders stripped to default lambert for .ma exports
-- Image plane references preserved in .ma exports
-- FBX exports with baked keyframes, skins, and blend shapes
-- Alembic exports in world space with UVs
-- After Effects ExtendScript export with camera, geo, tracking nulls, and source footage
-- Playblast QC at 1920x1080 through the shot camera: H.264 (.mov), PNG sequence, or H.264 (.mp4) via bundled ffmpeg
-- Automatic Alembic-to-blendshape conversion for Face Track FBX delivery
-- Multiple geo group entries in Camera Track tab
-- Multiple static geo entries in Matchmove tab
-- Multiple character rig/geo pairs in Matchmove tab
-- Multiple face mesh entries in Face Track tab
-- Optional T-pose frame for Matchmove FBX and ABC exports
-- Render as Raw (sRGB) playblast with OCIO bypass (on by default)
-- useBackground Shader + Wireframe overlay for Camera Track QC
-- QC Checker Overlay with adjustable color, scale, and opacity (Matchmove and Face Track)
-- Anti-Aliasing toggle between 8x and 16x
-- Use Current Viewport Settings mode for unmodified playblasts
-- Automatic playblast overrides: grid hidden, backface culling, far clip extended, 2D pan/zoom disabled, selection cleared
-- Isolate select, motion blur, and forced display layers for Matchmove and Face Track playblasts
-- Pre-export validation for missing assignments, duplicate picks, name conflicts, and invalid ranges
-- Auto-loading of required plugins (fbxmaya, AbcExport, objExport)
-- Rollover tooltips on every widget
-- Drag-and-drop install with automatic shelf button
+For tracked cameras with reference geometry. No rigs, no constraints.
 
-## What's New in v10
+1. Open your scene and click the **ExportGenie** shelf button.
+2. Set your **Export Root** path and **Export Name** (auto-filled from your scene file).
+3. On the **Camera Track** tab:
+   - Click your camera in the outliner, then click **<< Load Sel** next to **Camera**.
+   - Click your geo group, then **<< Load Sel** next to **Geo Group**. Use **+** to add more groups.
+4. Check the formats you want (MA, JSX, FBX, ABC, Playblast).
+5. Set your **frame range** (or click **Use Timeline Range**).
+6. Hit **EXPORT**.
 
-- New "H.264 (.mp4 Win)" playblast format — uses bundled ffmpeg to encode from PNG, no QuickTime needed (Windows only)
-- FBX exports now import into UE5 with correct camera orientation and scene scale (Z-up axis, centimeter units)
-- Camera animation is baked during Matchmove FBX prep for reliable UE5 import
-- Playblast HUD and grid are now always hidden
-- Playblast color management uses the dedicated playblast output transform instead of the main viewport setting
-- Raw (sRGB) playblast view is now detected dynamically across all Maya OCIO configurations
-- Renamed "Ctrl Rig Group" to "Rig Group" and "Anim Geo Group" to "Mesh Group"
-- Export files now use tab-specific naming tags (`cam`, `charMM`, `KTHead`) while QC playblasts always use `track`
-- Frame range auto-populates when a camera is loaded: start 1001, end from the camera's last keyframe
-- Default start frame is now 1001, even if the Maya timeline starts earlier
-- **Preview Playblast** — live viewport toggle that shows exactly what the QC render will look like (camera, lighting, shaders, checker overlay, color management) without running a full export. Salmon button indicates active preview; auto-exits on export or window close.
-- Configurable **Far Clip** slider in Viewport Settings for all tabs (default 800,000)
-- **ffmpeg pre-validation** — MP4 exports check for ffmpeg.exe before starting; skipped with a clear message if not found
-- Viewport preview now applies the Raw (sRGB) view transform to the live viewport, matching the playblast output
-- Default checker overlay opacity changed to 30% (Matchmove and Face Track)
-- useBackground Shader + Wireframe checkbox now defaults to checked (Camera Track)
-- Simplified log window output — short, user-friendly messages with detailed diagnostics directed to Script Editor
-- ffmpeg errors now logged to Script Editor for easier troubleshooting
+Your files land in `<export_root>/<export_name>/`.
 
-## What's New in v6
+---
 
-- Fixed exports failing when the camera lives under a static geo or rig group
-- Fixed FBX export failing after namespace stripping when short names are ambiguous
-- Fixed FBX export failing on scenes with namespaced rigs
-- QC playblast format dropdown: choose between H.264 (.mov) or PNG image sequence
-- Multiple geo groups on the Camera Track tab with +/- buttons
-- Multiple static geo entries on the Matchmove tab with +/- buttons
-- Raw (sRGB) playblast now works on Maya configs that label it "Raw (Legacy)"
-- Fixed camera rename issue when the camera is already named `cam_main`
-- Version number shown in all error dialogs for easier troubleshooting
+## Quick Start — Matchmove
+
+For character rigs, animated meshes, and proxy geometry. Supports multiple characters.
+
+1. Open your scene and click the **ExportGenie** shelf button.
+2. Set your **Export Root** path and **Export Name**.
+3. On the **Matchmove** tab:
+   - Load your **Camera**.
+   - Load any **Static Geo** (set pieces, environment). Use **+** for more.
+   - Load your **Rig Group** and **Mesh Group** as a pair. Use **+** to add more character pairs.
+   - Optionally enable **T-Pose** and set the frame (default 991).
+4. Check the formats you want (MA, FBX, ABC, Playblast).
+5. Set your **frame range** and hit **EXPORT**.
+
+The tool bakes all animation (joints, IK controls, constraints) into clean keyframes and strips namespaces — ready for Unreal or any game engine.
+
+---
+
+## Quick Start — Face Track
+
+For Alembic-cached facial animation from tracking software or animation caches.
+
+1. Open your scene and click the **ExportGenie** shelf button.
+2. Set your **Export Root** path and **Export Name**.
+3. On the **Face Track** tab:
+   - Load your **Camera**.
+   - Load any **Static Geo** for reference.
+   - Load your **Face Mesh Group** — the group containing your face meshes. Use **+** for more.
+4. Check the formats you want (MA, FBX, Playblast).
+5. Set your **frame range** and hit **EXPORT**.
+
+Vertex-animated meshes are automatically converted to blendshape targets with per-frame keys — no manual setup needed.
+
+---
 
 ## Install
 
-1. Extract the distribution folder. It should contain:
+1. Extract the distribution folder:
    ```
    export_genie/
      ExportGenie.py
@@ -81,180 +69,133 @@ Requires **Maya 2025+**. Windows and macOS.
          ffmpeg.exe
    ```
 2. Drag `ExportGenie.py` into the Maya viewport.
-3. A shelf button is added to your current shelf automatically.
+3. A shelf button appears on your current shelf. Click it to open the tool.
 
-That's it. The install automatically copies the script and the `bin/` folder (with ffmpeg) to Maya's scripts directory. Click the shelf button to open the tool.
+That's it. The script and `bin/` folder (with ffmpeg) are copied to Maya's scripts directory automatically.
 
-**Note:** The `bin/` folder enables the "H.264 (.mp4 Win)" playblast format on Windows. If you only have the `.py` file, the tool still works — you just won't have the .mp4 option (H.264 .mov and PNG sequence remain available).
+**Note:** The `bin/` folder enables the H.264 (.mp4) playblast format. Without it, the tool still works — you just won't have the .mp4 option.
 
 ## Upgrade
 
-To update to a newer version, restart Maya, open a fresh scene, then drag the new `ExportGenie.py` into the viewport again. It will overwrite the previous version in your scripts directory and replace the shelf button. If the new version includes an updated `bin/` folder, it will be copied as well. If you're upgrading with just the `.py` file, your existing `bin/` folder is preserved. Restart Maya after upgrading to ensure the new version is fully loaded.
+Restart Maya, open a fresh scene, drag the new `ExportGenie.py` into the viewport. It overwrites the old version and replaces the shelf button. Restart Maya after upgrading.
 
-## How to Use
+---
 
-1. Save your scene with a `_v##` version in the filename (e.g. `shot_layout_v03.ma`).
-2. Click the **ExportGenie** shelf button.
-3. Set the **Export Root** directory.
-4. Set the **Version Num** — pre-populated from your scene filename, editable for manual override.
-5. Select the appropriate tab for your workflow.
-6. Assign roles by selecting objects in the viewport and clicking **Load Sel**.
-7. Check the formats you want.
-8. Set the **frame range** or click **Use Timeline Range**.
-9. Click **EXPORT**.
+## What's New in v11
 
-All widgets have rollover tooltips describing their function.
+- **Scene protection** — FBX export no longer relies on Maya's undo to restore your scene. The tool saves a snapshot before the destructive bake/prep, exports the FBX, then reopens the snapshot. Your master scene is guaranteed to stay clean.
+- **Smarter bake** — Constraint-driven transforms (IK controls, locators, space-switch nodes) are now baked alongside joints. This fixes broken animation in rigs where locators drive IK chains through constraints.
+- **Alembic camera bake on Matchmove** — Camera driven by AlembicNode is now baked before all exports (matching Camera Track and Face Track). Fixes 0-byte ABC exports when the source .abc tracking file is on another drive.
+- **Export order** — Non-destructive formats (MA, ABC, Playblast) now export first. FBX goes last since it requires baking.
+- **Custom export naming** — New "Export Name" field lets you set the exact folder and file base name. Auto-populated from your scene file, fully editable.
+- **HUD in composite playblasts** — Frame number and focal length now appear in multi-pass composite playblasts (Matchmove and Face Track).
+- **Playblast color management fix** — Raw (sRGB) setting now correctly disables "Use View Transform" for the playblast output.
+- **No more stale versions** — Shelf button and workspace restore clear Python bytecache on every launch. The tab label always reflects the current version.
 
-## Three-Tab Workflow
+## What's New in v10
 
-### Tab 1 — Camera Track Export
+- **H.264 (.mp4) playblast format** — Uses bundled ffmpeg to encode from PNG sequences. No QuickTime needed (Windows and macOS).
+- **UE5-ready FBX** — Exports now import into Unreal Engine 5 with correct camera orientation and scene scale (Z-up axis, centimeter units).
+- **Camera bake for FBX** — Camera animation is baked during Matchmove FBX prep for reliable UE5 import.
+- **Preview Playblast** — Live viewport toggle that shows exactly what the QC render will look like (camera, lighting, shaders, checker overlay, color management) without running a full export. Salmon button indicates active preview; auto-exits on export or window close.
+- **Far Clip slider** — Configurable far clip plane in Viewport Settings for all tabs (default 800,000).
+- **QC Checker Overlay** — UV checker pattern with adjustable color, scale, and opacity for Matchmove and Face Track playblasts.
+- **useBackground Shader + Wireframe** — Camera Track QC overlay showing the plate through transparent meshes with wireframe edges.
+- **Frame range auto-populate** — Start and end frames fill in automatically when a camera is loaded (start 1001, end from last keyframe).
+- **ffmpeg pre-validation** — MP4 exports check for ffmpeg before starting; skipped with a clear message if not found.
+- **Raw (sRGB) playblast** — Dynamically detects the correct Raw view transform across all Maya OCIO configurations.
+- **Tab-specific file naming** — Export files use tab-specific tags (`cam`, `charMM`, `KTHead`) while QC playblasts always use `track`.
+- **Simplified log** — Short, user-friendly messages in the log window with detailed diagnostics in the Script Editor.
+- **Multi-pass composited playblasts** — Matchmove and Face Track playblasts render plate, color, and matte passes separately, then composite via ffmpeg for clean checker overlays.
+- **macOS support** — ffmpeg bundled for macOS, composite outputs as .mp4 on Mac.
 
-For artists who have tracked a camera in SynthEyes (or similar) and brought it into Maya with some reference geometry. Simple scenes — no rigs, no constraints, no vertex animation.
-
-**Export formats**: Maya ASCII (.ma), After Effects (.jsx + .obj), FBX (.fbx), Alembic (.abc), Playblast QC (.mov / .png / .mp4)
-
-**Roles**:
-- **Camera** — the tracked camera
-- **Geo Group** — top-level geometry group (use +/- buttons to add or remove groups)
-
-### Tab 2 — Matchmove Export
-
-For animators and riggers working with full character rigs, complex vertex-animated objects, or proxy geometry. Supports multiple character rig/geo pairs.
-
-**Export formats**: Maya ASCII (.ma), FBX (.fbx), Alembic (.abc), Playblast QC (.mov / .png / .mp4)
-
-**Roles**:
-- **Camera** — the shot camera
-- **Static Geo** — proxy/set geometry (use +/- buttons to add or remove groups)
-- **Rig Group** / **Mesh Group** — repeatable pairs for multiple characters or animated meshes (use +/- buttons to add or remove pairs)
-
-Example picks for a character rig:
-- **Rig Group** → `GenMan_rig_v05:GenMan_rig_hrc`
-- **Mesh Group** → `GenMan_rig_v05:GMan_Mesh_GRP`
-
-**T-Pose**: An optional T-pose frame (default: 991) can be included. When enabled, FBX and ABC exports extend their frame range to include the T-pose frame. The .ma export and QC playblast keep the original timeline range.
-
-### Tab 3 — Face Track Export
-
-For artists working with Alembic-cached facial animation (e.g. from face tracking software or animation caches). Supports multiple face mesh entries for multi-character scenes.
-
-**Export formats**: Maya ASCII (.ma), FBX (.fbx), Playblast QC (.mov / .png / .mp4)
-
-**Roles**:
-- **Camera** — the shot camera
-- **Static Geo** — static geometry for reference
-- **Face Mesh Group** — repeatable entries for face geometry groups (use +/- buttons to add or remove entries)
-
-**Automatic blendshape conversion**: Each mesh under a Face Mesh Group is classified as vertex-animated or transform-animated. Vertex-animated meshes (facial deformation) are converted to blendshape targets with per-frame keys. Transform-animated meshes (rigid bodies) have their channels baked. The result is an FBX with blendshape-driven facial animation ready for game engines and real-time renderers.
+---
 
 ## Features
 
-### Export Directory and Versioning
+### Export Directory and Naming
 - Browse to set your export root directory
-- Version number is auto-detected from your scene filename's `_v##` pattern
-- Override the version number manually to export under any version
-- All exports go into a versioned folder (e.g. `shot_track_v01/`)
-- New versions create new folders alongside existing ones
+- **Export Name** field controls the folder and file base name — auto-populated from your scene file, fully editable
+- Version number auto-detected from your scene file's `_v##` pattern, manually overridable
 
 ### Export Formats
-- **Maya ASCII (.ma)** — Camera renamed to `cam_main`, custom shaders stripped to default lambert, image plane references preserved, frame range matched to UI
-- **FBX (.fbx)** — Keyframes baked, skins and blend shapes preserved, cameras included
-- **Alembic (.abc)** — World space, UVs included, whole-frame geo sampling (Camera Track and Matchmove tabs)
-- **After Effects (.jsx + .obj)** — ExtendScript that rebuilds the 3D scene in AE with camera, geo, tracking nulls, and source footage (Camera Track tab only)
-- **Playblast QC (.mov, .png, or .mp4)** — H.264 QuickTime (.mov), PNG image sequence, or H.264 via ffmpeg (.mp4, Windows only) at 1920x1080 through the shot camera
+- **Maya ASCII (.ma)** — Camera renamed to `cam_main`, custom shaders stripped to default lambert, image plane references preserved
+- **FBX (.fbx)** — All animation baked (joints, IK controls, constraints), skins and blend shapes preserved, UE5-ready settings
+- **Alembic (.abc)** — World space, UVs included (Camera Track and Matchmove tabs)
+- **After Effects (.jsx + .obj)** — Rebuilds the 3D scene in AE with camera, geo, tracking nulls, and source footage (Camera Track only)
+- **Playblast QC (.mov, .png, or .mp4)** — 1920x1080 through the shot camera with frame counter and focal length overlay
 
 ### Viewport Settings (QC Playblast)
 
-Each tab has a collapsible **Viewport Settings** section with controls for the QC render:
+Each tab has a collapsible **Viewport Settings** section:
 
-- **Render as Raw (sRGB)** (on by default) — Renders the playblast using the Raw color view, bypassing any OCIO tonemapping. All color management settings are restored after the render.
-- **useBackground Shader + Wireframe** (Camera Track only) — Applies a useBackground shader to all geo so meshes become transparent (showing the camera plate) with wireframe edges drawn on top. Original shaders are restored after the render.
-- **Anti-Aliasing 16x** — Bumps VP2.0 anti-aliasing from 8 to 16 samples. Higher quality but uses more GPU memory.
-- **Use Current Viewport Settings** — Skips all viewport overrides and renders the playblast exactly as your viewport looks. Only the camera is switched to `cam_main`.
-- **QC Checker Overlay** (Matchmove and Face Track tabs) — Applies a UV checker pattern over all geo with adjustable Color, Scale, and Opacity. The checker shader is created and cleaned up automatically.
+- **Render as Raw (sRGB)** — Bypasses OCIO tonemapping (on by default)
+- **useBackground Shader + Wireframe** (Camera Track) — Transparent meshes showing the plate with wireframe edges
+- **QC Checker Overlay** (Matchmove / Face Track) — UV checker pattern with adjustable color, scale, and opacity
+- **HUD Overlay** — Frame number and focal length burned into every frame
+- **Anti-Aliasing 16x** — Higher quality, more GPU memory
+- **Use Current Viewport Settings** — Renders exactly what your viewport shows
+- **Far Clip** slider — Adjustable camera far clip (default 800,000)
 
-### Automatic Playblast Overrides
+### Playblast Overrides
 
-Unless "Use Current Viewport Settings" is enabled, every QC playblast automatically:
+Unless "Use Current Viewport Settings" is enabled, every playblast automatically hides the grid, enables backface culling, extends far clip, disables 2D pan/zoom, clears selection, and configures color management.
 
-- Hides the grid
-- Enables backface culling on all meshes
-- Extends the camera far clip plane so distant geometry is visible
-- Disables 2D pan/zoom on the camera
-- Sets anti-aliasing to 8x (or 16x with the toggle)
-- Clears the selection so no highlight outlines appear
-- Configures and restores color management settings
-
-Additional overrides for Matchmove and Face Track tabs:
-
-- Isolate select — only assigned geo, camera, and image planes are visible
-- All display layers forced visible
-- Smooth shaded display with no wireframe overlay
-- Display textures enabled (for checker overlay)
-- VP2.0 motion blur enabled
+Matchmove and Face Track playblasts also isolate assigned geo, force display layers visible, enable smooth shading, and turn on motion blur.
 
 ### Camera Handling
-- Camera is temporarily renamed to `cam_main` during export for consistent naming downstream
-- If the camera is already named `cam_main`, it is left as-is
-- Original name is restored after export
+- Camera temporarily renamed to `cam_main` during export for consistent downstream naming
+- Original name restored after export
 
-### After Effects Export Details
-- Creates an AE composition matching Maya's render resolution and frame rate
-- Camera exported with per-frame position, rotation, and zoom keyframes
-- Geo children named "nulls" become AE 3D nulls (SynthEyes tracking markers)
-- Geo children named "chisels" are skipped
+### After Effects Export
+- AE composition matching Maya's resolution and frame rate
+- Per-frame camera keyframes (position, rotation, zoom)
+- "nulls" children become AE 3D nulls (tracking markers)
+- "chisels" children are skipped
 - Flat planes become AE solids
-- All other geo exported as static OBJ files with per-frame transform keyframes
-- Source footage from the camera's image plane is auto-imported as a background layer
-- Run the .jsx file in After Effects via File > Scripts > Run Script File
+- Source footage from the image plane auto-imported as background
+- Run the .jsx in AE via File > Scripts > Run Script File
 
 ### Validation
-Before exporting, the tool checks for:
-- Missing role assignments
-- Duplicate picks (same node in multiple fields)
-- Camera name conflicts with existing `cam_main` nodes
-- OBJ filename collisions
-- Empty export root or invalid frame range
-- Empty version number (defaults to v01 with a warning)
 
-Errors are shown in a popup. Warnings let you continue or cancel.
+Before exporting, the tool checks for missing assignments, duplicate picks, camera name conflicts, OBJ filename collisions, invalid frame ranges, and empty version numbers. Errors show in a popup. Warnings let you continue or cancel.
 
 ### Plugin Management
-Required plugins (`fbxmaya`, `AbcExport`, `objExport`) are auto-loaded when needed. If a plugin can't be loaded, a dialog directs you to the Plug-in Manager.
+
+Required plugins (`fbxmaya`, `AbcExport`, `objExport`) are auto-loaded when needed. If a plugin can't load, a dialog points you to the Plug-in Manager.
 
 ## Output Folder Structure
 
-All tabs export into a folder named `<scene>_track_<version>/`. Export files use a tab-specific tag while QC playblasts always use `track`:
+Exports go into `<export_root>/<export_name>/`:
 
 **Camera Track:**
 ```
 <export_root>/
-  shot_track_v01/
-    shot_cam_v01.ma
-    shot_cam_v01.fbx
-    shot_cam_v01.abc
-    shot_track_v01.mov
-    shot_track_afterEffects_v01/
-      shot_ae_v01.jsx
-      shot_cam_v01_geo1.obj
-      shot_cam_v01_geo2.obj
+  <export_name>/
+    <name>_cam_v01.ma
+    <name>_cam_v01.fbx
+    <name>_cam_v01.abc
+    <name>_track_v01.mov
+    <name>_afterEffects/
+      <name>_ae_v01.jsx
+      <name>_v01_geo1.obj
 ```
 
 **Matchmove:**
 ```
 <export_root>/
-  shot_track_v02/
-    shot_charMM_v02.ma
-    shot_charMM_v02.fbx
-    shot_charMM_v02.abc
-    shot_track_v02.mov
+  <export_name>/
+    <name>_charMM_v01.ma
+    <name>_charMM_v01.fbx
+    <name>_charMM_v01.abc
+    <name>_track_v01.mov
 ```
 
 **Face Track:**
 ```
 <export_root>/
-  shot_track_v03/
-    shot_KTHead_v03.ma
-    shot_KTHead_v03.fbx
-    shot_track_v03.mov
+  <export_name>/
+    <name>_KTHead_v01.ma
+    <name>_KTHead_v01.fbx
+    <name>_track_v01.mov
 ```
