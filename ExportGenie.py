@@ -24,7 +24,7 @@ import maya.mel as mel
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v11_beta-11"
+TOOL_VERSION = "v11.2"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -128,7 +128,7 @@ class FolderManager(object):
             dict: {"ma": path, "fbx": path, "abc": path, "mov": path, ...}
         """
         paths = {}
-        dir_name = "{}_track_{}".format(scene_base_name, version_str)
+        dir_name = scene_base_name
         dir_path = os.path.join(export_root, dir_name)
         for fmt, ext in [("ma", ".ma"), ("fbx", ".fbx"), ("abc", ".abc")]:
             file_name = "{base}_{tag}_{ver}{ext}".format(
@@ -181,12 +181,8 @@ class FolderManager(object):
         Returns:
             dict: {"jsx": full_path, "obj": {geo_name: full_path, ...}}
         """
-        main_dir_name = "{}_track_{}".format(
-            scene_base_name, version_str
-        )
-        ae_dir_name = "{}_track_afterEffects_{}".format(
-            scene_base_name, version_str
-        )
+        main_dir_name = scene_base_name
+        ae_dir_name = "{}_afterEffects".format(scene_base_name)
         ae_dir = os.path.join(export_root, main_dir_name, ae_dir_name)
         jsx_name = "{base}_ae_{ver}.jsx".format(
             base=scene_base_name, ver=version_str
@@ -212,62 +208,25 @@ class FolderManager(object):
 
     @staticmethod
     def resolve_versioned_dir(export_root, scene_base_name, version_str):
-        """Find or create the versioned export directory.
+        """Ensure the export directory exists.
 
-        If an older version folder exists (e.g. _track_v01), rename it
-        to the current version. Existing files inside are preserved.
+        The folder name is the user-supplied export name (scene_base_name).
 
         Returns:
             str: Path to the export directory.
         """
-        target_name = "{}_track_{}".format(scene_base_name, version_str)
-        target_dir = os.path.join(export_root, target_name)
-        if os.path.isdir(target_dir):
-            return target_dir
-
-        # Search for an existing _track_v## folder to rename
-        prefix = scene_base_name + "_track_v"
-        try:
-            for entry in sorted(os.listdir(export_root)):
-                if (entry.startswith(prefix)
-                        and os.path.isdir(
-                            os.path.join(export_root, entry))):
-                    old_dir = os.path.join(export_root, entry)
-                    os.rename(old_dir, target_dir)
-                    return target_dir
-        except OSError:
-            pass
-
+        target_dir = os.path.join(export_root, scene_base_name)
         return target_dir
 
     @staticmethod
     def resolve_ae_dir(parent_dir, scene_base_name, version_str):
-        """Find or create the versioned AE export subdirectory.
-
-        If an older version AE folder exists inside *parent_dir*,
-        rename it to the current version.
+        """Ensure the AE export subdirectory exists.
 
         Returns:
             str: Path to the AE directory.
         """
-        target_name = "{}_track_afterEffects_{}".format(
-            scene_base_name, version_str
-        )
+        target_name = "{}_afterEffects".format(scene_base_name)
         target_dir = os.path.join(parent_dir, target_name)
-        if os.path.isdir(target_dir):
-            return target_dir
-
-        prefix = scene_base_name + "_track_afterEffects_v"
-        try:
-            for entry in sorted(os.listdir(parent_dir)):
-                if (entry.startswith(prefix)
-                        and os.path.isdir(
-                            os.path.join(parent_dir, entry))):
-                    old_dir = os.path.join(parent_dir, entry)
-                    os.rename(old_dir, target_dir)
-                    return target_dir
-        except OSError:
-            pass
 
         return target_dir
 
@@ -1052,9 +1011,12 @@ class Exporter(object):
                 self.log("ABC skipped — nothing to export.")
                 return False
 
-            # Build root flags — skip camera if it's already under
-            # any assigned group.
-            all_roots = geo_roots + rig_roots + proxy_geos
+            # Build root flags — camera, geo, static/proxy geo only.
+            # Rig roots are excluded — ABC needs just the mesh,
+            # camera, and any static geo.
+            all_roots = geo_roots + proxy_geos
+            if rig_roots:
+                all_roots = all_roots + rig_roots
             cam_under_root = any(
                 self._is_descendant_of(camera, gr)
                 for gr in all_roots if gr
@@ -1062,10 +1024,11 @@ class Exporter(object):
             # Create metadata group and include as a root
             info_grp = self._create_metadata_grp()
 
-            root_flags = ""
-            root_nodes = ([camera] + geo_roots + rig_roots
-                          + proxy_geos + [info_grp])
-            for node in root_nodes:
+            # Collect and resolve all root nodes to long paths
+            root_candidates = ([camera] + geo_roots
+                               + proxy_geos + [info_grp])
+            resolved_roots = []
+            for node in root_candidates:
                 if not node:
                     continue
                 if node == camera and cam_under_root:
@@ -1078,8 +1041,26 @@ class Exporter(object):
                         "ABC failed — '{}' not found.".format(node)
                     )
                     return False
+                resolved_roots.append(long_names[0])
+
+            # Remove any root that is a descendant of another root
+            # — AbcExport errors on ancestor/descendant pairs.
+            filtered_roots = []
+            for root in resolved_roots:
+                is_child = False
+                for other in resolved_roots:
+                    if other == root:
+                        continue
+                    if root.startswith(other + "|"):
+                        is_child = True
+                        break
+                if not is_child:
+                    filtered_roots.append(root)
+
+            root_flags = ""
+            for root in filtered_roots:
                 root_flags += "-root '{}' ".format(
-                    long_names[0].replace("'", "\\'"))
+                    root.replace("'", "\\'"))
 
             abc_path = file_path.replace("\\", "/")
 
@@ -1098,6 +1079,10 @@ class Exporter(object):
                 file=abc_path.replace("'", "\\'"),
             )
 
+            sys.stderr.write(
+                "[ExportGenie] AbcExport job: {}\n".format(
+                    job_string))
+
             try:
                 cmds.AbcExport(j=job_string)
             finally:
@@ -1109,10 +1094,25 @@ class Exporter(object):
             if not os.path.isfile(file_path):
                 self.log(
                     "ABC export completed but file not found.")
+                sys.stderr.write(
+                    "[ExportGenie] ABC file missing: "
+                    "{}\n".format(file_path))
+                return False
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                self.log(
+                    "ABC export produced empty file.")
+                sys.stderr.write(
+                    "[ExportGenie] ABC file is 0 bytes: "
+                    "{}\n".format(file_path))
                 return False
             return True
         except Exception as e:
             self._log_error("ABC", e)
+            sys.stderr.write(
+                "[ExportGenie] ABC exception: {}\n".format(e))
+            import traceback
+            traceback.print_exc()
             return False
 
     # --- OBJ Export ---
@@ -1888,31 +1888,79 @@ class Exporter(object):
             sys.stderr.write(
                 "[ExportGenie]   Non-skinned mesh bake complete\n")
 
-        sys.stderr.write(
-            "[ExportGenie] Step 1: Bake animation\n")
-        if all_joints:
+        # --- Step 1a: Find constraint-driven non-joint transforms ---
+        # IK control transforms, locators, and other non-joint nodes
+        # under rig_roots may be driven by constraints (e.g. locator
+        # → pointConstraint → IK control).  These must be baked
+        # alongside joints so their animation survives constraint
+        # deletion in Step 2.  Without this, IK controls snap to
+        # rest pose and any still-active IK solvers produce wrong
+        # results during the FBX plugin's internal re-bake.
+        constraint_types = [
+            "parentConstraint", "pointConstraint", "orientConstraint",
+            "aimConstraint", "scaleConstraint", "poleVectorConstraint",
+        ]
+        constrained_xforms = []
+        constrained_set = set()
+        for root in (rig_roots or []):
+            if not cmds.objExists(root):
+                continue
+            for ctype in constraint_types:
+                constraints = cmds.listRelatives(
+                    root, allDescendents=True, type=ctype,
+                    fullPath=True
+                ) or []
+                for c in constraints:
+                    # The constrained node is the constraint's parent
+                    parent = cmds.listRelatives(
+                        c, parent=True, fullPath=True)
+                    if not parent:
+                        continue
+                    xform = parent[0]
+                    if xform in constrained_set:
+                        continue
+                    # Skip joints — they're already in all_joints
+                    if cmds.objectType(xform) == "joint":
+                        continue
+                    constrained_set.add(xform)
+                    constrained_xforms.append(xform)
+        if constrained_xforms:
             sys.stderr.write(
-                "[ExportGenie]   Found {} joints to bake\n".format(
-                    len(all_joints)))
-            for jnt in all_joints[:10]:
+                "[ExportGenie]   Found {} constraint-driven "
+                "transform(s) to bake\n".format(
+                    len(constrained_xforms)))
+            for cx in constrained_xforms[:10]:
                 sys.stderr.write(
-                    "[ExportGenie]     {}\n".format(jnt))
-            if len(all_joints) > 10:
+                    "[ExportGenie]     {}\n".format(cx))
+            if len(constrained_xforms) > 10:
                 sys.stderr.write(
                     "[ExportGenie]     ... and {} more\n".format(
-                        len(all_joints) - 10))
+                        len(constrained_xforms) - 10))
+
+        sys.stderr.write(
+            "[ExportGenie] Step 1: Bake animation\n")
+
+        # Combine joints and constrained transforms into one bake
+        # pass.  simulation=True evaluates the full DG at each frame,
+        # capturing the correct result regardless of evaluation order.
+        all_bake_nodes = list(all_joints) + constrained_xforms
+        if all_bake_nodes:
+            sys.stderr.write(
+                "[ExportGenie]   Baking {} joint(s) + {} "
+                "constrained transform(s)\n".format(
+                    len(all_joints), len(constrained_xforms)))
             self.log("Baking animation...")
             # Unlock TRS channels before baking
-            for jnt in all_joints:
+            for node in all_bake_nodes:
                 for a in trs:
                     try:
                         cmds.setAttr(
-                            "{}.{}".format(jnt, a),
+                            "{}.{}".format(node, a),
                             lock=False, keyable=True, channelBox=True)
                     except Exception:
                         pass
             cmds.bakeResults(
-                all_joints,
+                all_bake_nodes,
                 t=(int(start_frame), int(end_frame)),
                 at=trs,
                 simulation=True,
@@ -1927,10 +1975,6 @@ class Exporter(object):
                 "rig_roots!\n")
 
         # --- Step 2: Remove constraints ---
-        constraint_types = [
-            "parentConstraint", "pointConstraint", "orientConstraint",
-            "aimConstraint", "scaleConstraint", "poleVectorConstraint",
-        ]
         constraints_removed = 0
         for root in (rig_roots or []):
             if not cmds.objExists(root):
@@ -1950,10 +1994,10 @@ class Exporter(object):
         if constraints_removed:
             self.log("Removing constraints...")
 
-        # Disconnect non-animCurve sources on baked joints
-        for jnt in all_joints:
+        # Disconnect non-animCurve sources on all baked nodes
+        for node in all_bake_nodes:
             for a in trs:
-                plug = "{}.{}".format(jnt, a)
+                plug = "{}.{}".format(node, a)
                 conns = cmds.listConnections(
                     plug, source=True, destination=False,
                     plugs=True, skipConversionNodes=True
@@ -2704,12 +2748,13 @@ class Exporter(object):
                     cmds.headsUpDisplay(
                         hud_fl, section=8,
                         block=cmds.headsUpDisplay(nextFreeBlock=8),
-                        label="FL:", labelFontSize="large",
-                        dataFontSize="large", blockSize="large",
-                        command=lambda: cmds.getAttr(
-                            fl_shape + ".focalLength"),
+                        label="",
+                        labelFontSize="large",
+                        blockSize="large",
+                        command=lambda: "FL {:.1f}".format(
+                            cmds.getAttr(
+                                fl_shape + ".focalLength")),
                         attachToRefresh=True,
-                        decimalPrecision=1,
                     )
                     hud_names_to_remove.append(hud_fl)
 
@@ -3068,9 +3113,10 @@ class Exporter(object):
                                 os.makedirs(d)
 
                         # --- Pass 1: Plate (background only) ---
-                        # All composite passes use showOrnaments=False
-                        # for clean compositing; HUD is added by the
-                        # single-pass fallback path instead.
+                        # HUD is rendered on the plate pass (bottom
+                        # layer) so frame/FL text is visible in the
+                        # final composite.  Color and matte passes
+                        # use showOrnaments=False for clean keying.
                         self.log("Rendering plate pass...")
                         cmds.modelEditor(
                             model_panel, edit=True,
@@ -3088,7 +3134,7 @@ class Exporter(object):
                             sequenceTime=False,
                             clearCache=True,
                             viewer=False,
-                            showOrnaments=False,
+                            showOrnaments=show_hud,
                             framePadding=4,
                             percent=100,
                             quality=100,
@@ -3935,21 +3981,41 @@ class Exporter(object):
 
         # --- Query what is currently set ---
         current_otn = None
+        current_use_vt = None
         try:
             current_otn = cmds.colorManagementPrefs(
                 query=True, outputTransformName=True,
                 outputTarget="playblast")
         except Exception:
             pass
+        try:
+            current_use_vt = cmds.colorManagementPrefs(
+                query=True, outputUseViewTransform=True,
+                outputTarget="playblast")
+        except Exception:
+            pass
+        sys.stderr.write(
+            "[ExportGenie] Playblast color: current='{}', "
+            "useViewTransform={}, target='{}'\n".format(
+                current_otn, current_use_vt, chosen_name))
 
-        if current_otn == chosen_name:
+        if current_otn == chosen_name and not current_use_vt:
             return
 
         # --- Apply the setting ---
-        # Per the Maya docs, outputTransformName implicitly handles
-        # the transform mode (disables view-transform mode), so we
-        # do NOT separately set outputUseViewTransform.
+        # Disable "Use View Transform" for playblast so Maya uses
+        # our explicit outputTransformName instead of inheriting
+        # whatever the viewport is set to.
         self.log("Setting color management to Raw...")
+        try:
+            cmds.colorManagementPrefs(
+                edit=True,
+                outputUseViewTransform=False,
+                outputTarget="playblast")
+        except Exception as exc:
+            sys.stderr.write(
+                "[ExportGenie] outputUseViewTransform "
+                "failed: {}\n".format(exc))
         try:
             cmds.colorManagementPrefs(
                 edit=True,
@@ -4728,6 +4794,7 @@ class MultiExportUI(object):
         self.scene_info_text = None
         self.version_text = None
         self.export_root_field = None
+        self.export_name_field = None
         self.version_field = None
         self.start_frame_field = None
         self.end_frame_field = None
@@ -4933,6 +5000,15 @@ class MultiExportUI(object):
             self.export_root_field,
             edit=True,
             buttonCommand=partial(self._browse_export_root),
+        )
+        self.export_name_field = cmds.textFieldGrp(
+            label="Export Name:",
+            text="",
+            columnWidth2=(108, 250),
+            annotation=(
+                "Base name for the export folder and files. "
+                "Auto-populated from the scene filename — "
+                "edit to customize."),
         )
         self.version_field = cmds.textFieldGrp(
             label="Version Num (v##):",
@@ -5980,6 +6056,11 @@ class MultiExportUI(object):
                 edit=True,
                 label="Scene: " + scene_short,
             )
+            # Auto-populate export name from scene file
+            scene_base = VersionParser.get_scene_base_name(scene_short)
+            cmds.textFieldGrp(
+                self.export_name_field, edit=True, text=scene_base)
+
             ver_str, _ = VersionParser.parse(scene_short)
             if ver_str:
                 cmds.text(
@@ -6025,8 +6106,8 @@ class MultiExportUI(object):
     def _log_result(self, label, success):
         """Append a single-line task result to the log.
 
-        success=True  -> 'MA ... done'
-        success=False -> 'MA ... FAILED  (see Script Editor)'
+        success=True  -> 'MA complete.'
+        success=False -> 'MA failed. See Script Editor.'
         """
         if success:
             self._log("{} complete.".format(label))
@@ -6106,12 +6187,17 @@ class MultiExportUI(object):
             self.version_field, query=True, text=True).strip()
         if not version_str:
             version_str = None
-        scene_base = None
-        if scene_path:
+        # Read custom export name from UI field
+        scene_base = cmds.textFieldGrp(
+            self.export_name_field, query=True, text=True).strip()
+        if not scene_base and scene_path:
             scene_short = cmds.file(
                 query=True, sceneName=True, shortName=True
             )
             scene_base = VersionParser.get_scene_base_name(scene_short)
+        if not scene_base:
+            errors.append("Export Name is not set.")
+        if scene_path:
             if not version_str:
                 warnings.append(
                     "Version Num field is empty.\n"
@@ -7458,24 +7544,23 @@ class MultiExportUI(object):
             self.end_frame_field, query=True, value=True
         )
 
-        # Read version from UI field
-        scene_short = cmds.file(
-            query=True, sceneName=True, shortName=True
-        )
+        # Read version and export name from UI fields
         version_str = cmds.textFieldGrp(
             self.version_field, query=True, text=True).strip()
         if not version_str:
             version_str = "v01"
-        scene_base = VersionParser.get_scene_base_name(scene_short)
+        scene_base = cmds.textFieldGrp(
+            self.export_name_field, query=True, text=True).strip()
+        if not scene_base:
+            scene_short = cmds.file(
+                query=True, sceneName=True, shortName=True)
+            scene_base = VersionParser.get_scene_base_name(scene_short)
 
         # Resolve versioned directories (rename older version folders)
         FolderManager.resolve_versioned_dir(
             export_root, scene_base, version_str
         )
-        main_dir = os.path.join(
-            export_root,
-            "{}_track_{}".format(scene_base, version_str),
-        )
+        main_dir = os.path.join(export_root, scene_base)
         FolderManager.resolve_ae_dir(main_dir, scene_base, version_str)
 
         self._log("Exporting to: {}".format(main_dir))
@@ -7496,12 +7581,16 @@ class MultiExportUI(object):
         baked_abc_cam = False
         try:
             if camera:
-                if camera == "cam_main" and cmds.objExists(camera):
-                    # Already named correctly — no rename needed
-                    pass
-                elif cmds.objExists(camera):
-                    renamed_cam = cmds.rename(camera, "cam_main")
-                    camera = renamed_cam
+                if cmds.objExists(camera):
+                    short = camera.rsplit("|", 1)[-1].rsplit(
+                        ":", 1)[-1]
+                    if short == "cam_main":
+                        # Already named correctly — no rename
+                        pass
+                    else:
+                        renamed_cam = cmds.rename(
+                            camera, "cam_main")
+                        camera = renamed_cam
                 elif cmds.objExists("cam_main"):
                     # cam_main already exists (e.g. from a prior
                     # export) — use it but don't mark for restore
@@ -7630,6 +7719,7 @@ class MultiExportUI(object):
                 all_paths["jsx"] = ae_paths["jsx"]
                 self._advance_progress()  # step 1: setup complete
 
+                self._log("Exporting JSX + OBJ...")
                 results["jsx"] = exporter.export_jsx(
                     ae_paths["jsx"], ae_paths["obj"], camera,
                     geo_children, start_frame, end_frame
@@ -7643,6 +7733,7 @@ class MultiExportUI(object):
                 )
                 FolderManager.ensure_directories({"ma": paths["ma"]})
                 all_paths["ma"] = paths["ma"]
+                self._log("Exporting MA...")
                 results["ma"] = exporter.export_ma(
                     paths["ma"], camera, geo_roots, [], [],
                     start_frame=start_frame, end_frame=end_frame,
@@ -7656,6 +7747,7 @@ class MultiExportUI(object):
                 )
                 FolderManager.ensure_directories({"fbx": paths["fbx"]})
                 all_paths["fbx"] = paths["fbx"]
+                self._log("Exporting FBX...")
                 results["fbx"] = exporter.export_fbx(
                     paths["fbx"], camera, geo_roots, [], [],
                     start_frame, end_frame
@@ -7669,6 +7761,7 @@ class MultiExportUI(object):
                 )
                 FolderManager.ensure_directories({"abc": paths["abc"]})
                 all_paths["abc"] = paths["abc"]
+                self._log("Exporting ABC...")
                 results["abc"] = exporter.export_abc(
                     paths["abc"], camera, geo_roots, [],
                     start_frame, end_frame
@@ -7704,7 +7797,7 @@ class MultiExportUI(object):
                         FolderManager.ensure_directories(
                             {"mov": paths["mov"]})
                         all_paths["mov"] = paths["mov"]
-                    self._log("Preparing playblast...")
+                    self._log("Exporting Playblast...")
                     raw_pb = cmds.checkBox(
                         self.pb_raw_playblast_cb, query=True,
                         value=True)
@@ -7841,15 +7934,17 @@ class MultiExportUI(object):
                         tpose_frame, start_frame))
             tpose_start = min(start_frame, tpose_frame)
 
-        # Read version from UI field
-        scene_short = cmds.file(
-            query=True, sceneName=True, shortName=True
-        )
+        # Read version and export name from UI fields
         version_str = cmds.textFieldGrp(
             self.version_field, query=True, text=True).strip()
         if not version_str:
             version_str = "v01"
-        scene_base = VersionParser.get_scene_base_name(scene_short)
+        scene_base = cmds.textFieldGrp(
+            self.export_name_field, query=True, text=True).strip()
+        if not scene_base:
+            scene_short = cmds.file(
+                query=True, sceneName=True, shortName=True)
+            scene_base = VersionParser.get_scene_base_name(scene_short)
 
         # Resolve versioned directories (rename older version folders)
         FolderManager.resolve_versioned_dir(
@@ -7881,14 +7976,19 @@ class MultiExportUI(object):
         # Rename camera to cam_main for all exports
         renamed_cam = None
         original_cam_name = camera
+        baked_abc_cam = False
         try:
             if camera:
-                if camera == "cam_main" and cmds.objExists(camera):
-                    # Already named correctly — no rename needed
-                    pass
-                elif cmds.objExists(camera):
-                    renamed_cam = cmds.rename(camera, "cam_main")
-                    camera = renamed_cam
+                if cmds.objExists(camera):
+                    short = camera.rsplit("|", 1)[-1].rsplit(
+                        ":", 1)[-1]
+                    if short == "cam_main":
+                        # Already named correctly — no rename
+                        pass
+                    else:
+                        renamed_cam = cmds.rename(
+                            camera, "cam_main")
+                        camera = renamed_cam
                 elif cmds.objExists("cam_main"):
                     # cam_main already exists (e.g. from a prior
                     # export) — use it but don't mark for restore
@@ -7897,6 +7997,90 @@ class MultiExportUI(object):
                     self._log(
                         "Camera not found. See Script Editor.")
                     camera = None
+
+            # Detect Alembic-driven camera and bake before exports
+            # so that ABC/playblast get valid camera animation even
+            # if the source .abc file is missing or on another drive.
+            if camera and cmds.objExists(camera):
+                cam_shapes = cmds.listRelatives(
+                    camera, shapes=True, type="camera") or []
+                abc_nodes = set()
+                for attr in ("tx", "ty", "tz", "rx", "ry", "rz",
+                             "sx", "sy", "sz"):
+                    conns = cmds.listConnections(
+                        "{}.{}".format(camera, attr),
+                        source=True, destination=False) or []
+                    for c in conns:
+                        if cmds.nodeType(c) == "AlembicNode":
+                            abc_nodes.add(c)
+                for shp in cam_shapes:
+                    conns = cmds.listConnections(
+                        "{}.focalLength".format(shp),
+                        source=True, destination=False) or []
+                    for c in conns:
+                        if cmds.nodeType(c) == "AlembicNode":
+                            abc_nodes.add(c)
+                if abc_nodes:
+                    self._log("Baking Alembic camera...")
+                    cmds.undoInfo(openChunk=True)
+                    baked_abc_cam = True
+                    trs = ["tx", "ty", "tz", "rx", "ry", "rz",
+                           "sx", "sy", "sz"]
+                    for a in trs:
+                        try:
+                            cmds.setAttr(
+                                "{}.{}".format(camera, a),
+                                lock=False, keyable=True,
+                                channelBox=True)
+                        except Exception:
+                            pass
+                    cmds.bakeResults(
+                        camera,
+                        t=(int(start_frame), int(end_frame)),
+                        at=trs,
+                        simulation=True,
+                        preserveOutsideKeys=True,
+                    )
+                    for shp in cam_shapes:
+                        try:
+                            cmds.setAttr(
+                                "{}.focalLength".format(shp),
+                                lock=False, keyable=True)
+                        except Exception:
+                            pass
+                        cmds.bakeResults(
+                            shp,
+                            t=(int(start_frame), int(end_frame)),
+                            at=["focalLength"],
+                            simulation=True,
+                            preserveOutsideKeys=True,
+                        )
+                    # Disconnect Alembic sources (keep baked
+                    # animCurves)
+                    all_plugs = ["{}.{}".format(camera, a)
+                                 for a in trs]
+                    for shp in cam_shapes:
+                        all_plugs.append(
+                            "{}.focalLength".format(shp))
+                    for plug in all_plugs:
+                        conns = cmds.listConnections(
+                            plug, source=True, destination=False,
+                            plugs=True,
+                            skipConversionNodes=True) or []
+                        for src_plug in conns:
+                            src_node = src_plug.split(".")[0]
+                            if cmds.nodeType(src_node).startswith(
+                                    "animCurve"):
+                                continue
+                            try:
+                                cmds.disconnectAttr(
+                                    src_plug, plug)
+                            except Exception:
+                                pass
+                    sys.stderr.write(
+                        "[ExportGenie] Baked Alembic camera: {} "
+                        "({} AlembicNode(s) disconnected).\n"
+                        .format(camera, len(abc_nodes)))
 
             # Unlock any locked locators in the export groups so that
             # FBX/ABC exporters can bake and export their transforms.
@@ -7925,6 +8109,7 @@ class MultiExportUI(object):
                             pass
 
             if do_ma:
+                self._log("Exporting MA...")
                 results["ma"] = exporter.export_ma(
                     paths["ma"], camera, geo_roots, rig_roots, proxy_geos,
                     start_frame=start_frame, end_frame=end_frame,
@@ -7932,105 +8117,8 @@ class MultiExportUI(object):
                 self._log_result("MA", results["ma"])
                 self._advance_progress()
 
-            if do_fbx:
-                self._log("Preparing FBX export...")
-                cmds.undoInfo(openChunk=True)
-                base_meshes = []
-                try:
-                    # Detect vertex-animated meshes before prep
-                    # (Alembic connections must be intact for sampling)
-                    vertex_anim_set = exporter.detect_vertex_anim_meshes(
-                        geo_roots, tpose_start, end_frame)
-                    has_vertex_anim = bool(vertex_anim_set)
-                    if has_vertex_anim:
-                        sys.stderr.write(
-                            "[ExportGenie] Detected {} vertex-animated "
-                            "mesh(es) in Mesh Group.\n".format(
-                                len(vertex_anim_set)))
-
-                    # Standard UE5 prep — skips vertex-anim meshes
-                    # in Steps 4 (history) and 5 (freeze transforms)
-                    exporter.prep_for_ue5_fbx_export(
-                        geo_roots, rig_roots, tpose_start, end_frame,
-                        camera=camera,
-                        skip_mesh_xforms=vertex_anim_set)
-
-                    # Namespace stripping in prep may have renamed nodes.
-                    # Resolve to long (unique) names so select succeeds.
-                    def _resolve_name(name):
-                        """Return a unique DAG path after namespace strip."""
-                        if not name:
-                            return name
-                        long_names = cmds.ls(name, long=True)
-                        if long_names:
-                            return long_names[0]
-                        # Name gone — try without namespace prefix
-                        short = name.rsplit(":", 1)[-1]
-                        long_names = cmds.ls(short, long=True)
-                        if len(long_names) == 1:
-                            return long_names[0]
-                        # Multiple matches — find by matching the
-                        # hierarchy tail (strip namespaces from each
-                        # segment of the original path)
-                        if long_names:
-                            stripped_tail = "/".join(
-                                seg.rsplit(":", 1)[-1]
-                                for seg in name.split("|") if seg)
-                            for ln in long_names:
-                                ln_tail = "/".join(
-                                    seg for seg in ln.split("|") if seg)
-                                if ln_tail.endswith(stripped_tail):
-                                    return ln
-                            return long_names[0]
-                        return name
-
-                    # Convert vertex-animated meshes to blendshapes
-                    # (after prep so namespaces are stripped, but
-                    # Alembic connections are still intact on skipped
-                    # meshes)
-                    if has_vertex_anim:
-                        self._log("Converting vertex animation...")
-                        for old_long in list(vertex_anim_set):
-                            resolved = _resolve_name(old_long)
-                            conv = exporter.convert_abc_to_blendshape(
-                                resolved, tpose_start, end_frame)
-                            base_meshes.append(conv["base_mesh"])
-
-                    fbx_geo = [_resolve_name(g) for g in geo_roots]
-                    fbx_rigs = [_resolve_name(r) for r in rig_roots]
-                    fbx_proxies = [_resolve_name(p) for p in proxy_geos]
-                    fbx_cam = _resolve_name(camera) if camera else camera
-                    results["fbx"] = exporter.export_fbx(
-                        paths["fbx"], fbx_cam, fbx_geo, fbx_rigs,
-                        fbx_proxies, tpose_start, end_frame,
-                        export_input_connections=has_vertex_anim,
-                    )
-                except Exception as exc:
-                    self._log(
-                        "FBX export failed. See Script Editor.")
-                    sys.stderr.write(
-                        "[ExportGenie] FBX error: {}\n".format(exc))
-                    results["fbx"] = False
-                finally:
-                    cmds.undoInfo(closeChunk=True)
-                    try:
-                        cmds.undo()
-                        self._log("Scene restored.")
-                    except Exception:
-                        self._log(
-                            "Undo failed. See Script Editor.")
-                    # Safety net: delete any blendshape artifacts
-                    # that survived the undo
-                    for bm in base_meshes:
-                        if cmds.objExists(bm):
-                            try:
-                                cmds.delete(bm)
-                            except Exception:
-                                pass
-                self._log_result("FBX", results.get("fbx", False))
-                self._advance_progress()
-
             if do_abc:
+                self._log("Exporting ABC...")
                 results["abc"] = exporter.export_abc(
                     paths["abc"], camera, geo_roots, proxy_geos,
                     tpose_start, end_frame, rig_roots=rig_roots,
@@ -8058,7 +8146,7 @@ class MultiExportUI(object):
                             os.makedirs(paths["png_dir"])
                     else:
                         pb_path = paths["mov"]
-                    self._log("Preparing playblast...")
+                    self._log("Exporting Playblast...")
                     raw_pb = cmds.checkBox(
                         self.pb_raw_playblast_cb, query=True,
                         value=True)
@@ -8105,7 +8193,163 @@ class MultiExportUI(object):
                     )
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
+
+            # FBX is last — destructive prep (bake, import refs,
+            # strip namespaces) cannot be reliably undone, so we
+            # save the scene to a temp file, run the prep + export,
+            # then reopen the original to guarantee a clean restore.
+            if do_fbx:
+                self._log("Exporting FBX...")
+                scene_path = cmds.file(
+                    query=True, sceneName=True)
+                if not scene_path:
+                    self._log(
+                        "Scene must be saved before FBX export.")
+                    results["fbx"] = False
+                else:
+                    import tempfile
+                    tmp_dir = tempfile.mkdtemp(
+                        prefix="ExportGenie_fbx_")
+                    tmp_scene = os.path.join(
+                        tmp_dir, os.path.basename(scene_path))
+                    try:
+                        # Save current scene state to temp file
+                        cmds.file(rename=tmp_scene)
+                        cmds.file(save=True, type="mayaAscii"
+                                  if tmp_scene.endswith(".ma")
+                                  else "mayaBinary")
+                        # Restore the original file name in the
+                        # title bar (the file on disk is unchanged)
+                        cmds.file(rename=scene_path)
+                        self._log("Scene snapshot saved.")
+
+                        # Destructive prep on the live scene
+                        vertex_anim_set = \
+                            exporter.detect_vertex_anim_meshes(
+                                geo_roots, tpose_start, end_frame)
+                        has_vertex_anim = bool(vertex_anim_set)
+                        if has_vertex_anim:
+                            sys.stderr.write(
+                                "[ExportGenie] Detected {} vertex-"
+                                "animated mesh(es) in Mesh "
+                                "Group.\n".format(
+                                    len(vertex_anim_set)))
+
+                        exporter.prep_for_ue5_fbx_export(
+                            geo_roots, rig_roots,
+                            tpose_start, end_frame,
+                            camera=camera,
+                            skip_mesh_xforms=vertex_anim_set)
+
+                        def _resolve_name(name):
+                            if not name:
+                                return name
+                            long_names = cmds.ls(name, long=True)
+                            if long_names:
+                                return long_names[0]
+                            short = name.rsplit(":", 1)[-1]
+                            long_names = cmds.ls(
+                                short, long=True)
+                            if len(long_names) == 1:
+                                return long_names[0]
+                            if long_names:
+                                stripped_tail = "/".join(
+                                    seg.rsplit(":", 1)[-1]
+                                    for seg in name.split("|")
+                                    if seg)
+                                for ln in long_names:
+                                    ln_tail = "/".join(
+                                        seg for seg in
+                                        ln.split("|") if seg)
+                                    if ln_tail.endswith(
+                                            stripped_tail):
+                                        return ln
+                                return long_names[0]
+                            return name
+
+                        base_meshes = []
+                        if has_vertex_anim:
+                            self._log(
+                                "Converting vertex animation...")
+                            for old_long in list(vertex_anim_set):
+                                resolved = _resolve_name(old_long)
+                                conv = \
+                                    exporter.convert_abc_to_blendshape(
+                                        resolved, tpose_start,
+                                        end_frame)
+                                base_meshes.append(
+                                    conv["base_mesh"])
+
+                        fbx_geo = [_resolve_name(g)
+                                   for g in geo_roots]
+                        fbx_rigs = [_resolve_name(r)
+                                    for r in rig_roots]
+                        fbx_proxies = [_resolve_name(p)
+                                       for p in proxy_geos]
+                        fbx_cam = (_resolve_name(camera)
+                                   if camera else camera)
+                        results["fbx"] = exporter.export_fbx(
+                            paths["fbx"], fbx_cam, fbx_geo,
+                            fbx_rigs, fbx_proxies,
+                            tpose_start, end_frame,
+                            export_input_connections=has_vertex_anim,
+                        )
+                    except Exception as exc:
+                        self._log(
+                            "FBX export failed. See Script Editor.")
+                        sys.stderr.write(
+                            "[ExportGenie] FBX error: "
+                            "{}\n".format(exc))
+                        results["fbx"] = False
+                    finally:
+                        # Reopen the pre-export snapshot to
+                        # guarantee a clean restore (preserves any
+                        # unsaved changes the user had).
+                        restored = False
+                        try:
+                            cmds.file(
+                                tmp_scene, open=True, force=True)
+                            cmds.file(rename=scene_path)
+                            self._log("Scene restored.")
+                            restored = True
+                        except Exception:
+                            pass
+                        if not restored:
+                            # Snapshot failed — fall back to the
+                            # original file on disk.
+                            try:
+                                cmds.file(
+                                    scene_path, open=True,
+                                    force=True)
+                                self._log(
+                                    "Restored from saved file.")
+                            except Exception:
+                                self._log(
+                                    "Scene restore failed! "
+                                    "Snapshot at: " + tmp_scene)
+                        # Clean up temp file
+                        try:
+                            if os.path.isfile(tmp_scene):
+                                os.remove(tmp_scene)
+                            os.rmdir(tmp_dir)
+                        except Exception:
+                            pass
+                self._log_result("FBX", results.get("fbx", False))
+                self._advance_progress()
+
         finally:
+            # Undo Alembic camera bake (restores original connections)
+            if baked_abc_cam:
+                try:
+                    cmds.undoInfo(closeChunk=True)
+                except Exception:
+                    pass
+                try:
+                    cmds.undo()
+                except Exception:
+                    self._log(
+                        "Undo camera bake failed. "
+                        "See Script Editor.")
             # Restore original camera name
             if renamed_cam and cmds.objExists(renamed_cam):
                 try:
@@ -8172,15 +8416,17 @@ class MultiExportUI(object):
             self.end_frame_field, query=True, value=True
         )
 
-        # Read version from UI field
-        scene_short = cmds.file(
-            query=True, sceneName=True, shortName=True
-        )
+        # Read version and export name from UI fields
         version_str = cmds.textFieldGrp(
             self.version_field, query=True, text=True).strip()
         if not version_str:
             version_str = "v01"
-        scene_base = VersionParser.get_scene_base_name(scene_short)
+        scene_base = cmds.textFieldGrp(
+            self.export_name_field, query=True, text=True).strip()
+        if not scene_base:
+            scene_short = cmds.file(
+                query=True, sceneName=True, shortName=True)
+            scene_base = VersionParser.get_scene_base_name(scene_short)
 
         # Resolve versioned directories
         FolderManager.resolve_versioned_dir(
@@ -8215,12 +8461,16 @@ class MultiExportUI(object):
         baked_abc_cam = False
         try:
             if camera:
-                if camera == "cam_main" and cmds.objExists(camera):
-                    # Already named correctly — no rename needed
-                    pass
-                elif cmds.objExists(camera):
-                    renamed_cam = cmds.rename(camera, "cam_main")
-                    camera = renamed_cam
+                if cmds.objExists(camera):
+                    short = camera.rsplit("|", 1)[-1].rsplit(
+                        ":", 1)[-1]
+                    if short == "cam_main":
+                        # Already named correctly — no rename
+                        pass
+                    else:
+                        renamed_cam = cmds.rename(
+                            camera, "cam_main")
+                        camera = renamed_cam
                 elif cmds.objExists("cam_main"):
                     # cam_main already exists (e.g. from a prior
                     # export) — use it but don't mark for restore
@@ -8316,164 +8566,6 @@ class MultiExportUI(object):
                         "({} AlembicNode(s) disconnected).\n".format(
                             camera, len(abc_nodes)))
 
-            if do_ma:
-                # MA export: import references, convert Alembic
-                # vertex animation to blendshapes, and strip
-                # namespaces so the exported .ma is fully
-                # self-contained (no external .ma/.mb/.abc
-                # dependencies).  Restored via undo.
-                static_geos = [static_geo] if static_geo else []
-                cmds.undoInfo(openChunk=True)
-                ma_prep = {"base_meshes": []}
-                try:
-                    # Import references
-                    all_refs = cmds.ls(type="reference") or []
-                    refs_imported = 0
-                    for ref_node in all_refs:
-                        if ref_node == "sharedReferenceNode":
-                            continue
-                        try:
-                            cmds.file(
-                                referenceNode=ref_node,
-                                importReference=True)
-                            refs_imported += 1
-                        except Exception:
-                            pass
-                    if refs_imported:
-                        self._log("Importing references...")
-
-                    # Strip namespaces
-                    all_ns = cmds.namespaceInfo(
-                        listOnlyNamespaces=True, recurse=True
-                    ) or []
-                    skip_ns = {"UI", "shared"}
-                    all_ns = [ns for ns in all_ns if ns not in skip_ns]
-                    all_ns.sort(key=len, reverse=True)
-                    for ns in all_ns:
-                        try:
-                            cmds.namespace(
-                                removeNamespace=ns,
-                                mergeNamespaceWithRoot=True)
-                        except Exception:
-                            pass
-
-                    # Resolve names after namespace strip
-                    def _resolve(name):
-                        if not name:
-                            return name
-                        long_names = cmds.ls(name, long=True)
-                        if long_names:
-                            return long_names[0]
-                        short = name.rsplit(":", 1)[-1]
-                        long_names = cmds.ls(short, long=True)
-                        if len(long_names) == 1:
-                            return long_names[0]
-                        if len(long_names) > 1:
-                            sys.stderr.write(
-                                "[ExportGenie] WARNING: '{}' is "
-                                "ambiguous after namespace strip "
-                                "({} matches). MA may be "
-                                "incomplete.\n".format(
-                                    short, len(long_names)))
-                            return long_names[0]
-                        return name
-
-                    resolved_meshes = [_resolve(fm) for fm in face_meshes]
-                    resolved_statics = [_resolve(sg) for sg in static_geos]
-                    resolved_cam = _resolve(camera) if camera else camera
-
-                    # Convert Alembic vertex animation to
-                    # blendshapes so the .ma has no .abc dependency.
-                    self._log("Preparing MA export...")
-                    ma_prep = exporter.prepare_face_track_for_export(
-                        resolved_meshes, start_frame, end_frame
-                    )
-
-                    # Export the converted meshes (blendshape bases
-                    # replace the originals in the selection)
-                    export_nodes = ma_prep.get(
-                        "select_for_export", resolved_meshes)
-                    results["ma"] = exporter.export_ma(
-                        paths["ma"], resolved_cam,
-                        export_nodes, [], resolved_statics,
-                        start_frame=start_frame, end_frame=end_frame,
-                    )
-                except Exception as exc:
-                    self._log(
-                        "MA export failed. See Script Editor.")
-                    sys.stderr.write(
-                        "[ExportGenie] MA error: {}\n".format(exc))
-                    results["ma"] = False
-                finally:
-                    cmds.undoInfo(closeChunk=True)
-                    try:
-                        cmds.undo()
-                        self._log("Scene restored.")
-                    except Exception:
-                        self._log(
-                            "Undo failed. See Script Editor.")
-                    # Safety net: delete any surviving artifacts
-                    for bm in ma_prep.get("base_meshes", []):
-                        if cmds.objExists(bm):
-                            try:
-                                cmds.delete(bm)
-                            except Exception:
-                                pass
-                self._log_result("MA", results["ma"])
-                self._advance_progress()
-
-            if do_fbx:
-                self._log("Preparing FBX export...")
-                cmds.undoInfo(openChunk=True)
-                prep = {
-                    "base_meshes": [],
-                    "select_for_export": [],
-                }
-                try:
-                    prep = exporter.prepare_face_track_for_export(
-                        face_meshes, start_frame, end_frame
-                    )
-
-                    if not prep["select_for_export"]:
-                        self._log("No geometry found to export.")
-                        results["fbx"] = False
-                    else:
-                        self._log("FBX export...")
-                        static_geos = [static_geo] if static_geo else []
-                        results["fbx"] = exporter.export_fbx(
-                            paths["fbx"], camera,
-                            prep["select_for_export"], [],
-                            static_geos, start_frame, end_frame,
-                            export_input_connections=True,
-                        )
-                except Exception as exc:
-                    self._log(
-                        "FBX export failed. See Script Editor.")
-                    results["fbx"] = False
-                finally:
-                    cmds.undoInfo(closeChunk=True)
-                    try:
-                        cmds.undo()
-                        self._log("Scene restored.")
-                    except Exception:
-                        self._log(
-                            "Undo failed. See Script Editor.")
-
-                    # Safety net: delete any surviving artifacts
-                    artifacts = [
-                        a for a in prep.get("base_meshes", [])
-                        if cmds.objExists(a)
-                    ]
-                    if artifacts:
-                        for artifact in artifacts:
-                            try:
-                                cmds.delete(artifact)
-                            except Exception:
-                                pass
-
-                self._log_result("FBX", results.get("fbx", False))
-                self._advance_progress()
-
             if do_mov:
                 fmt_choice = cmds.optionMenu(
                     self.ft_mov_format_menu, query=True, value=True)
@@ -8494,7 +8586,7 @@ class MultiExportUI(object):
                             os.makedirs(paths["png_dir"])
                     else:
                         pb_path = paths["mov"]
-                    self._log("Preparing playblast...")
+                    self._log("Exporting Playblast...")
                     raw_pb = cmds.checkBox(
                         self.pb_raw_playblast_cb, query=True,
                         value=True)
@@ -8541,6 +8633,210 @@ class MultiExportUI(object):
                     )
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
+
+            # MA and FBX are last — both require destructive scene
+            # changes (import refs, strip namespaces, convert ABC
+            # to blendshapes) that cannot be reliably undone.  We
+            # save the scene to a temp file, run the prep + export,
+            # then reopen the original for a clean restore.
+            if do_ma or do_fbx:
+                scene_path = cmds.file(
+                    query=True, sceneName=True)
+                if not scene_path:
+                    self._log(
+                        "Scene must be saved before MA/FBX export.")
+                    if do_ma:
+                        results["ma"] = False
+                    if do_fbx:
+                        results["fbx"] = False
+                else:
+                    import tempfile
+                    tmp_dir = tempfile.mkdtemp(
+                        prefix="ExportGenie_ft_")
+                    tmp_scene = os.path.join(
+                        tmp_dir, os.path.basename(scene_path))
+                    try:
+                        # Save current scene state to temp file
+                        cmds.file(rename=tmp_scene)
+                        cmds.file(save=True, type="mayaAscii"
+                                  if tmp_scene.endswith(".ma")
+                                  else "mayaBinary")
+                        cmds.file(rename=scene_path)
+                        self._log("Scene snapshot saved.")
+
+                        if do_ma:
+                            self._log("Exporting MA...")
+                            static_geos = (
+                                [static_geo] if static_geo else [])
+                            try:
+                                # Import references
+                                all_refs = cmds.ls(
+                                    type="reference") or []
+                                for ref_node in all_refs:
+                                    if ref_node == \
+                                            "sharedReferenceNode":
+                                        continue
+                                    try:
+                                        cmds.file(
+                                            referenceNode=ref_node,
+                                            importReference=True)
+                                    except Exception:
+                                        pass
+
+                                # Strip namespaces
+                                all_ns = cmds.namespaceInfo(
+                                    listOnlyNamespaces=True,
+                                    recurse=True) or []
+                                skip_ns = {"UI", "shared"}
+                                all_ns = [ns for ns in all_ns
+                                          if ns not in skip_ns]
+                                all_ns.sort(key=len, reverse=True)
+                                for ns in all_ns:
+                                    try:
+                                        cmds.namespace(
+                                            removeNamespace=ns,
+                                            mergeNamespaceWithRoot=True)
+                                    except Exception:
+                                        pass
+
+                                def _resolve(name):
+                                    if not name:
+                                        return name
+                                    long_names = cmds.ls(
+                                        name, long=True)
+                                    if long_names:
+                                        return long_names[0]
+                                    short = name.rsplit(":", 1)[-1]
+                                    long_names = cmds.ls(
+                                        short, long=True)
+                                    if len(long_names) == 1:
+                                        return long_names[0]
+                                    if len(long_names) > 1:
+                                        return long_names[0]
+                                    return name
+
+                                resolved_meshes = [
+                                    _resolve(fm)
+                                    for fm in face_meshes]
+                                resolved_statics = [
+                                    _resolve(sg)
+                                    for sg in static_geos]
+                                resolved_cam = (
+                                    _resolve(camera)
+                                    if camera else camera)
+
+                                ma_prep = \
+                                    exporter.prepare_face_track_for_export(
+                                        resolved_meshes,
+                                        start_frame, end_frame)
+                                export_nodes = ma_prep.get(
+                                    "select_for_export",
+                                    resolved_meshes)
+                                results["ma"] = exporter.export_ma(
+                                    paths["ma"], resolved_cam,
+                                    export_nodes, [],
+                                    resolved_statics,
+                                    start_frame=start_frame,
+                                    end_frame=end_frame)
+                            except Exception as exc:
+                                self._log(
+                                    "MA export failed. "
+                                    "See Script Editor.")
+                                sys.stderr.write(
+                                    "[ExportGenie] MA error: "
+                                    "{}\n".format(exc))
+                                results["ma"] = False
+                            self._log_result(
+                                "MA", results.get("ma", False))
+                            self._advance_progress()
+
+                            # Reopen scene before FBX (MA prep
+                            # was destructive)
+                            if do_fbx:
+                                try:
+                                    cmds.file(
+                                        scene_path, open=True,
+                                        force=True)
+                                except Exception:
+                                    cmds.file(
+                                        tmp_scene, open=True,
+                                        force=True)
+                                    cmds.file(rename=scene_path)
+
+                        if do_fbx:
+                            self._log("Exporting FBX...")
+                            try:
+                                prep = \
+                                    exporter.prepare_face_track_for_export(
+                                        face_meshes, start_frame,
+                                        end_frame)
+                                if not prep["select_for_export"]:
+                                    self._log(
+                                        "No geometry found to "
+                                        "export.")
+                                    results["fbx"] = False
+                                else:
+                                    static_geos = (
+                                        [static_geo]
+                                        if static_geo else [])
+                                    results["fbx"] = \
+                                        exporter.export_fbx(
+                                            paths["fbx"], camera,
+                                            prep[
+                                                "select_for_export"
+                                            ],
+                                            [], static_geos,
+                                            start_frame, end_frame,
+                                            export_input_connections=True)
+                            except Exception as exc:
+                                self._log(
+                                    "FBX export failed. "
+                                    "See Script Editor.")
+                                sys.stderr.write(
+                                    "[ExportGenie] FBX error: "
+                                    "{}\n".format(exc))
+                                results["fbx"] = False
+                            self._log_result(
+                                "FBX",
+                                results.get("fbx", False))
+                            self._advance_progress()
+
+                    except Exception as exc:
+                        sys.stderr.write(
+                            "[ExportGenie] Export error: "
+                            "{}\n".format(exc))
+                    finally:
+                        # Reopen the pre-export snapshot to
+                        # guarantee a clean restore (preserves
+                        # any unsaved changes the user had).
+                        restored = False
+                        try:
+                            cmds.file(
+                                tmp_scene, open=True, force=True)
+                            cmds.file(rename=scene_path)
+                            self._log("Scene restored.")
+                            restored = True
+                        except Exception:
+                            pass
+                        if not restored:
+                            try:
+                                cmds.file(
+                                    scene_path, open=True,
+                                    force=True)
+                                self._log(
+                                    "Restored from saved file.")
+                            except Exception:
+                                self._log(
+                                    "Scene restore failed! "
+                                    "Snapshot at: " + tmp_scene)
+                        # Clean up temp file
+                        try:
+                            if os.path.isfile(tmp_scene):
+                                os.remove(tmp_scene)
+                            os.rmdir(tmp_dir)
+                        except Exception:
+                            pass
+
         finally:
             # Undo Alembic camera bake (restores original connections)
             if baked_abc_cam:
@@ -8597,12 +8893,32 @@ class MultiExportUI(object):
 def launch():
     """Open the Export Genie UI. Called by the shelf button.
 
-    Forces a module reload so dropping a new ExportGenie.py into the
-    scripts folder and clicking the shelf button is enough to upgrade.
+    Aggressively clears all cached versions of the module so the
+    latest .py on disk is always used — no restart required.
     """
     import importlib
+
+    # 1. Remove any cached module object
+    sys.modules.pop("ExportGenie", None)
+
+    # 2. Invalidate bytecode caches so Python re-reads the .py
+    importlib.invalidate_caches()
+
+    # 3. Delete stale .pyc files next to the script
+    scripts_dir = os.path.join(
+        cmds.internalVar(userAppDir=True), "scripts")
+    pyc_cache = os.path.join(scripts_dir, "__pycache__")
+    if os.path.isdir(pyc_cache):
+        for f in os.listdir(pyc_cache):
+            if f.startswith("ExportGenie.") and f.endswith(
+                    (".pyc", ".pyo")):
+                try:
+                    os.remove(os.path.join(pyc_cache, f))
+                except Exception:
+                    pass
+
+    # 4. Fresh import from disk
     import ExportGenie as _self_mod
-    importlib.reload(_self_mod)
     _self_mod._launch_inner()
 
 
@@ -8632,10 +8948,26 @@ def _launch_inner():
 def _restore_ui():
     """Called by workspaceControl uiScript to (re)build UI contents."""
     global _ui_instance
-    # Force a module reload so the latest code is always used
     import importlib
+    sys.modules.pop("ExportGenie", None)
+    importlib.invalidate_caches()
+    # Delete stale .pyc files
+    _scripts = os.path.join(
+        cmds.internalVar(userAppDir=True), "scripts")
+    _cache = os.path.join(_scripts, "__pycache__")
+    if os.path.isdir(_cache):
+        for _f in os.listdir(_cache):
+            if _f.startswith("ExportGenie.") and _f.endswith(
+                    (".pyc", ".pyo")):
+                try:
+                    os.remove(os.path.join(_cache, _f))
+                except Exception:
+                    pass
     import ExportGenie as _self_mod
-    importlib.reload(_self_mod)
+    # Update the tab label to match the current version
+    cmds.workspaceControl(
+        WORKSPACE_CONTROL_NAME, edit=True,
+        label="Export Genie  {}".format(_self_mod.TOOL_VERSION))
     _self_mod._ui_instance = MultiExportUI()
     _ui_instance = _self_mod._ui_instance
     cmds.setParent(WORKSPACE_CONTROL_NAME)
@@ -8711,8 +9043,17 @@ def _create_shelf_button():
         annotation="Export Genie: Export to .ma, .fbx, .abc, .jsx",
         image1=ICON_FILENAME,
         command=(
-            "import sys\n"
+            "import sys, importlib, os, maya.cmds\n"
             "sys.modules.pop('ExportGenie', None)\n"
+            "importlib.invalidate_caches()\n"
+            "_sd = os.path.join("
+            "maya.cmds.internalVar(userAppDir=True),"
+            "'scripts','__pycache__')\n"
+            "[os.remove(os.path.join(_sd,f)) "
+            "for f in os.listdir(_sd) "
+            "if f.startswith('ExportGenie.') "
+            "and f.endswith(('.pyc','.pyo'))] "
+            "if os.path.isdir(_sd) else None\n"
             "import ExportGenie\n"
             "ExportGenie.launch()\n"
         ),
