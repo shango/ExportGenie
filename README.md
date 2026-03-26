@@ -1,6 +1,6 @@
 # Export Genie
 
-**Version v11** — Maya 2025+ / Windows & macOS
+**Version v12** — Maya 2025+ / Windows & macOS
 
 One-click export from Maya to .ma, .fbx, .abc, .jsx, and playblast QC. Three tabs for three workflows: Camera Track, Matchmove, and Face Track.
 
@@ -81,6 +81,22 @@ Restart Maya, open a fresh scene, drag the new `ExportGenie.py` into the viewpor
 
 ---
 
+## What's New in v12
+
+- **PySide6/Qt6 UI** — Full UI rewrite from `maya.cmds` to PySide6 (PySide2 fallback). Collapsible groups, labels above fields, cleaner layout.
+- **Export Folder field** — Single editable field replaces separate Export Name + Version fields. Pre-populated with the scene filename. Folder name parsed into base + version for file naming.
+- **Multiple cameras** — All tabs now support multiple cameras via +/- buttons. Each camera is baked and exported.
+- **Object Track (Camera Track)** — New loader for animated object groups. Alembic-driven and constraint-driven transforms are auto-baked before export.
+- **Dynamic field lists everywhere** — Camera, Geo, Static Geo, Rig/Geo, Face Mesh, and Object Track loaders all have +/- buttons. Labels above fields.
+- **Load/Unload toggle** — Clicking "Load Sel" on a populated field clears it. Click again to reload.
+- **QC spline crown (Face Track)** — Auto-created per render, point+orient constrained to the face mesh. Rendered with useBackground shader occlusion and composited via ffmpeg alpha overlay.
+- **Camera Track composited playblast** — All Camera Track playblast formats now render to temp PNGs and encode via ffmpeg with full HUD metadata overlay.
+- **Image plane resolution** — Camera Track playblasts match the camera's image plane dimensions instead of hardcoded 1920x1080.
+- **Motion blur checkbox** — Matchmove / Face Track playblast section has a toggle for VP2.0 motion blur (default on).
+- **AE JSX frame alignment fix** — Composition and all layers now start at the correct Maya start frame (e.g., 1001). Fixed off-by-one in keyframe timing and footage layer start.
+- **ffmpeg font fix (Windows)** — Font paths written via `-filter_complex_script` with double-escaped colons for reliable drawtext on Windows.
+- **AE folder naming** — `{base}_afterEffects_{version}/`, OBJ files: `{base}_{geo}_{version}.obj`.
+
 ## What's New in v11
 
 - **Scene protection** — FBX export no longer relies on Maya's undo to restore your scene. The tool saves a snapshot before the destructive bake/prep, exports the FBX, then reopens the snapshot. Your master scene is guaranteed to stay clean.
@@ -115,8 +131,8 @@ Restart Maya, open a fresh scene, drag the new `ExportGenie.py` into the viewpor
 
 ### Export Directory and Naming
 - Browse to set your export root directory
-- **Export Name** field controls the folder and file base name — auto-populated from your scene file, fully editable
-- Version number auto-detected from your scene file's `_v##` pattern, manually overridable
+- **Export Folder** field is the full folder name — auto-populated from the scene filename (without extension), fully editable
+- Version and tag are parsed from the folder name: `{shot}_{plate}_{tag}_{version}` (e.g., `SHOT001_pl01_track_v03`)
 
 ### Export Formats
 - **Maya ASCII (.ma)** — Camera renamed to `cam_main`, custom shaders stripped to default lambert, image plane references preserved
