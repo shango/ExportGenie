@@ -48,7 +48,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v12"
+TOOL_VERSION = "v12.5"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -678,6 +678,26 @@ class Exporter(object):
         return None
 
     @staticmethod
+    def _has_drawtext():
+        """Return True if the bundled ffmpeg supports the drawtext filter."""
+        ffmpeg_path = Exporter._find_ffmpeg()
+        if not ffmpeg_path:
+            return False
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-filters"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return "drawtext" in result.stdout
+        except Exception:
+            return False
+
+    @staticmethod
     def _run_ffmpeg(cmd, filter_complex=None, log_prefix="ffmpeg"):
         """Run an ffmpeg command with a filter_complex graph.
 
@@ -892,7 +912,7 @@ class Exporter(object):
             "-i", seq_pattern,
         ]
         vf_script = None
-        if show_hud:
+        if show_hud and self._has_drawtext():
             hud_filters = self._build_hud_drawtext(
                 start_frame, focal_length, resolution=resolution)
             # Strip stream labels — single-input uses plain vf
@@ -1063,7 +1083,7 @@ class Exporter(object):
                 "[0:v][fg]overlay=format=auto[out]"
             ).format(opacity=opacity_val)
 
-        if show_hud:
+        if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
                 start_frame, focal_length, resolution=resolution)
             filter_complex = filter_complex.replace(
@@ -1728,7 +1748,10 @@ class Exporter(object):
                     file=usd_path,
                     selection=True,
                     frameRange=(int(start_frame), int(end_frame)),
+                    frameStride=1.0,
                     exportSkels="auto",
+                    exportSkin="auto",
+                    exportBlendShapes=True,
                     exportVisibility=True,
                     eulerFilter=True,
                 )
@@ -4487,7 +4510,7 @@ class Exporter(object):
                             out_dir,
                             out_base + ".%04d.png")
                         hud_filters = None
-                        if show_hud:
+                        if show_hud and self._has_drawtext():
                             hud_f = self._build_hud_drawtext(
                                 start_frame, hud_focal_length,
                                 resolution=(pb_width, pb_height))
@@ -5749,7 +5772,7 @@ QGroupBox {
     margin-top: 10px;
     padding: 18px 6px 8px 6px;
     font-weight: bold;
-    font-size: 11px;
+    font-size: 13px;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
@@ -5852,7 +5875,7 @@ QSlider::handle:horizontal {
     border-radius: 7px;
 }
 QLabel {
-    font-size: 11px;
+    font-size: 13px;
 }
 QScrollArea {
     border: none;
@@ -5911,13 +5934,14 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_obj_track_entries = []
         self.ct_obj_track_layout = None
         self.ct_obj_track_minus_btn = None
+        self.ct_stmap_undistort_field = None
+        self.ct_stmap_redistort_field = None
         self.ct_ma_checkbox = None
         self.ct_jsx_checkbox = None
         self.ct_fbx_checkbox = None
         self.ct_abc_checkbox = None
         self.ct_usd_checkbox = None
         self.ct_mov_checkbox = None
-        self.ct_mov_format_menu = None
         # Playblast settings
         self.pb_context_menu = None
         self.pb_raw_playblast_cb = None
@@ -5946,7 +5970,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
-        self.mm_mov_format_menu = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -5963,7 +5986,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ft_fbx_checkbox = None
         self.ft_usd_checkbox = None
         self.ft_mov_checkbox = None
-        self.ft_mov_format_menu = None
         # Preview mode state
         self._preview_active = False
         self._preview_state = {}
@@ -6052,6 +6074,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
     def _build_support_row(self):
         row = QHBoxLayout()
+        ver_label = QLabel("{} {}".format(TOOL_NAME, TOOL_VERSION))
+        ver_label.setStyleSheet(
+            "color: #888888; font-size: 15px; font-weight: bold;")
+        row.addWidget(ver_label)
+        row.addStretch()
         row.addWidget(QLabel("For Support - "))
         link = QPushButton("Shannon")
         link.setStyleSheet(
@@ -6063,10 +6090,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             "?subject=Export Genie {}".format(TOOL_VERSION)))
         link.setToolTip("sgold1@pdoexperts.fb.com")
         row.addWidget(link)
-        row.addStretch()
-        ver_label = QLabel("{} {}".format(TOOL_NAME, TOOL_VERSION))
-        ver_label.setStyleSheet("color: #ffffff; font-size: 10px;")
-        row.addWidget(ver_label)
         self._content_layout.addLayout(row)
 
     def _build_scene_info(self):
@@ -6211,6 +6234,47 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         fr.insertWidget(idx + 1, self.ct_obj_track_plus_btn)
         fr.insertWidget(idx + 2, self.ct_obj_track_minus_btn)
 
+        # Lens Distortion STMaps (for AE Grid Warp)
+        stmap_group = CollapsibleGroupBox(
+            "Lens Distortion STMaps  (for AE Grid Warp)")
+        stmap_layout = QVBoxLayout()
+        stmap_layout.setSpacing(6)
+
+        ud_lbl = QLabel("Undistort STMap (.exr):")
+        stmap_layout.addWidget(ud_lbl)
+        ud_row = QHBoxLayout()
+        ud_row.setSpacing(6)
+        self.ct_stmap_undistort_field = QLineEdit()
+        self.ct_stmap_undistort_field.setReadOnly(True)
+        self.ct_stmap_undistort_field.setToolTip(
+            "32-bit EXR STMap for removing lens distortion")
+        ud_row.addWidget(self.ct_stmap_undistort_field, 2)
+        ud_btn = QPushButton("Browse...")
+        ud_btn.setFixedWidth(85)
+        ud_btn.clicked.connect(
+            partial(self._browse_stmap, self.ct_stmap_undistort_field))
+        ud_row.addWidget(ud_btn)
+        stmap_layout.addLayout(ud_row)
+
+        rd_lbl = QLabel("Redistort STMap (.exr):")
+        stmap_layout.addWidget(rd_lbl)
+        rd_row = QHBoxLayout()
+        rd_row.setSpacing(6)
+        self.ct_stmap_redistort_field = QLineEdit()
+        self.ct_stmap_redistort_field.setReadOnly(True)
+        self.ct_stmap_redistort_field.setToolTip(
+            "32-bit EXR STMap for re-applying lens distortion")
+        rd_row.addWidget(self.ct_stmap_redistort_field, 2)
+        rd_btn = QPushButton("Browse...")
+        rd_btn.setFixedWidth(85)
+        rd_btn.clicked.connect(
+            partial(self._browse_stmap, self.ct_stmap_redistort_field))
+        rd_row.addWidget(rd_btn)
+        stmap_layout.addLayout(rd_row)
+
+        stmap_group.setLayout(stmap_layout)
+        tab_layout.addWidget(stmap_group)
+
         # Export Formats
         formats = CollapsibleGroupBox("Export Formats")
         fmt_layout = QVBoxLayout()
@@ -6226,25 +6290,15 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_usd_checkbox = QCheckBox("  USD (.usd)")
         self.ct_usd_checkbox.setChecked(True)
 
-        mov_row = QHBoxLayout()
-        mov_row.setSpacing(6)
-        self.ct_mov_checkbox = QCheckBox("  Playblast QC:")
+        self.ct_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ct_mov_checkbox.setChecked(True)
-        mov_row.addWidget(self.ct_mov_checkbox)
-        self.ct_mov_format_menu = QComboBox()
-        self.ct_mov_format_menu.addItems(
-            ["H.264 (.mov)", "PNG Sequence", "H.264 (.mp4 Win)"])
-        if sys.platform == "win32":
-            self.ct_mov_format_menu.setCurrentText("H.264 (.mp4 Win)")
-        mov_row.addWidget(self.ct_mov_format_menu)
-        mov_row.addStretch()
 
         fmt_layout.addWidget(self.ct_ma_checkbox)
         fmt_layout.addWidget(self.ct_jsx_checkbox)
         fmt_layout.addWidget(self.ct_fbx_checkbox)
         fmt_layout.addWidget(self.ct_abc_checkbox)
         fmt_layout.addWidget(self.ct_usd_checkbox)
-        fmt_layout.addLayout(mov_row)
+        fmt_layout.addWidget(self.ct_mov_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -6355,24 +6409,14 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_usd_checkbox = QCheckBox("  USD (.usd)")
         self.mm_usd_checkbox.setChecked(True)
 
-        mov_row = QHBoxLayout()
-        mov_row.setSpacing(6)
-        self.mm_mov_checkbox = QCheckBox("  Playblast QC:")
+        self.mm_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.mm_mov_checkbox.setChecked(True)
-        mov_row.addWidget(self.mm_mov_checkbox)
-        self.mm_mov_format_menu = QComboBox()
-        self.mm_mov_format_menu.addItems(
-            ["H.264 (.mov)", "PNG Sequence", "H.264 (.mp4 Win)"])
-        if sys.platform == "win32":
-            self.mm_mov_format_menu.setCurrentText("H.264 (.mp4 Win)")
-        mov_row.addWidget(self.mm_mov_format_menu)
-        mov_row.addStretch()
 
         fmt_layout.addWidget(self.mm_ma_checkbox)
         fmt_layout.addWidget(self.mm_fbx_checkbox)
         fmt_layout.addWidget(self.mm_abc_checkbox)
         fmt_layout.addWidget(self.mm_usd_checkbox)
-        fmt_layout.addLayout(mov_row)
+        fmt_layout.addWidget(self.mm_mov_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -6499,23 +6543,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ft_usd_checkbox = QCheckBox("  USD (.usd)")
         self.ft_usd_checkbox.setChecked(True)
 
-        mov_row = QHBoxLayout()
-        mov_row.setSpacing(6)
-        self.ft_mov_checkbox = QCheckBox("  Playblast QC:")
+        self.ft_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ft_mov_checkbox.setChecked(True)
-        mov_row.addWidget(self.ft_mov_checkbox)
-        self.ft_mov_format_menu = QComboBox()
-        self.ft_mov_format_menu.addItems(
-            ["H.264 (.mov)", "PNG Sequence", "H.264 (.mp4 Win)"])
-        if sys.platform == "win32":
-            self.ft_mov_format_menu.setCurrentText("H.264 (.mp4 Win)")
-        mov_row.addWidget(self.ft_mov_format_menu)
-        mov_row.addStretch()
 
         fmt_layout.addWidget(self.ft_ma_checkbox)
         fmt_layout.addWidget(self.ft_fbx_checkbox)
         fmt_layout.addWidget(self.ft_usd_checkbox)
-        fmt_layout.addLayout(mov_row)
+        fmt_layout.addWidget(self.ft_mov_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -6793,8 +6827,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(
-                f, "camera"))
+            partial(self._load_selection_into, field, "camera"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -6831,7 +6864,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(f, "geo"))
+            partial(self._load_selection_into, field, "geo"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -6866,8 +6899,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(
-                f, "geo"))
+            partial(self._load_selection_into, field, "geo"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -6904,8 +6936,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(
-                f, "camera"))
+            partial(self._load_selection_into, field, "camera"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -6942,7 +6973,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(f, "proxy"))
+            partial(self._load_selection_into, field, "proxy"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -6980,7 +7011,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         rig_btn = QPushButton("<< Load Sel")
         rig_btn.setFixedWidth(100)
         rig_btn.clicked.connect(
-            lambda checked=False, f=rig_field: self._load_selection_into(f, "rig"))
+            partial(self._load_selection_into, rig_field, "rig"))
         rig_row.addWidget(rig_btn)
         row_layout.addLayout(rig_row)
 
@@ -6995,7 +7026,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         geo_btn = QPushButton("<< Load Sel")
         geo_btn.setFixedWidth(100)
         geo_btn.clicked.connect(
-            lambda checked=False, f=geo_field: self._load_selection_into(f, "geo"))
+            partial(self._load_selection_into, geo_field, "geo"))
         geo_row.addWidget(geo_btn)
         row_layout.addLayout(geo_row)
 
@@ -7034,8 +7065,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(
-                f, "camera"))
+            partial(self._load_selection_into, field, "camera"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -7072,8 +7102,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(
-                f, "proxy"))
+            partial(self._load_selection_into, field, "proxy"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -7111,7 +7140,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn = QPushButton("<< Load Sel")
         btn.setFixedWidth(100)
         btn.clicked.connect(
-            lambda checked=False, f=field: self._load_selection_into(f, "geo"))
+            partial(self._load_selection_into, field, "geo"))
         field_row.addWidget(btn)
         row_layout.addLayout(field_row)
 
@@ -7214,6 +7243,15 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             self, "Select Export Root Directory")
         if result:
             self.export_root_field.setText(result)
+
+    def _browse_stmap(self, target_field):
+        result = QFileDialog.getOpenFileName(
+            self, "Select STMap EXR", "",
+            "EXR Files (*.exr);;All Files (*)")
+        if isinstance(result, (list, tuple)):
+            result = result[0]
+        if result:
+            target_field.setText(result)
 
     def _load_selection_into(self, target_field, role):
         """Validate the current selection and load it into a QLineEdit."""
@@ -7388,26 +7426,50 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
     # Progress Bar
     # ------------------------------------------------------------------
 
+    def _widget_alive(self, widget):
+        """Return True if a Qt widget's C++ object still exists."""
+        try:
+            widget.isVisible()
+            return True
+        except RuntimeError:
+            return False
+
     def _reset_progress(self, total_steps):
         self._progress_total = max(total_steps, 1)
         self._progress_done = 0
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.progress_label.setText("0%")
-        self.progress_label.setVisible(True)
-        cmds.refresh(force=True)
+        try:
+            if self._widget_alive(self.progress_bar):
+                self.progress_bar.setValue(0)
+                self.progress_bar.setVisible(True)
+            if self._widget_alive(self.progress_label):
+                self.progress_label.setText("0%")
+                self.progress_label.setVisible(True)
+            cmds.refresh(force=True)
+        except Exception:
+            pass
 
     def _advance_progress(self):
         self._progress_done += 1
         pct = int(
             (self._progress_done / float(self._progress_total)) * 100)
-        self.progress_bar.setValue(min(pct, 100))
-        self.progress_label.setText("{}%".format(min(pct, 100)))
-        cmds.refresh(force=True)
+        try:
+            if self._widget_alive(self.progress_bar):
+                self.progress_bar.setValue(min(pct, 100))
+            if self._widget_alive(self.progress_label):
+                self.progress_label.setText("{}%".format(
+                    min(pct, 100)))
+            cmds.refresh(force=True)
+        except Exception:
+            pass
 
     def _hide_progress(self):
-        self.progress_bar.setVisible(False)
-        self.progress_label.setVisible(False)
+        try:
+            if self._widget_alive(self.progress_bar):
+                self.progress_bar.setVisible(False)
+            if self._widget_alive(self.progress_label):
+                self.progress_label.setVisible(False)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Validation
@@ -8952,10 +9014,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 paths = FolderManager.build_export_paths(
                     export_root, scene_base, version_str, tag="cam",
                     folder_name=folder_name)
-                fmt_choice = self.ct_mov_format_menu.currentText()
-                png_mode = "PNG" in fmt_choice
-                mp4_mode = ".mp4" in fmt_choice
-                if mp4_mode and not Exporter._find_ffmpeg():
+                png_mode = False
+                mp4_mode = True
+                if not Exporter._find_ffmpeg():
                     self._log(
                         "Playblast skipped \u2014 ffmpeg not found.")
                     results["mov"] = False
@@ -9280,10 +9341,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 self._advance_progress()
 
             if do_mov:
-                fmt_choice = self.mm_mov_format_menu.currentText()
-                png_mode = "PNG" in fmt_choice
-                mp4_mode = ".mp4" in fmt_choice
-                if mp4_mode and not Exporter._find_ffmpeg():
+                png_mode = False
+                mp4_mode = True
+                if not Exporter._find_ffmpeg():
                     self._log(
                         "Playblast skipped \u2014 ffmpeg not found.")
                     results["mov"] = False
@@ -9665,10 +9725,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             camera, len(abc_nodes)))
 
             if do_mov:
-                fmt_choice = self.ft_mov_format_menu.currentText()
-                png_mode = "PNG" in fmt_choice
-                mp4_mode = ".mp4" in fmt_choice
-                if mp4_mode and not Exporter._find_ffmpeg():
+                png_mode = False
+                mp4_mode = True
+                if not Exporter._find_ffmpeg():
                     self._log(
                         "Playblast skipped \u2014 ffmpeg not found.")
                     results["mov"] = False
@@ -10278,10 +10337,6 @@ def install():
             for fname in files:
                 fpath = os.path.join(root, fname)
                 installed_items.append(("Bundled", fpath))
-    elif dest_ffmpeg and os.path.isfile(dest_ffmpeg):
-        # No bin/ shipped with this drop, but a previous install
-        # already placed ffmpeg — report it so the user knows.
-        installed_items.append(("Already installed", dest_ffmpeg))
     elif dest_ffmpeg:
         # Neither source nor destination has ffmpeg — warn the user.
         installed_items.append((
