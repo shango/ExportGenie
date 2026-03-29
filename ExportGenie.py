@@ -10805,6 +10805,30 @@ def _create_shelf_button():
 
 def install():
     """Install the tool: copy to scripts dir and create shelf button."""
+    # Show a splash dialog immediately so the user knows something is happening
+    try:
+        from PySide6.QtWidgets import QApplication, QDialog, QLabel, QVBoxLayout
+        from PySide6.QtCore import Qt
+    except ImportError:
+        from PySide2.QtWidgets import QApplication, QDialog, QLabel, QVBoxLayout
+        from PySide2.QtCore import Qt
+
+    splash = QDialog(None, Qt.FramelessWindowHint)
+    splash.setStyleSheet(
+        "QDialog { background: #2b2b2b; border: 2px solid #555; "
+        "border-radius: 10px; }"
+        "QLabel { color: #e0e0e0; }")
+    layout = QVBoxLayout(splash)
+    layout.setContentsMargins(40, 30, 40, 30)
+    lbl = QLabel("Export Genie {} is being installed.\n"
+                 "Please stand by\u2026".format(TOOL_VERSION))
+    lbl.setAlignment(Qt.AlignCenter)
+    lbl.setStyleSheet("font-size: 18px; font-weight: bold;")
+    layout.addWidget(lbl)
+    splash.adjustSize()
+    splash.show()
+    QApplication.processEvents()
+
     source_file = os.path.abspath(__file__)
     scripts_dir = _get_scripts_dir()
     dest_file = os.path.join(scripts_dir, "ExportGenie.py")
@@ -10941,6 +10965,8 @@ def install():
         removed_section = (
             "\nCleaned up old version:\n"
             "{}\n".format("\n".join(removed_lines)))
+
+    splash.close()
 
     cmds.confirmDialog(
         title="Install Complete",
