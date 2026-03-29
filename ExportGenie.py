@@ -6,12 +6,13 @@ Drag and drop this file into Maya's viewport to install.
 Compatible with Maya 2025+.
 """
 
-import ctypes
 import datetime
 import math
 import os
 import re
 import struct
+
+import numpy as np
 import subprocess
 import sys
 import shutil
@@ -5321,24 +5322,181 @@ class Exporter(object):
 
     # --- Mesh Warp Preset Helpers (STMap → AE .ffx) ---
 
+    # EXR reading: Pure-Python reader using struct + zlib + numpy.
+    # Maya 2025+ ships numpy but NOT Python bindings for OpenEXR or
+    # OpenImageIO.  MImage.floatPixels() causes access violations on
+    # Windows.  This reader handles ZIP/ZIPS-compressed scanline EXRs
+    # with float32 or half channels — the standard format for STMaps.
+
     @staticmethod
     def _read_stmap_pixels(stmap_path):
         """Read a 32-bit EXR STMap and return (width, height, pixels).
 
-        Uses maya.api.OpenMaya.MImage to load the EXR as float data.
-        Returns the raw float buffer as a ctypes array of
-        (width * height * 4) floats (RGBA layout).
+        Returns a numpy array of shape (height, width, 4) with
+        float32 RGBA values.  Row 0 = top of image (standard
+        EXR scanline order, matching screen space).
+        Uses only stdlib (struct, zlib) and numpy.
         """
-        from maya.api.OpenMaya import MImage
-        img = MImage()
-        img.readFromFile(stmap_path, MImage.kFloat)
-        w, h = img.getSize()
-        ptr = img.floatPixels()
-        num_floats = w * h * 4
-        arr = (ctypes.c_float * num_floats).from_address(ptr)
-        # Copy out — the MImage buffer lifetime is tied to img
-        pixels = list(arr)
+        pixels = Exporter._read_exr_float(stmap_path)
+        h, w = pixels.shape[0], pixels.shape[1]
         return w, h, pixels
+
+    @staticmethod
+    def _read_exr_float(path):
+        """Minimal OpenEXR reader for scanline float/half EXRs.
+
+        Supports uncompressed, ZIP (16-line), and ZIPS (1-line)
+        compression.  Returns numpy (H, W, 4) float32 array with
+        R in channel 0 and G in channel 1.
+        """
+        import zlib
+
+        with open(path, 'rb') as f:
+            data = f.read()
+
+        pos = 8  # skip magic + version
+
+        # --- Parse header ---
+        channels = []  # [(name, pixel_type, x_sampling, y_sampling)]
+        compression = 0
+        data_window = (0, 0, 0, 0)
+
+        while True:
+            # Attribute name
+            end = data.index(b'\x00', pos)
+            attr_name = data[pos:end].decode('ascii')
+            pos = end + 1
+            if not attr_name:
+                break  # end of header
+
+            # Type name
+            end = data.index(b'\x00', pos)
+            attr_type = data[pos:end].decode('ascii')
+            pos = end + 1
+
+            # Size + value
+            attr_size = struct.unpack('<I', data[pos:pos + 4])[0]
+            pos += 4
+            attr_data = data[pos:pos + attr_size]
+            pos += attr_size
+
+            if attr_name == 'channels':
+                cp = 0
+                while cp < len(attr_data) - 1:
+                    ne = attr_data.index(b'\x00', cp)
+                    ch_name = attr_data[cp:ne].decode('ascii')
+                    cp = ne + 1
+                    if not ch_name:
+                        break
+                    ptype = struct.unpack('<I', attr_data[cp:cp + 4])[0]
+                    cp += 4
+                    # pLinear(1) + reserved(3) + xSampling(4) + ySampling(4)
+                    cp += 12
+                    channels.append((ch_name, ptype))
+            elif attr_name == 'compression':
+                compression = attr_data[0]
+            elif attr_name == 'dataWindow':
+                data_window = struct.unpack('<iiii', attr_data)
+
+        x1, y1, x2, y2 = data_window
+        w = x2 - x1 + 1
+        h = y2 - y1 + 1
+
+        # Channel byte sizes (0=uint32, 1=half, 2=float)
+        bpc = {0: 4, 1: 2, 2: 4}
+        bytes_per_pixel = sum(bpc[ch[1]] for ch in channels)
+
+        # Determine scanlines per chunk
+        if compression == 0:    # none
+            lines_per_chunk = 1
+        elif compression == 2:  # zips
+            lines_per_chunk = 1
+        elif compression == 3:  # zip
+            lines_per_chunk = 16
+        else:
+            comp_names = {0: 'none', 1: 'rle', 2: 'zips', 3: 'zip',
+                          4: 'piz', 5: 'pxr24', 6: 'b44', 7: 'b44a',
+                          8: 'dwaa', 9: 'dwab'}
+            raise RuntimeError(
+                "Unsupported EXR compression: {} ({}).\n"
+                "STMap EXRs should use ZIP compression. "
+                "Re-export with 'Zip (16 scanlines)'.".format(
+                    compression,
+                    comp_names.get(compression, 'unknown')))
+
+        num_chunks = (h + lines_per_chunk - 1) // lines_per_chunk
+
+        # Read scanline offset table
+        offsets = []
+        for _ in range(num_chunks):
+            offsets.append(struct.unpack('<Q', data[pos:pos + 8])[0])
+            pos += 8
+
+        # Build channel name → index map (channels are stored
+        # alphabetically in EXR, e.g. B, G, R)
+        ch_index = {ch[0]: i for i, ch in enumerate(channels)}
+        r_idx = ch_index.get('R', 0)
+        g_idx = ch_index.get('G', 1 if len(channels) > 1 else 0)
+
+        # Allocate output
+        pixels = np.zeros((h, w, 4), dtype=np.float32)
+
+        for chunk_i in range(num_chunks):
+            off = offsets[chunk_i]
+            # y_coord(4) + pixel_data_size(4)
+            y_start = struct.unpack('<i', data[off:off + 4])[0] - y1
+            chunk_size = struct.unpack('<I', data[off + 4:off + 8])[0]
+            raw = data[off + 8:off + 8 + chunk_size]
+
+            n_lines = min(lines_per_chunk, h - y_start)
+            expected = n_lines * w * bytes_per_pixel
+
+            if compression in (2, 3) and len(raw) < expected:
+                raw = zlib.decompress(raw)
+                # Undo predictor (delta decode with -128 bias)
+                arr = np.frombuffer(raw, dtype=np.uint8).copy()
+                arr[1:] -= np.uint8(128)
+                arr = np.cumsum(arr, dtype=np.uint8)
+                # Undo byte interleave (even/odd split)
+                half = (len(arr) + 1) // 2
+                tmp = np.empty_like(arr)
+                tmp[0::2] = arr[:half]
+                tmp[1::2] = arr[half:]
+                raw = tmp.tobytes()
+
+            # EXR stores channels interleaved per-scanline:
+            # for each scanline: [ch0_pixels][ch1_pixels][ch2_pixels]...
+            line_bytes = w * bytes_per_pixel
+            for ln in range(n_lines):
+                y_row = y_start + ln
+                if y_row >= h:
+                    break
+                line_start = ln * line_bytes
+                ch_offset = 0
+                for ci, (ch_name, ptype) in enumerate(channels):
+                    ch_bpc = bpc[ptype]
+                    ch_data = raw[line_start + ch_offset:
+                                  line_start + ch_offset + w * ch_bpc]
+                    ch_offset += w * ch_bpc
+
+                    if ci == r_idx:
+                        out_ch = 0
+                    elif ci == g_idx:
+                        out_ch = 1
+                    else:
+                        continue
+
+                    if ptype == 2:  # float32
+                        vals = np.frombuffer(ch_data, dtype='<f4')
+                    elif ptype == 1:  # half
+                        vals = np.frombuffer(
+                            ch_data, dtype='<f2').astype(np.float32)
+                    else:  # uint32
+                        vals = np.frombuffer(
+                            ch_data, dtype='<u4').astype(np.float32)
+                    pixels[y_row, :len(vals), out_ch] = vals
+
+        return pixels
 
     @staticmethod
     def _sample_stmap(pixels, img_w, img_h, norm_x, norm_y):
@@ -5346,6 +5504,7 @@ class Exporter(object):
 
         Returns (u, v) from the R and G channels using bilinear
         interpolation.  Coordinates outside [0,1] are clamped.
+        ``pixels`` is a numpy array of shape (height, width, 4).
         """
         fx = max(0.0, min(norm_x * (img_w - 1), img_w - 1.001))
         fy = max(0.0, min(norm_y * (img_h - 1), img_h - 1.001))
@@ -5356,21 +5515,17 @@ class Exporter(object):
         ix1 = min(ix + 1, img_w - 1)
         iy1 = min(iy + 1, img_h - 1)
 
-        def _px(px_x, px_y):
-            # STMap images store bottom-to-top; MImage loads top-to-top,
-            # so row 0 = top of image.  Flip Y for bottom-origin STMaps.
-            flipped_y = (img_h - 1) - px_y
-            idx = (flipped_y * img_w + px_x) * 4
-            return pixels[idx], pixels[idx + 1]  # R, G
-
-        r00, g00 = _px(ix, iy)
-        r10, g10 = _px(ix1, iy)
-        r01, g01 = _px(ix, iy1)
-        r11, g11 = _px(ix1, iy1)
-        u = (r00 * (1 - dx) * (1 - dy) + r10 * dx * (1 - dy) +
-             r01 * (1 - dx) * dy + r11 * dx * dy)
-        v = (g00 * (1 - dx) * (1 - dy) + g10 * dx * (1 - dy) +
-             g01 * (1 - dx) * dy + g11 * dx * dy)
+        # pixels is already Y-flipped in _read_stmap_pixels
+        p00 = pixels[iy, ix]
+        p10 = pixels[iy, ix1]
+        p01 = pixels[iy1, ix]
+        p11 = pixels[iy1, ix1]
+        w00 = (1 - dx) * (1 - dy)
+        w10 = dx * (1 - dy)
+        w01 = (1 - dx) * dy
+        w11 = dx * dy
+        u = float(p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11)
+        v = float(p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11)
         return u, v
 
     @staticmethod
@@ -5405,48 +5560,6 @@ class Exporter(object):
             grid.append(row)
         return grid
 
-    @staticmethod
-    def _compute_jacobian_from_stmap(pixels, img_w, img_h, norm_x, norm_y):
-        """Approximate the 2x2 Jacobian of the STMap at (norm_x, norm_y).
-
-        Uses finite differences with a small epsilon.
-        Returns [[du/dx, du/dy], [dv/dx, dv/dy]].
-        """
-        eps = 0.5 / max(img_w, img_h)
-        u_px, v_px = Exporter._sample_stmap(
-            pixels, img_w, img_h, norm_x + eps, norm_y)
-        u_mx, v_mx = Exporter._sample_stmap(
-            pixels, img_w, img_h, norm_x - eps, norm_y)
-        u_py, v_py = Exporter._sample_stmap(
-            pixels, img_w, img_h, norm_x, norm_y + eps)
-        u_my, v_my = Exporter._sample_stmap(
-            pixels, img_w, img_h, norm_x, norm_y - eps)
-        denom = 2.0 * eps
-        return [
-            [(u_px - u_mx) / denom, (u_py - u_my) / denom],
-            [(v_px - v_mx) / denom, (v_py - v_my) / denom],
-        ]
-
-    @staticmethod
-    def _invert_2x2(m):
-        """Invert a 2x2 matrix [[a,b],[c,d]]. Returns identity on failure."""
-        det = m[0][0] * m[1][1] - m[0][1] * m[1][0]
-        if abs(det) < 1e-12:
-            return [[1, 0], [0, 1]]
-        inv_det = 1.0 / det
-        return [
-            [m[1][1] * inv_det, -m[0][1] * inv_det],
-            [-m[1][0] * inv_det, m[0][0] * inv_det],
-        ]
-
-    @staticmethod
-    def _mat2x2_mul_vec(m, v):
-        """Multiply 2x2 matrix by 2-vector."""
-        return [
-            m[0][0] * v[0] + m[0][1] * v[1],
-            m[1][0] * v[0] + m[1][1] * v[1],
-        ]
-
     # --- .ffx Binary Preset Writer ---
 
     @staticmethod
@@ -5464,23 +5577,22 @@ class Exporter(object):
 
     @staticmethod
     def _write_mesh_warp_ffx(filename, grid_res_x, grid_res_y, grid,
-                             pixels, img_w, img_h, invert_jacobian,
                              fps, frame_offset):
         """Write a single .ffx mesh warp preset file.
+
+        Tangent handles are derived from neighboring grid points
+        (central differences) rather than a separate Jacobian, matching
+        the 3DE4 approach but without needing an analytical Jacobian.
 
         Args:
             filename: Output .ffx path.
             grid_res_x/y: Grid resolution (e.g. 11).
-            grid: 2D list from _build_stmap_grid().
-            pixels: Raw STMap float pixel buffer.
-            img_w/h: STMap image dimensions.
-            invert_jacobian: True for apply-distortion preset.
+            grid: 2D list from _build_stmap_grid().  Each entry is
+                [src_x, src_y, dst_x, dst_y, sample_x, sample_y].
             fps: Scene frame rate.
             frame_offset: Maya start frame number, used for AE timecode.
         """
         frames = 1  # Static distortion — single keyframe
-        t_width = 1.0 / float(grid_res_x) / 3.0
-        t_height = 1.0 / float(grid_res_y) / 3.0
 
         # Build mesh point data (aRbs container with one aRbp sub-chunk)
         aRbs_chunk = bytearray(b'aRbs')
@@ -5499,44 +5611,55 @@ class Exporter(object):
         aRbs_chunk += aRbp
 
         # Iterate grid in reversed Y order (top-to-bottom in AE space)
-        for y in reversed(range(grid_res_y + 1)):
-            for x in range(grid_res_x + 1):
-                # Use the actual STMap sample coordinates for Jacobian
-                # (these may extend beyond [0,1] when overscan is active)
-                jac_x = grid[y][x][4]
-                jac_y = grid[y][x][5]
-
-                # Compute Jacobian from STMap via finite differences
-                jmat = Exporter._compute_jacobian_from_stmap(
-                    pixels, img_w, img_h, jac_x, jac_y)
-                if invert_jacobian:
-                    jmat = Exporter._invert_2x2(jmat)
-
-                # Cardinal tangent vectors
-                r_vec = [t_width, 0.0]
-                l_vec = [-t_width, 0.0]
-                o_vec = [0.0, t_height]
-                u_vec = [0.0, -t_height]
-
-                # Transform through Jacobian
-                r_t = Exporter._mat2x2_mul_vec(jmat, r_vec)
-                l_t = Exporter._mat2x2_mul_vec(jmat, l_vec)
-                o_t = Exporter._mat2x2_mul_vec(jmat, o_vec)
-                u_t = Exporter._mat2x2_mul_vec(jmat, u_vec)
-
-                # Destination point with Y-flip for AE coordinate system
+        for y in range(rows):
+            for x in range(cols):
+                # Anchor point with Y-flip for AE coordinate system
                 pointx = grid[y][x][2]
                 pointy = 1.0 - grid[y][x][3]
 
-                # Tangent handle positions
-                ta_rx = pointx + r_t[0]
-                ta_ry = pointy - r_t[1]
-                ta_lx = pointx + l_t[0]
-                ta_ly = pointy - l_t[1]
-                ta_ox = pointx + o_t[0]
-                ta_oy = pointy - o_t[1]
-                ta_ux = pointx + u_t[0]
-                ta_uy = pointy - u_t[1]
+                # Tangent handles from neighboring destination positions.
+                # Central difference where possible, one-sided at edges.
+                # Factor of 1/6 = (1/2 for central diff) * (1/3 for
+                # cubic Bezier handle length).  One-sided uses 1/3.
+
+                # X-direction derivative (right / left handles)
+                if 0 < x < grid_res_x:
+                    dxdx = (grid[y][x + 1][2] - grid[y][x - 1][2]) / 6.0
+                    dydx = (grid[y][x + 1][3] - grid[y][x - 1][3]) / 6.0
+                elif x == 0:
+                    dxdx = (grid[y][1][2] - grid[y][0][2]) / 3.0
+                    dydx = (grid[y][1][3] - grid[y][0][3]) / 3.0
+                else:
+                    dxdx = (grid[y][grid_res_x][2]
+                            - grid[y][grid_res_x - 1][2]) / 3.0
+                    dydx = (grid[y][grid_res_x][3]
+                            - grid[y][grid_res_x - 1][3]) / 3.0
+
+                # Y-direction derivative (top / bottom handles)
+                # Subtraction is reversed (y-1 minus y+1) because our
+                # grid y increases downward (screen space) while the
+                # AE mesh warp expects upward-positive tangent direction.
+                if 0 < y < grid_res_y:
+                    dxdy = (grid[y - 1][x][2] - grid[y + 1][x][2]) / 6.0
+                    dydy = (grid[y - 1][x][3] - grid[y + 1][x][3]) / 6.0
+                elif y == 0:
+                    dxdy = (grid[0][x][2] - grid[1][x][2]) / 3.0
+                    dydy = (grid[0][x][3] - grid[1][x][3]) / 3.0
+                else:
+                    dxdy = (grid[grid_res_y - 1][x][2]
+                            - grid[grid_res_y][x][2]) / 3.0
+                    dydy = (grid[grid_res_y - 1][x][3]
+                            - grid[grid_res_y][x][3]) / 3.0
+
+                # Tangent handle positions (Y-flipped for AE)
+                ta_rx = pointx + dxdx
+                ta_ry = pointy - dydx
+                ta_lx = pointx - dxdx
+                ta_ly = pointy + dydx
+                ta_ox = pointx + dxdy
+                ta_oy = pointy - dydy
+                ta_ux = pointx - dxdy
+                ta_uy = pointy + dydy
 
                 # Write 5 float pairs: anchor, top, right, bottom, left
                 aRbs_chunk += struct.pack(">ff", pointx, pointy)
@@ -5660,6 +5783,8 @@ class Exporter(object):
             "    adj_{v}.moveToBeginning();".format(v=safe_var))
         jsx.append(
             "    adj_{v}.applyPreset(ffxFile_{v});".format(v=safe_var))
+        jsx.append(
+            "    adj_{v}.enabled = false;".format(v=safe_var))
         jsx.append("}")
         jsx.append("")
         return jsx
@@ -5677,20 +5802,20 @@ class Exporter(object):
         grid_res = 11
         jsx_lines = []
 
-        for label, stmap_path, invert_jac in [
-            ("Undistort", stmap_undistort, False),
-            ("Redistort", stmap_redistort, True),
+        for label, stmap_path in [
+            ("Undistort", stmap_undistort),
+            ("Redistort", stmap_redistort),
         ]:
             if not stmap_path:
                 continue
-            self._log("Reading STMap: {}".format(
+            self.log("Reading STMap: {}".format(
                 os.path.basename(stmap_path)))
             img_w, img_h, pixels = Exporter._read_stmap_pixels(stmap_path)
 
             # Detect overscan from redistort STMap edge values
             overscan_x = 0.0
             overscan_y = 0.0
-            if invert_jac:
+            if label == "Redistort":
                 # Sample corners — if UV extends beyond [0,1] there is overscan
                 u0, v0 = Exporter._sample_stmap(
                     pixels, img_w, img_h, 0.0, 0.0)
@@ -5708,10 +5833,9 @@ class Exporter(object):
                 scene_base, tag, version_str)
             ffx_path = os.path.join(ae_dir, ffx_name)
 
-            self._log("Writing .ffx preset: {}".format(ffx_name))
+            self.log("Writing .ffx preset: {}".format(ffx_name))
             Exporter._write_mesh_warp_ffx(
                 ffx_path, grid_res, grid_res, grid,
-                pixels, img_w, img_h, invert_jac,
                 fps, int(start_frame))
 
             jsx_lines.extend(Exporter._jsx_mesh_warp_adjustment(
@@ -6689,6 +6813,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         stmap_layout.addLayout(rd_row)
 
         stmap_group.setLayout(stmap_layout)
+        stmap_group.setChecked(False)          # collapsed by default
         tab_layout.addWidget(stmap_group)
 
         # Export Formats
