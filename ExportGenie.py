@@ -62,6 +62,23 @@ TAB_CAMERA_TRACK = "camera_track"
 TAB_MATCHMOVE = "matchmove"
 TAB_FACE_TRACK = "face_track"
 
+# Third-party renderer plugins whose scene nodes should be stripped
+# from exported .ma files.  Covers both the case where the plugin
+# is loaded (nodes have a real type) and where it isn't (nodes
+# appear as "unknown" / "unknownDag").
+_THIRDPARTY_RENDERER_PLUGINS = {
+    "mtoa",                    # Arnold
+    "vrayformaya",             # V-Ray
+    "RenderMan_for_Maya",      # RenderMan / Pixar
+    "redshift4maya",           # Redshift
+    "OctaneRender",            # Octane
+    "maxwell",                 # Maxwell
+    "Mayatomr",                # Mental Ray (legacy)
+    "pgYetiMaya",              # Yeti (fur/grooming)
+    "iDeform",                 # iDeform
+    "substancenode",           # Substance (3rd-party builds)
+}
+
 
 # Base64-encoded 32x32 RGBA PNG icon (purple-to-cyan gradient with export arrow and badge)
 ICON_DATA = (
@@ -1161,6 +1178,71 @@ class Exporter(object):
         return (node_long[0] == ancestor_long[0]
                 or node_long[0].startswith(ancestor_long[0] + "|"))
 
+    def _delete_thirdparty_plugin_nodes(self):
+        """Delete all scene nodes registered by third-party plugins.
+
+        Handles three categories:
+        1. Nodes from known third-party renderer plugins (Arnold, V-Ray,
+           RenderMan, Redshift, etc.) — matched by plugin name.
+        2. Nodes from any plugin installed outside the Maya application
+           directory — caught by comparing the plugin path to MAYA_LOCATION.
+        3. Unknown / unknownDag nodes — left behind when the originating
+           plugin is not loaded on this machine.
+
+        After removing plugin nodes, runs MLdeleteUnused to sweep up
+        any shading networks or utility nodes that are now orphaned.
+        """
+        maya_location = os.environ.get(
+            "MAYA_LOCATION",
+            os.path.dirname(os.path.dirname(sys.executable)))
+        maya_location = os.path.normcase(os.path.normpath(maya_location))
+
+        plugins_in_use = cmds.pluginInfo(
+            query=True, pluginsInUse=True) or []
+        # pluginsInUse returns [name, version, name, version, …]
+        plugin_names = plugins_in_use[::2]
+
+        for plugin in plugin_names:
+            is_thirdparty = plugin in _THIRDPARTY_RENDERER_PLUGINS
+            if not is_thirdparty:
+                try:
+                    ppath = cmds.pluginInfo(
+                        plugin, query=True, path=True) or ""
+                    ppath = os.path.normcase(os.path.normpath(ppath))
+                    if not ppath.startswith(maya_location):
+                        is_thirdparty = True
+                except Exception:
+                    pass
+            if not is_thirdparty:
+                continue
+            node_types = cmds.pluginInfo(
+                plugin, query=True, dependNode=True) or []
+            for nt in node_types:
+                nodes = cmds.ls(type=nt) or []
+                for node in nodes:
+                    if cmds.objExists(node):
+                        try:
+                            cmds.lockNode(node, lock=False)
+                            cmds.delete(node)
+                        except Exception:
+                            pass
+
+        # Catch nodes whose plugin is not loaded (shows as unknown).
+        for nt in ("unknown", "unknownDag"):
+            for node in cmds.ls(type=nt) or []:
+                if cmds.objExists(node):
+                    try:
+                        cmds.lockNode(node, lock=False)
+                        cmds.delete(node)
+                    except Exception:
+                        pass
+
+        # Sweep orphaned shading networks / utility nodes.
+        try:
+            mel.eval("MLdeleteUnused")
+        except Exception:
+            pass
+
     def export_ma(self, file_path, camera, geo_roots, rig_roots, proxy_geos,
                   start_frame=None, end_frame=None):
         """Export selection as Maya ASCII.
@@ -1218,9 +1300,15 @@ class Exporter(object):
                     animationStartTime=start_frame,
                     animationEndTime=end_frame)
 
+            # Everything below (shader swap, unknown-node cleanup,
+            # metadata group) is wrapped in a single undo chunk so the
+            # entire set of scene modifications is rolled back after
+            # the export finishes.
+            cmds.undoInfo(openChunk=True)
+            _ma_cleanup_done = True
+
             # Replace all custom shaders with the default lambert so
             # the exported .ma contains only default materials.
-            original_shading = {}
             all_meshes = []
             for node in sel:
                 if node and cmds.objExists(node):
@@ -1233,11 +1321,18 @@ class Exporter(object):
                     sgs = cmds.listConnections(
                         mesh, type="shadingEngine") or []
                     if sgs and sgs[0] != "initialShadingGroup":
-                        original_shading[mesh] = sgs[0]
                         cmds.sets(mesh, edit=True,
                                   forceElement="initialShadingGroup")
                 except Exception:
                     pass
+
+            # Remove third-party plugin nodes and unknown nodes so
+            # the exported .ma is clean (no RenderMan, Arnold, V-Ray,
+            # Redshift, etc.).  Covers both loaded and unloaded plugins.
+            try:
+                self._delete_thirdparty_plugin_nodes()
+            except Exception:
+                pass
 
             # Create metadata group with version and export date
             info_grp = cmds.group(em=True, name="ExportGenie_info")
@@ -1264,26 +1359,20 @@ class Exporter(object):
                     constructionHistory=True,
                 )
             finally:
-                # Remove temporary metadata group from scene
-                if cmds.objExists(info_grp):
-                    try:
-                        cmds.delete(info_grp)
-                    except Exception:
-                        pass
-                # Restore original shading assignments
-                for mesh, sg in original_shading.items():
-                    try:
-                        if cmds.objExists(mesh) and cmds.objExists(sg):
-                            cmds.sets(mesh, edit=True,
-                                      forceElement=sg)
-                    except Exception:
-                        pass
                 # Restore original playback range
                 if orig_min is not None:
                     cmds.playbackOptions(
                         minTime=orig_min, maxTime=orig_max,
                         animationStartTime=orig_ast,
                         animationEndTime=orig_aet)
+                # Undo all pre-export scene modifications (shader
+                # swap, unknown-node cleanup, metadata group).
+                if _ma_cleanup_done:
+                    try:
+                        cmds.undoInfo(closeChunk=True)
+                        cmds.undo()
+                    except Exception:
+                        pass
             return True
         except Exception as e:
             self._log_error("MA", e)
