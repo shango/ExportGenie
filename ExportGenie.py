@@ -33,7 +33,7 @@ try:
     )
     from PySide6.QtCore import Qt, Signal, QSize
     from PySide6.QtGui import QColor, QFont, QTextCursor
-    from shiboken6 import wrapInstance
+    from shiboken6 import wrapInstance, isValid as _shiboken_isValid
 except ImportError:
     from PySide2.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QGroupBox, QScrollArea,
@@ -43,7 +43,7 @@ except ImportError:
     )
     from PySide2.QtCore import Qt, Signal, QSize
     from PySide2.QtGui import QColor, QFont, QTextCursor
-    from shiboken2 import wrapInstance
+    from shiboken2 import wrapInstance, isValid as _shiboken_isValid
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 from maya.OpenMayaUI import MQtUtil
 
@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13-beta-7"
+TOOL_VERSION = "v13-beta-10"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -2036,6 +2036,32 @@ class Exporter(object):
                 n for n in select_nodes
                 if n and cmds.objExists(n)]
 
+            # USD requires skinned meshes / skeletons to live under a
+            # SkelRoot.  If any geo root with blendshapes sits at the
+            # scene root (no parent transform), group everything under
+            # a temp wrapper so the exporter can promote it.
+            usd_wrapper = None
+            needs_wrapper = False
+            for node in select_nodes:
+                parent = cmds.listRelatives(
+                    node, parent=True, fullPath=True)
+                if not parent:
+                    shapes = cmds.listRelatives(
+                        node, shapes=True, type="mesh",
+                        fullPath=True) or []
+                    for shp in shapes:
+                        bs = cmds.listConnections(
+                            shp, type="blendShape") or []
+                        if bs:
+                            needs_wrapper = True
+                            break
+                if needs_wrapper:
+                    break
+            if needs_wrapper:
+                usd_wrapper = cmds.group(
+                    select_nodes, name="USD_SkelRoot_GRP")
+                select_nodes = [usd_wrapper]
+
             cmds.select(select_nodes, replace=True)
 
             usd_path = file_path.replace("\\", "/")
@@ -2054,8 +2080,14 @@ class Exporter(object):
                     exportBlendShapes=True,
                     exportVisibility=True,
                     eulerFilter=True,
+                    worldspace=True,
                 )
             finally:
+                if usd_wrapper and cmds.objExists(usd_wrapper):
+                    try:
+                        cmds.delete(usd_wrapper)
+                    except Exception:
+                        pass
                 if cmds.objExists(info_grp):
                     try:
                         cmds.delete(info_grp)
@@ -6618,128 +6650,158 @@ class Exporter(object):
 # ---------------------------------------------------------------------------
 # PySide2/6 Stylesheet
 # ---------------------------------------------------------------------------
-STYLESHEET = """
-QWidget {
+def _ui_font_scale():
+    """Return scale factor from Maya's app font relative to a 9pt baseline."""
+    app_font = QApplication.font()
+    base_pt = app_font.pointSize()
+    if base_pt <= 0:
+        base_pt = max(app_font.pixelSize(), 9)
+    return base_pt / 9.0
+
+def _scaled_px(val):
+    """Return a scaled 'Npx' string for inline stylesheets."""
+    return "{}px".format(max(1, int(round(val * _ui_font_scale()))))
+
+def _build_stylesheet():
+    """Build the UI stylesheet using Maya's current application font size."""
+    scale = _ui_font_scale()
+    def px(val):
+        return "{}px".format(max(1, int(round(val * scale))))
+    return """
+QWidget {{
     background-color: #3a3a3a;
     color: #e0e0e0;
-    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    font-size: 12px;
-}
-QGroupBox {
+    font-size: {base};
+}}
+QGroupBox {{
     border: 1px solid #555;
     border-radius: 4px;
-    margin-top: 10px;
-    padding: 18px 6px 8px 6px;
+    margin-top: {grp_margin};
+    padding: {grp_pad_top} 6px 8px 6px;
     font-weight: bold;
-    font-size: 13px;
-}
-QGroupBox::title {
+    font-size: {base_plus1};
+}}
+QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
     padding: 0 6px;
-}
-QGroupBox::indicator {
-    width: 12px;
-    height: 12px;
-}
-QTabWidget::pane {
+}}
+QGroupBox::indicator {{
+    width: {chk_size};
+    height: {chk_size};
+}}
+QTabWidget::pane {{
     border: 1px solid #555;
     background-color: #3a3a3a;
-}
-QTabBar::tab {
+}}
+QTabBar::tab {{
     background-color: #444;
     color: #ccc;
     padding: 7px 16px;
     border-top-left-radius: 4px;
     border-top-right-radius: 4px;
     margin-right: 3px;
-}
-QTabBar::tab:selected {
+    font-size: {base};
+}}
+QTabBar::tab:selected {{
     background-color: #3a3a3a;
     color: #e0e0e0;
     border-bottom: 2px solid #5dade2;
-}
-QLineEdit, QSpinBox, QComboBox {
+}}
+QLineEdit, QSpinBox, QComboBox {{
     background-color: #2a2a2a;
     border: 1px solid #555;
     border-radius: 3px;
     padding: 4px 8px;
     color: #e0e0e0;
-}
-QPushButton {
+    font-size: {base};
+}}
+QPushButton {{
     background-color: #4a4a4a;
     border: 1px solid #555;
     border-radius: 3px;
     padding: 5px 14px;
     color: #e0e0e0;
-}
-QPushButton:hover {
+    font-size: {base};
+}}
+QPushButton:hover {{
     background-color: #555;
-}
-QPushButton:pressed {
+}}
+QPushButton:pressed {{
     background-color: #333;
-}
-QPushButton#exportButton {
+}}
+QPushButton#exportButton {{
     background-color: #339956;
     color: white;
-    font-size: 14px;
+    font-size: {base_plus2};
     font-weight: bold;
     border: none;
     border-radius: 4px;
     padding: 8px;
-}
-QPushButton#exportButton:hover {
+}}
+QPushButton#exportButton:hover {{
     background-color: #3dae64;
-}
-QPushButton#exportButton:pressed {
+}}
+QPushButton#exportButton:pressed {{
     background-color: #2d8049;
-}
-QProgressBar {
+}}
+QProgressBar {{
     background-color: #2a2a2a;
     border: 1px solid #555;
     border-radius: 3px;
     text-align: center;
     color: #e0e0e0;
-}
-QProgressBar::chunk {
+}}
+QProgressBar::chunk {{
     background-color: #5dade2;
     border-radius: 2px;
-}
-QTextEdit#logField {
+}}
+QTextEdit#logField {{
     background-color: #1e1e1e;
     color: #e0e0e0;
     font-family: "Consolas", "Monaco", "Courier New", monospace;
-    font-size: 11px;
+    font-size: {base_minus1};
     border: 1px solid #555;
     border-radius: 3px;
-}
-QCheckBox {
+}}
+QCheckBox {{
     spacing: 8px;
     padding: 2px 0;
-}
-QCheckBox::indicator {
-    width: 14px;
-    height: 14px;
-}
-QSlider::groove:horizontal {
+    font-size: {base};
+}}
+QCheckBox::indicator {{
+    width: {chk_size};
+    height: {chk_size};
+}}
+QSlider::groove:horizontal {{
     height: 4px;
     background-color: #555;
     border-radius: 2px;
-}
-QSlider::handle:horizontal {
+}}
+QSlider::handle:horizontal {{
     background-color: #5dade2;
-    width: 14px;
-    height: 14px;
+    width: {slider_handle};
+    height: {slider_handle};
     margin: -5px 0;
-    border-radius: 7px;
-}
-QLabel {
-    font-size: 13px;
-}
-QScrollArea {
+    border-radius: {slider_radius};
+}}
+QLabel {{
+    font-size: {base_plus1};
+}}
+QScrollArea {{
     border: none;
-}
-"""
+}}
+""".format(
+        base=px(12),
+        base_plus1=px(13),
+        base_plus2=px(14),
+        base_minus1=px(11),
+        grp_margin=px(10),
+        grp_pad_top=px(18),
+        chk_size=px(14),
+        slider_handle=px(14),
+        slider_radius=px(7),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6857,7 +6919,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         # Build the UI
         self._build_ui()
-        self.setStyleSheet(STYLESHEET)
+        self.setStyleSheet(_build_stylesheet())
         self._refresh_scene_info()
 
     # ------------------------------------------------------------------
@@ -6927,7 +6989,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # Version label
         ver_label = QLabel(TOOL_VERSION)
         ver_label.setAlignment(Qt.AlignRight)
-        ver_label.setStyleSheet("font-style: italic; font-size: 10px;")
+        ver_label.setStyleSheet(
+            "font-style: italic; font-size: {};".format(_scaled_px(10)))
         self._content_layout.addWidget(ver_label)
 
         scroll.setWidget(content)
@@ -6937,7 +7000,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         row = QHBoxLayout()
         ver_label = QLabel("{} {}".format(TOOL_NAME, TOOL_VERSION))
         ver_label.setStyleSheet(
-            "color: #888888; font-size: 15px; font-weight: bold;")
+            "color: #888888; font-size: {}; font-weight: bold;".format(
+                _scaled_px(15)))
         row.addWidget(ver_label)
         row.addStretch()
         row.addWidget(QLabel("For Support - "))
@@ -7643,7 +7707,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         prog_row.addWidget(self.progress_bar)
         self.progress_label = QLabel("")
         self.progress_label.setAlignment(Qt.AlignRight)
-        self.progress_label.setStyleSheet("font-size: 10px;")
+        self.progress_label.setStyleSheet(
+            "font-size: {};".format(_scaled_px(10)))
         self.progress_label.setVisible(False)
         prog_row.addWidget(self.progress_label)
         self._content_layout.addLayout(prog_row)
@@ -8249,6 +8314,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         pass
 
     def _refresh_scene_info(self):
+        # Guard against C++ widget already deleted (scriptJob can
+        # fire after the workspace control is torn down).
+        try:
+            if not _shiboken_isValid(self):
+                return
+        except Exception:
+            return
         scene_path = cmds.file(query=True, sceneName=True)
         if scene_path:
             scene_short = cmds.file(
@@ -10332,8 +10404,17 @@ def launch():
                 except Exception:
                     pass
 
-    # 4. Fresh import from disk
-    import ExportGenie as _self_mod
+    # 4. Fresh import from disk — use spec loader to bypass any
+    #    residual import cache that __import__ might still honour.
+    scripts_file = os.path.join(scripts_dir, "ExportGenie.py")
+    if os.path.isfile(scripts_file):
+        spec = importlib.util.spec_from_file_location(
+            "ExportGenie", scripts_file)
+        _self_mod = importlib.util.module_from_spec(spec)
+        sys.modules["ExportGenie"] = _self_mod
+        spec.loader.exec_module(_self_mod)
+    else:
+        import ExportGenie as _self_mod
     _self_mod._launch_inner()
 
 
@@ -10382,8 +10463,16 @@ def _restore_ui():
                     os.remove(os.path.join(_cache, _f))
                 except Exception:
                     pass
-    import ExportGenie as _self_mod
-    importlib.reload(_self_mod)
+    _scripts_file = os.path.join(_scripts, "ExportGenie.py")
+    if os.path.isfile(_scripts_file):
+        spec = importlib.util.spec_from_file_location(
+            "ExportGenie", _scripts_file)
+        _self_mod = importlib.util.module_from_spec(spec)
+        sys.modules["ExportGenie"] = _self_mod
+        spec.loader.exec_module(_self_mod)
+    else:
+        import ExportGenie as _self_mod
+        importlib.reload(_self_mod)
     cmds.workspaceControl(
         WORKSPACE_CONTROL_NAME, edit=True,
         label="Export Genie  {}".format(_self_mod.TOOL_VERSION))
@@ -10502,7 +10591,8 @@ def install():
     lbl = QLabel("Export Genie {} is being installed.\n"
                  "Please stand by\u2026".format(TOOL_VERSION))
     lbl.setAlignment(Qt.AlignCenter)
-    lbl.setStyleSheet("font-size: 18px; font-weight: bold;")
+    lbl.setStyleSheet(
+        "font-size: {}; font-weight: bold;".format(_scaled_px(18)))
     layout.addWidget(lbl)
     splash.adjustSize()
     splash.show()
@@ -10660,7 +10750,7 @@ def install():
         elif ffmpeg_copied:
             action = "Installed"
         else:
-            action = "Already installed"
+            action = "Replaced"
         detail = "{}; chmod 755".format(action)
         if xattr_ok:
             detail += "; quarantine xattr removed"
@@ -10683,23 +10773,16 @@ def install():
                 except OSError:
                     pass
 
-    # Remove stale module from the interpreter and invalidate
-    # Python's import file-finder caches so the fresh .py is
-    # picked up instead of any residual bytecache metadata.
+    # Force-load the freshly copied .py from disk, bypassing any
+    # cached module or stale bytecode that Python's import may return.
     sys.modules.pop(TOOL_NAME, None)
     import importlib
     importlib.invalidate_caches()
-    mod = __import__(TOOL_NAME)
-
-    # If the reimported module still has an old version (bytecache
-    # or stale finder), force a reload from the .py on disk.
-    if mod.TOOL_VERSION != TOOL_VERSION:
-        sys.modules.pop(TOOL_NAME, None)
-        spec = importlib.util.spec_from_file_location(
-            TOOL_NAME, dest_file)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[TOOL_NAME] = mod
-        spec.loader.exec_module(mod)
+    spec = importlib.util.spec_from_file_location(
+        TOOL_NAME, dest_file)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[TOOL_NAME] = mod
+    spec.loader.exec_module(mod)
 
     # Create shelf button and show dialog using the freshly loaded module
     mod._create_shelf_button()
