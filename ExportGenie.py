@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13-beta-10"
+TOOL_VERSION = "v13-beta-11"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -1353,6 +1353,40 @@ class Exporter(object):
         return (node_long[0] == ancestor_long[0]
                 or node_long[0].startswith(ancestor_long[0] + "|"))
 
+    @staticmethod
+    def _is_in_hidden_display_layer(node):
+        """Return True if *node* belongs to a display layer whose
+        visibility is turned off.  Checks the node itself and all
+        ancestors so that a hidden parent group also hides children.
+        """
+        if not node or not cmds.objExists(node):
+            return False
+        long_names = cmds.ls(node, long=True)
+        if not long_names:
+            return False
+        parts = long_names[0].lstrip("|").split("|")
+        # Walk from root to leaf, checking each ancestor
+        path = ""
+        for part in parts:
+            path = path + "|" + part
+            conns = cmds.listConnections(
+                path + ".drawOverride", type="displayLayer") or []
+            for layer in conns:
+                if layer == "defaultLayer":
+                    continue
+                try:
+                    if not cmds.getAttr(layer + ".visibility"):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    @staticmethod
+    def _filter_hidden_layers(nodes):
+        """Remove nodes that belong to a hidden display layer."""
+        return [n for n in nodes
+                if not Exporter._is_in_hidden_display_layer(n)]
+
     def _delete_thirdparty_plugin_nodes(self):
         """Delete all scene nodes registered by third-party plugins.
 
@@ -2070,17 +2104,23 @@ class Exporter(object):
                 LOG_PREFIX + " USD export: {}\n".format(usd_path))
 
             try:
+                # Note: mayaUSDExport has no worldspace flag —
+                # transforms are exported in local/hierarchy space.
+                # Selected nodes whose parents are outside the
+                # selection appear at the USD stage root with their
+                # world-space transform baked by the exporter.
                 cmds.mayaUSDExport(
                     file=usd_path,
                     selection=True,
                     frameRange=(int(start_frame), int(end_frame)),
                     frameStride=1.0,
+                    defaultMeshScheme="none",
                     exportSkels="auto",
                     exportSkin="auto",
                     exportBlendShapes=True,
                     exportVisibility=True,
                     eulerFilter=True,
-                    worldspace=True,
+                    filterTypes=["nurbsCurve"],
                 )
             finally:
                 if usd_wrapper and cmds.objExists(usd_wrapper):
@@ -5649,7 +5689,7 @@ class Exporter(object):
             focal_length = cmds.getAttr(cam_shape + ".focalLength")
             ae_zoom = focal_length * comp_width / h_aperture_mm
 
-            time_sec = (frame - start_frame + 1) / fps
+            time_sec = (frame - start_frame) / fps
 
             jsx.append("timesArray.push({:.10f});".format(time_sec))
             jsx.append("posArray.push([{:.10f}, {:.10f}, {:.10f}]);".format(
@@ -5863,7 +5903,7 @@ class Exporter(object):
         ix1 = min(ix + 1, img_w - 1)
         iy1 = min(iy + 1, img_h - 1)
 
-        # pixels is already Y-flipped in _read_stmap_pixels
+        # pixels row 0 = top of image (EXR scanline order)
         p00 = pixels[iy, ix]
         p10 = pixels[iy, ix1]
         p01 = pixels[iy1, ix]
@@ -5958,7 +5998,7 @@ class Exporter(object):
                            0x00, 0x00, 0x0D, 0x0D])
         aRbs_chunk += aRbp
 
-        # Iterate grid in reversed Y order (top-to-bottom in AE space)
+        # Iterate grid top-to-bottom (y=0 is top, matching AE space)
         for y in range(rows):
             for x in range(cols):
                 # Anchor point with Y-flip for AE coordinate system
@@ -6081,7 +6121,14 @@ class Exporter(object):
         a[826:830] = struct.pack(">I", grid_res_x)
         a[1030:1034] = struct.pack(">I", grid_res_y)
 
+        # AE Mesh Warp only supports these grid sizes (matches effect UI dropdown)
         lup = {7: 28, 11: 38, 13: 42, 19: 51}
+        for axis, val in [("X", grid_res_x), ("Y", grid_res_y)]:
+            if val not in lup:
+                raise ValueError(
+                    "Mesh Warp grid resolution {} ({}) is not supported by "
+                    "After Effects. Valid values: {}".format(
+                        axis, val, sorted(lup)))
         a[2261] = lup[grid_res_x]
         a[2561] = lup[grid_res_y]
 
@@ -6146,13 +6193,23 @@ class Exporter(object):
 
         Called from export_jsx() when STMap paths are provided.
         Returns a list of JSX lines to insert before the footer.
+
+        AE Mesh Warp is a forward warp (image follows mesh vertices
+        from rest positions to anchor positions), while STMaps define
+        an inverse warp (each pixel says "sample FROM here").  To
+        convert correctly we must use the OPPOSITE STMap for each
+        direction:
+          - Undistort mesh warp ← redistort STMap
+          - Redistort mesh warp ← undistort STMap
         """
         grid_res = 11
         jsx_lines = []
 
+        # STMaps are crossed: forward-warp anchor positions require
+        # the inverse map for the opposite direction.
         for label, stmap_path in [
-            ("Undistort", stmap_undistort),
-            ("Redistort", stmap_redistort),
+            ("Undistort", stmap_redistort),
+            ("Redistort", stmap_undistort),
         ]:
             if not stmap_path:
                 continue
@@ -6160,17 +6217,30 @@ class Exporter(object):
                 os.path.basename(stmap_path)))
             img_w, img_h, pixels = Exporter._read_stmap_pixels(stmap_path)
 
-            # Detect overscan from redistort STMap edge values
+            # Detect overscan — STMap edge values extending beyond
+            # [0,1] indicate the warp covers a larger area than the
+            # frame.  Sample all four edges to find the true extent.
             overscan_x = 0.0
             overscan_y = 0.0
-            if label == "Redistort":
-                # Sample corners — if UV extends beyond [0,1] there is overscan
-                u0, v0 = Exporter._sample_stmap(
-                    pixels, img_w, img_h, 0.0, 0.0)
-                u1, v1 = Exporter._sample_stmap(
-                    pixels, img_w, img_h, 1.0, 1.0)
-                overscan_x = max(0.0, -min(u0, 0.0), max(u1 - 1.0, 0.0))
-                overscan_y = max(0.0, -min(v0, 0.0), max(v1 - 1.0, 0.0))
+            edge_samples = grid_res + 1
+            min_u = float('inf')
+            max_u = float('-inf')
+            min_v = float('inf')
+            max_v = float('-inf')
+            for i in range(edge_samples):
+                t = i / float(edge_samples - 1)
+                for sx, sy in [(0.0, t), (1.0, t),
+                               (t, 0.0), (t, 1.0)]:
+                    u, v = Exporter._sample_stmap(
+                        pixels, img_w, img_h, sx, sy)
+                    min_u = min(min_u, u)
+                    max_u = max(max_u, u)
+                    min_v = min(min_v, v)
+                    max_v = max(max_v, v)
+            overscan_x = max(0.0, -min(min_u, 0.0),
+                             max(max_u - 1.0, 0.0))
+            overscan_y = max(0.0, -min(min_v, 0.0),
+                             max(max_v - 1.0, 0.0))
 
             grid = Exporter._build_stmap_grid(
                 pixels, img_w, img_h, grid_res,
@@ -6650,23 +6720,34 @@ class Exporter(object):
 # ---------------------------------------------------------------------------
 # PySide2/6 Stylesheet
 # ---------------------------------------------------------------------------
-def _ui_font_scale():
-    """Return scale factor from Maya's app font relative to a 9pt baseline."""
+def _app_font_px():
+    """Return Maya's application font size in pixels."""
     app_font = QApplication.font()
-    base_pt = app_font.pointSize()
-    if base_pt <= 0:
-        base_pt = max(app_font.pixelSize(), 9)
-    return base_pt / 9.0
+    pt = app_font.pointSize()
+    if pt > 0:
+        try:
+            screen = QApplication.primaryScreen()
+            dpi = screen.logicalDotsPerInch() if screen else 96.0
+        except Exception:
+            dpi = 96.0
+        return max(9, int(round(pt * dpi / 72.0)))
+    return max(9, app_font.pixelSize())
 
 def _scaled_px(val):
-    """Return a scaled 'Npx' string for inline stylesheets."""
-    return "{}px".format(max(1, int(round(val * _ui_font_scale()))))
+    """Return 'Npx' string offset from Maya's app font size.
+
+    val is treated as a relative offset from a 12px baseline:
+    val=12 → app font size, val=13 → +1px, val=11 → -1px, etc.
+    """
+    base = _app_font_px()
+    return "{}px".format(max(1, base + (val - 12)))
 
 def _build_stylesheet():
-    """Build the UI stylesheet using Maya's current application font size."""
-    scale = _ui_font_scale()
+    """Build the UI stylesheet matching Maya's application font size."""
+    base = _app_font_px()
     def px(val):
-        return "{}px".format(max(1, int(round(val * scale))))
+        """val is a 12px-baseline offset: 12→base, 13→base+1, etc."""
+        return "{}px".format(max(1, base + (val - 12)))
     return """
 QWidget {{
     background-color: #3a3a3a;
@@ -9212,6 +9293,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         obj, len(nodes_to_bake)))
 
             extra_cameras = cameras[1:]
+            # Exclude nodes hidden via display layers
+            geo_roots = Exporter._filter_hidden_layers(geo_roots)
+            obj_tracks = Exporter._filter_hidden_layers(obj_tracks)
             export_geo = extra_cameras + obj_tracks + geo_roots
 
             if do_jsx:
@@ -9431,6 +9515,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 rig_roots.append(r)
             if g:
                 geo_roots.append(g)
+        # Exclude nodes hidden via display layers
+        geo_roots = Exporter._filter_hidden_layers(geo_roots)
+        rig_roots = Exporter._filter_hidden_layers(rig_roots)
+        proxy_geos = Exporter._filter_hidden_layers(proxy_geos)
+
         do_ma = self.mm_ma_checkbox.isChecked()
         do_fbx = self.mm_fbx_checkbox.isChecked()
         do_abc = self.mm_abc_checkbox.isChecked()
@@ -9890,6 +9979,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             fm = entry["field"].text().strip()
             if fm:
                 face_meshes.append(fm)
+        # Exclude nodes hidden via display layers
+        face_meshes = Exporter._filter_hidden_layers(face_meshes)
+        if static_geo and Exporter._is_in_hidden_display_layer(static_geo):
+            static_geo = ""
+
         do_ma = self.ft_ma_checkbox.isChecked()
         do_fbx = self.ft_fbx_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
@@ -10808,6 +10902,12 @@ def install():
 
     splash.close()
 
+    # If the UI was already open, tear it down and relaunch from the
+    # freshly loaded module so the version shown on the tab and in the
+    # header updates immediately — no restart required.
+    ui_was_open = cmds.workspaceControl(
+        WORKSPACE_CONTROL_NAME, exists=True)
+
     cmds.confirmDialog(
         title="Install Complete",
         message=(
@@ -10821,6 +10921,9 @@ def install():
         ).format(mod.TOOL_VERSION, summary, removed_section),
         button=["OK"],
     )
+
+    if ui_was_open:
+        mod.launch()
 
 
 def onMayaDroppedPythonFile(*args, **kwargs):
