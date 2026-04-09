@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13-beta-11"
+TOOL_VERSION = "v13-beta-16"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -3572,7 +3572,13 @@ class Exporter(object):
         matchmove_geo = [
             g for g in (matchmove_geo or []) if g and cmds.objExists(g)
         ]
-        pb_width, pb_height = resolution or (1920, 1080)
+        if resolution is None:
+            resolution = self._get_image_plane_resolution(camera)
+        pb_width, pb_height = resolution
+        # Cap width at 1920, scaling height to preserve aspect ratio.
+        if pb_width > 1920:
+            pb_height = int(round(pb_height * 1920.0 / pb_width))
+            pb_width = 1920
         try:
             # Validate format availability
             pb_format = None
@@ -5946,6 +5952,24 @@ class Exporter(object):
                     dst_y = (dst_y + overscan_y) / (overscan_y * 2 + 1.0)
                 row.append([src_x, src_y, dst_x, dst_y, sample_x, sample_y])
             grid.append(row)
+
+        # Extrapolate border points from interior.  STMap edge pixels
+        # are often clipped or invalid (lens models don't cover the
+        # full frame boundary), causing all border anchors to collapse
+        # to a single point.  Linear extrapolation from the two nearest
+        # interior points gives correct edge behaviour.
+        n = grid_res + 1
+        # Left / right columns for interior rows first
+        for y in range(1, n - 1):
+            for idx in (2, 3):  # dst_x, dst_y
+                grid[y][0][idx] = 2 * grid[y][1][idx] - grid[y][2][idx]
+                grid[y][-1][idx] = 2 * grid[y][-2][idx] - grid[y][-3][idx]
+        # Top / bottom rows for all columns (uses already-fixed edges)
+        for x in range(n):
+            for idx in (2, 3):
+                grid[0][x][idx] = 2 * grid[1][x][idx] - grid[2][x][idx]
+                grid[-1][x][idx] = 2 * grid[-2][x][idx] - grid[-3][x][idx]
+
         return grid
 
     # --- .ffx Binary Preset Writer ---
@@ -6005,49 +6029,64 @@ class Exporter(object):
                 pointx = grid[y][x][2]
                 pointy = 1.0 - grid[y][x][3]
 
-                # Tangent handles from neighboring destination positions.
-                # Central difference where possible, one-sided at edges.
-                # Factor of 1/6 = (1/2 for central diff) * (1/3 for
-                # cubic Bezier handle length).  One-sided uses 1/3.
+                # Tangent handles — geometric 1/3-neighbour method.
+                #
+                # Each handle points directly at the neighbouring
+                # anchor, 1/3 of the way there.  At grid boundaries
+                # the missing neighbour is mirrored from the opposite
+                # side so handles stay symmetric.  This matches the
+                # 3DE4 reference exporter and cannot overshoot.
 
-                # X-direction derivative (right / left handles)
-                if 0 < x < grid_res_x:
-                    dxdx = (grid[y][x + 1][2] - grid[y][x - 1][2]) / 6.0
-                    dydx = (grid[y][x + 1][3] - grid[y][x - 1][3]) / 6.0
-                elif x == 0:
-                    dxdx = (grid[y][1][2] - grid[y][0][2]) / 3.0
-                    dydx = (grid[y][1][3] - grid[y][0][3]) / 3.0
+                # Helper: neighbour anchor in AE space
+                def _nbr(ny, nx):
+                    return (grid[ny][nx][2],
+                            1.0 - grid[ny][nx][3])
+
+                # X-direction (right / left)
+                if x < grid_res_x:
+                    rx, ry = _nbr(y, x + 1)
+                    r_off = ((rx - pointx) / 3.0,
+                             (ry - pointy) / 3.0)
                 else:
-                    dxdx = (grid[y][grid_res_x][2]
-                            - grid[y][grid_res_x - 1][2]) / 3.0
-                    dydx = (grid[y][grid_res_x][3]
-                            - grid[y][grid_res_x - 1][3]) / 3.0
-
-                # Y-direction derivative (top / bottom handles)
-                # Subtraction is reversed (y-1 minus y+1) because our
-                # grid y increases downward (screen space) while the
-                # AE mesh warp expects upward-positive tangent direction.
-                if 0 < y < grid_res_y:
-                    dxdy = (grid[y - 1][x][2] - grid[y + 1][x][2]) / 6.0
-                    dydy = (grid[y - 1][x][3] - grid[y + 1][x][3]) / 6.0
-                elif y == 0:
-                    dxdy = (grid[0][x][2] - grid[1][x][2]) / 3.0
-                    dydy = (grid[0][x][3] - grid[1][x][3]) / 3.0
+                    r_off = None
+                if x > 0:
+                    lx, ly = _nbr(y, x - 1)
+                    l_off = ((lx - pointx) / 3.0,
+                             (ly - pointy) / 3.0)
                 else:
-                    dxdy = (grid[grid_res_y - 1][x][2]
-                            - grid[grid_res_y][x][2]) / 3.0
-                    dydy = (grid[grid_res_y - 1][x][3]
-                            - grid[grid_res_y][x][3]) / 3.0
+                    l_off = None
+                # Fill missing boundary from opposite side (mirrored)
+                if r_off is None:
+                    r_off = (-l_off[0], -l_off[1])
+                if l_off is None:
+                    l_off = (-r_off[0], -r_off[1])
 
-                # Tangent handle positions (Y-flipped for AE)
-                ta_rx = pointx + dxdx
-                ta_ry = pointy - dydx
-                ta_lx = pointx - dxdx
-                ta_ly = pointy + dydx
-                ta_ox = pointx + dxdy
-                ta_oy = pointy - dydy
-                ta_ux = pointx - dxdy
-                ta_uy = pointy + dydy
+                # Y-direction (top / bottom)
+                if y > 0:
+                    tx, ty = _nbr(y - 1, x)
+                    t_off = ((tx - pointx) / 3.0,
+                             (ty - pointy) / 3.0)
+                else:
+                    t_off = None
+                if y < grid_res_y:
+                    bx, by = _nbr(y + 1, x)
+                    b_off = ((bx - pointx) / 3.0,
+                             (by - pointy) / 3.0)
+                else:
+                    b_off = None
+                if t_off is None:
+                    t_off = (-b_off[0], -b_off[1])
+                if b_off is None:
+                    b_off = (-t_off[0], -t_off[1])
+
+                ta_rx = pointx + r_off[0]
+                ta_ry = pointy + r_off[1]
+                ta_lx = pointx + l_off[0]
+                ta_ly = pointy + l_off[1]
+                ta_ox = pointx + t_off[0]
+                ta_oy = pointy + t_off[1]
+                ta_ux = pointx + b_off[0]
+                ta_uy = pointy + b_off[1]
 
                 # Write 5 float pairs: anchor, top, right, bottom, left
                 aRbs_chunk += struct.pack(">ff", pointx, pointy)
@@ -6246,8 +6285,27 @@ class Exporter(object):
                 pixels, img_w, img_h, grid_res,
                 overscan_x, overscan_y)
 
-            tag = "remove" if label == "Undistort" else "apply"
-            ffx_name = "{}_{}_meshwarp_{}.ffx".format(
+            # Diagnostic: log STMap properties and key grid positions
+            self.log("{} STMap: {}x{}, overscan=({:.4f}, {:.4f}), "
+                     "UV range U=[{:.4f},{:.4f}] V=[{:.4f},{:.4f}]".format(
+                         label, img_w, img_h,
+                         overscan_x, overscan_y,
+                         min_u, max_u, min_v, max_v))
+            _gr = grid_res
+            for _gy, _gx, _lbl in [
+                (0, 0, "top-left"), (0, _gr, "top-right"),
+                (_gr, 0, "bot-left"), (_gr, _gr, "bot-right"),
+                (_gr // 2, _gr // 2, "center"),
+            ]:
+                _e = grid[_gy][_gx]
+                self.log("  grid[{},{}] ({}) src=({:.4f},{:.4f}) "
+                         "dst=({:.4f},{:.4f}) -> AE=({:.4f},{:.4f})".format(
+                             _gy, _gx, _lbl,
+                             _e[0], _e[1], _e[2], _e[3],
+                             _e[2], 1.0 - _e[3]))
+
+            tag = "remove_LD" if label == "Undistort" else "apply_LD"
+            ffx_name = "{}_mesh_warp_{}_{}.ffx".format(
                 scene_base, tag, version_str)
             ffx_path = os.path.join(ae_dir, ffx_name)
 
@@ -6302,6 +6360,9 @@ class Exporter(object):
         jsx.append("};")
         jsx.append("srcFootage.pixelAspect = 1;")
         jsx.append("srcFootage.mainSource.conformFrameRate = {};".format(fps))
+        jsx.append(
+            "if (srcFootage.mainSource.hasAlpha) "
+            "srcFootage.mainSource.alphaMode = AlphaMode.IGNORE;")
         jsx.append("var bkgLayer = comp.layers.add(srcFootage, {});".format(
             duration))
         jsx.append("srcFootage.selected = false;")
@@ -6345,6 +6406,7 @@ class Exporter(object):
             "[0.5, 0.5, 0.5], '{nm}', {w}, {h}, 1.0, comp.duration);".format(
                 v=layer_var, nm=layer_name, w=comp_width, h=comp_height))
         jsx.append("{v}.threeDLayer = true;".format(v=layer_var))
+        jsx.append("{v}.shy = true;".format(v=layer_var))
         jsx.append("")
 
         pos, rot, _ = self._world_matrix_to_ae(
@@ -6397,12 +6459,16 @@ class Exporter(object):
             "var {fv} = app.project.importFile(importOptions);".format(
                 fv=footage_var))
         jsx.append("{fv}.selected = false;".format(fv=footage_var))
+        jsx.append(
+            "if (typeof geoFolder !== 'undefined') "
+            "{fv}.parentFolder = geoFolder;".format(fv=footage_var))
         jsx.append("app.beginSuppressDialogs();")
         jsx.append(
             "var {lv} = comp.layers.add({fv}, comp.duration);".format(
                 lv=layer_var, fv=footage_var))
         jsx.append("{lv}.name = '{nm}';".format(
             lv=layer_var, nm=layer_name))
+        jsx.append("{lv}.shy = true;".format(lv=layer_var))
         jsx.append("app.endSuppressDialogs(true);")
         jsx.append("")
 
@@ -6490,6 +6556,7 @@ class Exporter(object):
         jsx.append("{var}.name = '{name}';".format(
             var=layer_var, name=layer_name))
         jsx.append("{var}.threeDLayer = true;".format(var=layer_var))
+        jsx.append("{var}.shy = true;".format(var=layer_var))
         jsx.append(
             "{var}.property('Anchor Point')"
             ".setValue([0, 0, 0]);".format(var=layer_var)
@@ -6617,6 +6684,12 @@ class Exporter(object):
                 # start_frame so static geo is sampled correctly.
                 cmds.currentTime(int(start_frame), edit=True)
 
+            # Create a project folder for geo assets
+            if geo_children:
+                jsx_lines.append(
+                    "var geoFolder = app.project.items.addFolder('Geo');")
+                jsx_lines.append("")
+
             # Export OBJs and generate null layers
             if geo_children:
                 for child in geo_children:
@@ -6647,6 +6720,17 @@ class Exporter(object):
                                 fps, comp_width, comp_height, ae_scale
                             )
                             jsx_lines.extend(loc_jsx)
+                        continue
+
+                    # Individual locator → AE 3D null
+                    loc_shapes = cmds.listRelatives(
+                        child, shapes=True, type="locator") or []
+                    if loc_shapes:
+                        loc_jsx = self._jsx_null_from_locator(
+                            child, start_frame, end_frame,
+                            fps, comp_width, comp_height, ae_scale
+                        )
+                        jsx_lines.extend(loc_jsx)
                         continue
 
                     # Simple planes → AE solid (no OBJ needed)
@@ -8905,12 +8989,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 e["field"].text().strip()
                 for e in self.ct_geo_fields
                 if e["field"].text().strip()]
-            ct_res = Exporter._get_image_plane_resolution(camera)
             pb_kwargs.update(
                 camera_track_mode=True,
                 wireframe_shader=wf_shader,
                 wireframe_shader_geo=geo_roots,
-                resolution=ct_res,
             )
         else:
             # Matchmove or Face Track
@@ -9424,8 +9506,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     aa16 = self.pb_aa16_cb.isChecked()
                     far_clip = self.pb_far_clip_spin.value()
                     show_hud = self.pb_hud_overlay_cb.isChecked()
-                    ct_res = Exporter._get_image_plane_resolution(
-                        primary_camera)
                     results["mov"] = exporter.export_playblast(
                         pb_path, primary_camera,
                         start_frame, end_frame,
@@ -9437,8 +9517,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         msaa_16=aa16, far_clip=far_clip,
                         png_mode=png_mode, mp4_mode=mp4_mode,
                         mp4_output=paths.get("mp4"),
-                        show_hud=show_hud,
-                        resolution=ct_res)
+                        show_hud=show_hud)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
         finally:
@@ -10590,7 +10669,7 @@ def _restore_ui():
 # ---------------------------------------------------------------------------
 def _get_maya_app_dir():
     """Return the user's Maya application directory."""
-    return cmds.internalVar(userAppDir=True)
+    return os.path.normpath(cmds.internalVar(userAppDir=True))
 
 
 def _get_scripts_dir():
@@ -10739,7 +10818,10 @@ def install():
     for old_mod in _legacy_modules:
         sys.modules.pop(old_mod, None)
 
-    # Copy self to Maya's scripts directory (if not already there)
+    # Copy self to Maya's scripts directory (if not already there).
+    # Use shutil.copy (not copy2) so the destination file's timestamp
+    # reflects the actual install time rather than the source file's
+    # creation/download date.
     same_file = False
     try:
         same_file = os.path.samefile(source_file, dest_file)
@@ -10749,7 +10831,7 @@ def install():
     if not same_file:
         if not os.path.exists(scripts_dir):
             os.makedirs(scripts_dir)
-        shutil.copy2(source_file, dest_file)
+        shutil.copy(source_file, dest_file)
         installed_items.append(("Script (copied)", dest_file))
     else:
         installed_items.append(("Script (in place)", dest_file))
@@ -10927,5 +11009,46 @@ def install():
 
 
 def onMayaDroppedPythonFile(*args, **kwargs):
-    """Maya drag-and-drop hook — called when this file is dropped into the viewport."""
-    install()
+    """Maya drag-and-drop hook — called when this file is dropped
+    into the viewport.
+
+    Maya 2022+ uses ``importlib.import_module()`` to load the dropped
+    file.  Unlike the older ``imp.load_module()`` (Maya ≤2020), this
+    returns the **cached** module from ``sys.modules`` when one exists.
+    If an older version of ExportGenie is already installed in the
+    scripts directory, Maya loads THAT instead of the dragged file,
+    making ``__file__`` point to the installed copy and causing
+    ``install()`` to skip the copy (source == dest).
+
+    Fix: Maya adds the drop directory to ``sys.path[0]`` before the
+    import.  By popping the cached module and re-importing, Python
+    finds the NEW file in the drop directory first.
+    """
+    import importlib
+
+    # Evict the cached (possibly stale) module and clear bytecode
+    # caches so the re-import picks up the dragged file.
+    sys.modules.pop("ExportGenie", None)
+    importlib.invalidate_caches()
+    scripts_dir = os.path.join(
+        cmds.internalVar(userAppDir=True), "scripts")
+    pycache = os.path.join(scripts_dir, "__pycache__")
+    if os.path.isdir(pycache):
+        for f in os.listdir(pycache):
+            if f.startswith("ExportGenie.") and f.endswith(
+                    (".pyc", ".pyo")):
+                try:
+                    os.remove(os.path.join(pycache, f))
+                except Exception:
+                    pass
+
+    # Re-import — sys.path[0] is the drop directory (set by Maya),
+    # so this loads the NEW dragged file, not the installed copy.
+    try:
+        mod = importlib.import_module("ExportGenie")
+    except Exception:
+        # Fall back to our own install() if re-import fails.
+        install()
+        return
+
+    mod.install()
