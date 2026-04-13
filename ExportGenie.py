@@ -1,6 +1,6 @@
 """
 ExportGenie.py  v12
-Export Genie — Export scenes to .ma, .fbx, .abc with auto versioning.
+Export Genie  -- Export scenes to .ma, .fbx, .abc with auto versioning.
 
 Drag and drop this file into Maya's viewport to install.
 Compatible with Maya 2025+.
@@ -57,7 +57,7 @@ WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
 ICON_FILENAME = "ExportGenie.png"
 
-# Prefix for Script Editor messages — includes version for debugging.
+# Prefix for Script Editor messages  -- includes version for debugging.
 LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 
 # Tab identifiers
@@ -163,7 +163,7 @@ class VersionParser(object):
 
         The base is everything before the tag, the version is the
         trailing _v## segment, and the tag (between base and version)
-        is discarded — callers supply their own per-format tag.
+        is discarded  -- callers supply their own per-format tag.
 
         Returns:
             tuple: (base, version_str) e.g. ("SHOT001_pl01", "v03").
@@ -222,7 +222,7 @@ class FolderManager(object):
                 base=scene_base_name, tag=tag, ver=version_str, ext=ext
             )
             paths[fmt] = os.path.join(dir_path, file_name)
-        # QC playblast — uses qc_tag (always "track") for consistent naming
+        # QC playblast  -- uses qc_tag (always "track") for consistent naming
         qc_base = "{base}_{tag}_{ver}".format(
             base=scene_base_name, tag=qc_tag, ver=version_str
         )
@@ -519,7 +519,7 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
 
     # Position then constrain to the mesh transform.
     # The mesh transform has animCurves on TRS from the face
-    # tracking solve — the constraints follow this animation.
+    # tracking solve  -- the constraints follow this animation.
     cmds.xform(grp, ws=True, t=crown_pos)
     pc = cmds.pointConstraint(head, grp, mo=True)[0]
     oc = cmds.orientConstraint(head, grp, mo=True)[0]
@@ -556,7 +556,7 @@ class Exporter(object):
         divider = "=" * 60
         sys.stderr.write(
             "\n{div}\n"
-            "  Export Genie {ver}  —  {tag} FAILED\n"
+            "  Export Genie {ver}   --  {tag} FAILED\n"
             "{div}\n"
             "\n"
             "  Error  : {err}\n"
@@ -814,7 +814,7 @@ class Exporter(object):
     def _get_image_resolution(file_path):
         """Return (width, height) by reading the header of an image file.
 
-        Supports EXR, PNG, JPEG, TIFF, DPX, SGI/RGB and BMP — the
+        Supports EXR, PNG, JPEG, TIFF, DPX, SGI/RGB and BMP  -- the
         common plate formats used in VFX.  Only reads the first few
         hundred bytes (no pixel data), so it is fast even for large
         files.  Returns None on failure.
@@ -1110,7 +1110,7 @@ class Exporter(object):
         if show_hud and self._has_drawtext():
             hud_filters = self._build_hud_drawtext(
                 start_frame, focal_length, resolution=resolution)
-            # Strip stream labels — single-input uses plain vf
+            # Strip stream labels  -- single-input uses plain vf
             vf_script = hud_filters.replace(
                 "[pre_hud]", "").replace("[out]", "")
         cmd.extend([
@@ -1221,7 +1221,7 @@ class Exporter(object):
         """
         ffmpeg_path = self._find_ffmpeg()
         if not ffmpeg_path:
-            self.log("ffmpeg not found — cannot composite.")
+            self.log("ffmpeg not found  -- cannot composite.")
             return False
 
         fps = self._get_fps()
@@ -1392,10 +1392,10 @@ class Exporter(object):
 
         Handles three categories:
         1. Nodes from known third-party renderer plugins (Arnold, V-Ray,
-           RenderMan, Redshift, etc.) — matched by plugin name.
+           RenderMan, Redshift, etc.)  -- matched by plugin name.
         2. Nodes from any plugin installed outside the Maya application
-           directory — caught by comparing the plugin path to MAYA_LOCATION.
-        3. Unknown / unknownDag nodes — left behind when the originating
+           directory  -- caught by comparing the plugin path to MAYA_LOCATION.
+        3. Unknown / unknownDag nodes  -- left behind when the originating
            plugin is not loaded on this machine.
 
         After removing plugin nodes, runs MLdeleteUnused to sweep up
@@ -1472,7 +1472,7 @@ class Exporter(object):
             rig_roots = rig_roots or []
             proxy_geos = proxy_geos or []
             # Skip camera from selection if it's already a descendant
-            # of any assigned group — it will be exported as part of
+            # of any assigned group  -- it will be exported as part of
             # that hierarchy.
             all_roots = geo_roots + rig_roots + proxy_geos
             cam_under_root = any(
@@ -1489,7 +1489,7 @@ class Exporter(object):
             if camera:
                 sel.extend(self._get_image_plane_transforms(camera))
             if not sel:
-                self.log("MA skipped — nothing to export.")
+                self.log("MA skipped  -- nothing to export.")
                 return False
 
             # Temporarily set the scene's playback range so the
@@ -1757,7 +1757,7 @@ class Exporter(object):
                                             include))
 
             if not sel:
-                self.log("FBX skipped — nothing to export.")
+                self.log("FBX skipped  -- nothing to export.")
                 return False
 
             sys.stderr.write(
@@ -1810,7 +1810,7 @@ class Exporter(object):
             mel.eval("FBXExportEmbeddedTextures -v false")
             # Animation
             mel.eval("FBXExportQuaternion -v resample")
-            # Bake Animation — FBX plugin bakes internally without
+            # Bake Animation  -- FBX plugin bakes internally without
             # modifying the source scene
             mel.eval("FBXExportBakeComplexAnimation -v true")
             mel.eval(
@@ -1892,11 +1892,11 @@ class Exporter(object):
                     return False
 
             if not camera and not geo_roots and not proxy_geos and not rig_roots:
-                self.log("ABC skipped — nothing to export.")
+                self.log("ABC skipped  -- nothing to export.")
                 return False
 
-            # Build root flags — camera, geo, static/proxy geo only.
-            # Rig roots are excluded — ABC needs just the mesh,
+            # Build root flags  -- camera, geo, static/proxy geo only.
+            # Rig roots are excluded  -- ABC needs just the mesh,
             # camera, and any static geo.
             all_roots = geo_roots + proxy_geos
             if rig_roots:
@@ -1922,13 +1922,13 @@ class Exporter(object):
                     if node == info_grp:
                         continue
                     self.log(
-                        "ABC failed — '{}' not found.".format(node)
+                        "ABC failed  -- '{}' not found.".format(node)
                     )
                     return False
                 resolved_roots.append(long_names[0])
 
             # Remove any root that is a descendant of another root
-            # — AbcExport errors on ancestor/descendant pairs.
+            #  -- AbcExport errors on ancestor/descendant pairs.
             filtered_roots = []
             for root in resolved_roots:
                 is_child = False
@@ -2043,10 +2043,10 @@ class Exporter(object):
 
             if not camera and not geo_roots and not proxy_geos \
                     and not rig_roots:
-                self.log("USD skipped — nothing to export.")
+                self.log("USD skipped  -- nothing to export.")
                 return False
 
-            # Build selection list — camera, geo, rig, proxy
+            # Build selection list  -- camera, geo, rig, proxy
             all_roots = geo_roots + proxy_geos
             if rig_roots:
                 all_roots = all_roots + rig_roots
@@ -2104,7 +2104,7 @@ class Exporter(object):
                 LOG_PREFIX + " USD export: {}\n".format(usd_path))
 
             # Only request blendshape export when there are
-            # actual blendShape nodes in the selection — avoids
+            # actual blendShape nodes in the selection  -- avoids
             # thousands of harmless but noisy USD plugin warnings.
             has_blendshapes = False
             for node in select_nodes:
@@ -2120,7 +2120,7 @@ class Exporter(object):
                     break
 
             try:
-                # Note: mayaUSDExport has no worldspace flag —
+                # Note: mayaUSDExport has no worldspace flag  --
                 # transforms are exported in local/hierarchy space.
                 # Selected nodes whose parents are outside the
                 # selection appear at the USD stage root with their
@@ -2319,7 +2319,7 @@ class Exporter(object):
 
         Two-pass approach: creates all targets first, then keys all
         weights.  After keying, target shapes, the targets group, and
-        the original source mesh are deleted — the blendShape node
+        the original source mesh are deleted  -- the blendShape node
         stores deltas internally, so only the base mesh is needed for
         FBX export.  Caller should wrap in an undo chunk to restore
         the scene afterward.
@@ -2335,7 +2335,7 @@ class Exporter(object):
         # Strip namespace and DAG path for clean naming
         short_name = src_xform.split("|")[-1].rsplit(":", 1)[-1]
 
-        self.log("Creating blendshapes for '{}' — {} frames...".format(
+        self.log("Creating blendshapes for '{}'  -- {} frames...".format(
             short_name, len(frames)))
 
         # Preserve hierarchy: parent base under same parent as source
@@ -2441,7 +2441,7 @@ class Exporter(object):
         self.log("Keyed {}/{} blendshape weights on '{}'.".format(
             keyed_count, len(frames), bs_node))
 
-        # Delete target shapes and their group — the blendShape node
+        # Delete target shapes and their group  -- the blendShape node
         # stores deltas internally, so the physical targets are no
         # longer needed.  Keeping them causes FBX InputConnections to
         # pull them into the export as extra geometry (visible in
@@ -2454,7 +2454,7 @@ class Exporter(object):
                     LOG_PREFIX + " WARNING: Could not delete targets "
                     "group '{}': {}\n".format(grp, exc))
 
-        # Delete original Alembic source mesh — prevents the FBX
+        # Delete original Alembic source mesh  -- prevents the FBX
         # exporter from including the original (still Alembic-driven)
         # mesh via InputConnections (visual glitching / double geo).
         if cmds.objExists(src_xform):
@@ -2551,7 +2551,7 @@ class Exporter(object):
         constraints, check joint scales, delete non-deformer history,
         freeze transforms on non-skinned geo, strip namespaces.
 
-        All changes are destructive — caller MUST wrap in an undo chunk.
+        All changes are destructive  -- caller MUST wrap in an undo chunk.
 
         Args:
             skip_mesh_xforms: optional set of long DAG paths to exclude
@@ -2738,7 +2738,7 @@ class Exporter(object):
                 ) or []
                 if not shapes:
                     continue
-                # Skip skinned meshes — they animate via skeleton
+                # Skip skinned meshes  -- they animate via skeleton
                 history = cmds.listHistory(
                     desc, pruneDagObjects=True) or []
                 if any(cmds.objectType(h) == "skinCluster"
@@ -2867,7 +2867,7 @@ class Exporter(object):
             # Disconnect non-animCurve sources so baked curves
             # are the sole driver.  bakeResults may leave the
             # original constraint output connected alongside
-            # the new anim curve — when Step 2 deletes the
+            # the new anim curve  -- when Step 2 deletes the
             # constraint, the channel can lose its driver.
             disconnected_count = 0
             for cm in nonskinned_meshes:
@@ -2977,7 +2977,7 @@ class Exporter(object):
                     xform = parent[0]
                     if xform in constrained_set:
                         continue
-                    # Skip joints — they're already in all_joints
+                    # Skip joints  -- they're already in all_joints
                     if cmds.objectType(xform) == "joint":
                         continue
                     constrained_set.add(xform)
@@ -3292,7 +3292,7 @@ class Exporter(object):
         # The safest approach: delete every dagPose in the scene.
         # The FBX plugin's built-in bake (FBXExportBakeComplexAnimation)
         # will re-evaluate animation from the baked anim curves on
-        # joints — it does not need a dagPose to do this.  Removing
+        # joints  -- it does not need a dagPose to do this.  Removing
         # dagPose eliminates "not part of the BindPose definition"
         # errors entirely.
         sys.stderr.write(
@@ -3315,7 +3315,7 @@ class Exporter(object):
         end) to find meshes with real vertex deformation (vs.
         AlembicNode only driving TRS).  Multiple sample frames avoid
         false negatives when a mesh returns to rest pose at the
-        endpoints.  Read-only — does not modify the scene.
+        endpoints.  Read-only  -- does not modify the scene.
 
         Args:
             geo_roots: list of root transforms to search under.
@@ -3347,7 +3347,7 @@ class Exporter(object):
                 if shapes and desc not in mesh_xforms:
                     mesh_xforms.append(desc)
 
-        # Exclude meshes driven by a skinCluster — their vertices move
+        # Exclude meshes driven by a skinCluster  -- their vertices move
         # due to skeletal deformation, not Alembic vertex caching.
         skinned = set()
         for xform in mesh_xforms:
@@ -3468,7 +3468,7 @@ class Exporter(object):
                     for child in children:
                         leaves.extend(_collect_leaves(child))
                 else:
-                    # Non-mesh leaf (locator, null, etc.) — only
+                    # Non-mesh leaf (locator, null, etc.)  -- only
                     # include if it has driven transforms
                     if self._has_driven_transforms(node):
                         leaves.append(node)
@@ -3571,7 +3571,7 @@ class Exporter(object):
                 shaded display, and applies a UV checker overlay.
             raw_playblast: If True, skips ALL viewport modifications.
                 The playblast uses the user's current VP2.0 settings
-                — only the camera is switched to cam_main.
+                 -- only the camera is switched to cam_main.
             wireframe_shader: If True, applies a useBackground shader
                 to all meshes under wireframe_shader_geo and sets the
                 viewport to wireframe-on-shaded mode.
@@ -3720,7 +3720,7 @@ class Exporter(object):
                 except Exception:
                     pass
 
-            # Disable 2D pan/zoom — animation aid, not for QC renders.
+            # Disable 2D pan/zoom  -- animation aid, not for QC renders.
             # Extend far clipping plane so distant geometry is visible.
             original_far_clip = None
             if camera:
@@ -3844,7 +3844,7 @@ class Exporter(object):
                     )
                     hud_names_to_remove.append(hud_fl)
 
-            # Playblast colour management — set once and persist.
+            # Playblast colour management  -- set once and persist.
             # When render_raw_srgb is True we ensure the Preferences >
             # Color Management > Playblast view transform is Raw (sRGB).
             # The change is intentionally left in the scene file so it
@@ -4016,7 +4016,7 @@ class Exporter(object):
                     except Exception:
                         pass
 
-                # 2. Isolate select — show only the animated geo roots,
+                # 2. Isolate select  -- show only the animated geo roots,
                 #    the camera, and its image planes.
                 original_isolate_state = cmds.isolateSelect(
                     model_panel, query=True, state=True)
@@ -4061,7 +4061,7 @@ class Exporter(object):
                         pass
                 if face_track_mode:
                     # Create crown from the first face mesh.
-                    # The picker may hold a group — find the
+                    # The picker may hold a group  -- find the
                     # actual animated mesh transform inside it.
                     crown_target = None
                     first_mesh = (matchmove_geo[0]
@@ -4207,16 +4207,16 @@ class Exporter(object):
                                 or composite_matte_path):
                             if not self._find_ffmpeg():
                                 sys.stderr.write(
-                                    LOG_PREFIX + " ffmpeg not found — falling "
+                                    LOG_PREFIX + " ffmpeg not found  -- falling "
                                     "back to single-pass checker "
                                     "overlay\n")
                                 self.log(
-                                    "ffmpeg not found — using "
+                                    "ffmpeg not found  -- using "
                                     "single-pass checker overlay.")
                             else:
                                 sys.stderr.write(
                                     LOG_PREFIX + " Composite paths incomplete "
-                                    "— falling back to single-pass "
+                                    " -- falling back to single-pass "
                                     "checker overlay\n")
 
                     if use_composite:
@@ -4305,7 +4305,7 @@ class Exporter(object):
                             "backgroundBottom", 0, 0, 0)
                         cmds.displayPref(displayGradient=False)
 
-                        # Flat lighting — no viewport shading or
+                        # Flat lighting  -- no viewport shading or
                         # shadows so self-shadowing doesn't affect
                         # the composite.
                         original_shadows = cmds.modelEditor(
@@ -4783,7 +4783,7 @@ class Exporter(object):
 
             try:
                 # Ensure the model panel we configured is the active
-                # viewport — playblast renders from the focused panel.
+                # viewport  -- playblast renders from the focused panel.
                 if model_panel:
                     cmds.setFocus(model_panel)
 
@@ -4850,7 +4850,7 @@ class Exporter(object):
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base)
                     else:
-                        # Composite output — use .mp4 on macOS for
+                        # Composite output  -- use .mp4 on macOS for
                         # reliable ffmpeg encoding; .mov on Windows.
                         composite_out = file_path
                         if sys.platform == "darwin":
@@ -4880,7 +4880,7 @@ class Exporter(object):
                             self._cleanup_temp_pngs(mp4_tmp)
                     else:
                         self.log(
-                            "Composite failed — temp PNGs kept.")
+                            "Composite failed  -- temp PNGs kept.")
                     return encode_ok
                 else:
                     # Camera Track: render to temp PNGs, then
@@ -4988,7 +4988,7 @@ class Exporter(object):
                                         "CREATE_NO_WINDOW", 0))
                             encode_ok = True
                         else:
-                            # No ffmpeg or no HUD — just copy PNGs
+                            # No ffmpeg or no HUD  -- just copy PNGs
                             import shutil
                             out_dir2 = os.path.dirname(file_path)
                             if not os.path.exists(out_dir2):
@@ -5004,7 +5004,7 @@ class Exporter(object):
                                     shutil.copy2(src, dst)
                             encode_ok = True
                     else:
-                        # .mov / default — encode to mp4 via ffmpeg
+                        # .mov / default  -- encode to mp4 via ffmpeg
                         ct_output = file_path
                         if sys.platform == "darwin":
                             ct_output = os.path.splitext(
@@ -5019,7 +5019,7 @@ class Exporter(object):
                         self._cleanup_temp_pngs(ct_tmp)
                     else:
                         self.log(
-                            "Encode failed — temp PNGs kept at "
+                            "Encode failed  -- temp PNGs kept at "
                             "{}".format(ct_tmp))
                 return True
             finally:
@@ -5283,7 +5283,7 @@ class Exporter(object):
                     except Exception:
                         pass
                 # Playblast colour management is intentionally NOT
-                # restored — the Raw (sRGB) setting persists in the
+                # restored  -- the Raw (sRGB) setting persists in the
                 # scene file per user preference.
         except Exception as e:
             self._log_error("Playblast", e)
@@ -5463,7 +5463,7 @@ class Exporter(object):
     def _jsx_header(scene_name):
         """Generate JSX file header lines."""
         lines = []
-        lines.append("// Auto-generated JSX from Export Genie v{}".format(
+        lines.append("// Auto-generated JSX from Export Genie {}".format(
             TOOL_VERSION))
         lines.append("// Scene: {}".format(scene_name))
         lines.append("// Coordinate system: Maya Y-up converted to AE")
@@ -5604,7 +5604,7 @@ class Exporter(object):
         Position comes from the world matrix (correct absolute placement).
         Rotation comes from the *local* (object-space) matrix so that any
         parent-group orientation (e.g. a SynthEyes tracking group that
-        converts Z-up to Y-up) is excluded — matching the behaviour of
+        converts Z-up to Y-up) is excluded  -- matching the behaviour of
         direct SynthEyes-to-AE exports.
         World-space scale is also returned (from the world matrix) so
         callers can account for parent scale.
@@ -5678,7 +5678,7 @@ class Exporter(object):
         jsx = []
         shapes = cmds.listRelatives(camera, shapes=True, type="camera") or []
         if not shapes:
-            self.log("JSX failed — camera has no shape node.")
+            self.log("JSX failed  -- camera has no shape node.")
             return jsx
         cam_shape = shapes[0]
 
@@ -5736,7 +5736,7 @@ class Exporter(object):
     # Maya 2025+ ships numpy but NOT Python bindings for OpenEXR or
     # OpenImageIO.  MImage.floatPixels() causes access violations on
     # Windows.  This reader handles ZIP/ZIPS-compressed scanline EXRs
-    # with float32 or half channels — the standard format for STMaps.
+    # with float32 or half channels  -- the standard format for STMaps.
 
     @staticmethod
     def _read_stmap_pixels(stmap_path):
@@ -6020,12 +6020,12 @@ class Exporter(object):
             fps: Scene frame rate.
             frame_offset: Maya start frame number, used for AE timecode.
         """
-        frames = 1  # Static distortion — single keyframe
+        frames = 1  # Static distortion  -- single keyframe
 
         # Build mesh point data (aRbs container with one aRbp sub-chunk)
         aRbs_chunk = bytearray(b'aRbs')
 
-        # Single frame — one aRbp header
+        # Single frame  -- one aRbp header
         rows = grid_res_y + 1
         cols = grid_res_x + 1
         s = rows * cols * 4 * 10 + 12 + 8
@@ -6045,7 +6045,7 @@ class Exporter(object):
                 pointx = grid[y][x][2]
                 pointy = 1.0 - grid[y][x][3]
 
-                # Tangent handles — geometric 1/3-neighbour method.
+                # Tangent handles  -- geometric 1/3-neighbour method.
                 #
                 # Each handle points directly at the neighbouring
                 # anchor, 1/3 of the way there.  At grid boundaries
@@ -6124,7 +6124,7 @@ class Exporter(object):
         ])
         list_chunk[20:24] = struct.pack(">I", frames)
 
-        # ldat chunk — one 60-byte keyframe record
+        # ldat chunk  -- one 60-byte keyframe record
         fps_factor = 100.0 / fps
         ldat = bytearray(b'ldat')
         ldat += struct.pack(">I", frames * 60)
@@ -6272,7 +6272,7 @@ class Exporter(object):
                 os.path.basename(stmap_path)))
             img_w, img_h, pixels = Exporter._read_stmap_pixels(stmap_path)
 
-            # Detect overscan — STMap edge values extending beyond
+            # Detect overscan  -- STMap edge values extending beyond
             # [0,1] indicate the warp covers a larger area than the
             # frame.  Sample all four edges to find the true extent.
             overscan_x = 0.0
@@ -6560,7 +6560,7 @@ class Exporter(object):
                                fps, comp_width, comp_height, ae_scale):
         """Generate JSX for a Maya locator as a position-only 3D null in AE.
 
-        Used for SynthEyes tracking markers — no OBJ, no rotation/scale.
+        Used for SynthEyes tracking markers  -- no OBJ, no rotation/scale.
         """
         jsx = []
         short_name = locator_node.rsplit("|", 1)[-1]
@@ -6703,7 +6703,7 @@ class Exporter(object):
                     comp_width, comp_height, ae_scale
                 )
                 jsx_lines.extend(cam_jsx)
-                # Camera scrub leaves Maya at end_frame — reset to
+                # Camera scrub leaves Maya at end_frame  -- reset to
                 # start_frame so static geo is sampled correctly.
                 cmds.currentTime(int(start_frame), edit=True)
 
@@ -6800,7 +6800,7 @@ class Exporter(object):
                         rel_path = os.path.relpath(img_path, jsx_dir)
                         footage_path = rel_path
                     except ValueError:
-                        # Different drives on Windows — keep absolute
+                        # Different drives on Windows  -- keep absolute
                         footage_path = img_path
                     jsx_lines.extend(self._jsx_footage(
                         footage_path, fps, duration,
@@ -6819,7 +6819,7 @@ class Exporter(object):
                     fps, start_frame, duration)
                 jsx_lines.extend(mw_jsx)
 
-            # Outer comp — wraps the work comp with the raw
+            # Outer comp  -- wraps the work comp with the raw
             # (distorted) plate at its native resolution.
             has_outer_comp = False
             if has_lens_distortion and raw_plate:
@@ -6844,7 +6844,7 @@ class Exporter(object):
                         raw_plate_jsx = raw_plate
                     raw_plate_jsx = raw_plate_jsx.replace("\\", "/")
 
-                    jsx_lines.append("// Outer comp — raw plate "
+                    jsx_lines.append("// Outer comp - raw plate "
                                      "resolution")
                     jsx_lines.append(
                         "var outerComp = app.project.items.addComp("
@@ -6932,10 +6932,10 @@ class Exporter(object):
                 else:
                     sys.stderr.write(
                         LOG_PREFIX + " Raw plate resolution "
-                        "could not be read — skipping outer "
+                        "could not be read  -- skipping outer "
                         "comp.\n")
 
-            # Footer — open the outermost comp in the viewer
+            # Footer  -- open the outermost comp in the viewer
             footer = self._jsx_footer()
             if has_outer_comp:
                 footer = [
@@ -7146,7 +7146,7 @@ class CollapsibleGroupBox(QGroupBox):
 # ExportGenieWidget (PySide2/6 UI)
 # ---------------------------------------------------------------------------
 class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
-    """Main Export Genie UI — PySide2/6 dockable widget."""
+    """Main Export Genie UI  -- PySide2/6 dockable widget."""
 
     def __init__(self, parent=None):
         super(ExportGenieWidget, self).__init__(parent)
@@ -7375,7 +7375,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.export_name_field = QLineEdit()
         self.export_name_field.setToolTip(
             "Export folder name. Auto-populated from the scene "
-            "filename — edit to customize. The version and tag "
+            "filename  -- edit to customize. The version and tag "
             "segments are used for file naming.")
         name_row.addWidget(self.export_name_field, 2)
         layout.addLayout(name_row)
@@ -8482,7 +8482,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         elif idx == 2:
             self._last_export_tab = TAB_FACE_TRACK
             return TAB_FACE_TRACK
-        # Tab 3 = Playblast Settings — use context menu selection
+        # Tab 3 = Playblast Settings  -- use context menu selection
         if self.pb_context_menu:
             ctx = self.pb_context_menu.currentText()
             if ctx == "Camera Track":
@@ -9667,7 +9667,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 mp4_mode = True
                 if not Exporter._find_ffmpeg():
                     self._log(
-                        "Playblast skipped \u2014 ffmpeg not found.")
+                        "Playblast skipped -- ffmpeg not found.")
                     results["mov"] = False
                 else:
                     if mp4_mode:
@@ -9708,7 +9708,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 self._advance_progress()
         finally:
             # Undo bakes in reverse order (object tracks first,
-            # then cameras — reverse of the order they were opened)
+            # then cameras  -- reverse of the order they were opened)
             for _ in baked_obj_tracks:
                 try:
                     cmds.undoInfo(closeChunk=True)
@@ -9799,7 +9799,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if tpose_frame >= start_frame:
                 self._log(
                     "Warning: T-pose frame {} is not before start "
-                    "frame {} \u2014 T-pose will not be distinct.".format(
+                    "frame {} -- T-pose will not be distinct.".format(
                         tpose_frame, start_frame))
             tpose_start = min(start_frame, tpose_frame)
 
@@ -9841,7 +9841,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     short = camera.rsplit("|", 1)[-1].rsplit(
                         ":", 1)[-1]
                     if short == "cam_main":
-                        # Already named correctly — no rename
+                        # Already named correctly  -- no rename
                         pass
                     else:
                         renamed_cam = cmds.rename(
@@ -9996,7 +9996,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 mp4_mode = True
                 if not Exporter._find_ffmpeg():
                     self._log(
-                        "Playblast skipped \u2014 ffmpeg not found.")
+                        "Playblast skipped -- ffmpeg not found.")
                     results["mov"] = False
                 else:
                     if mp4_mode:
@@ -10043,7 +10043,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
-            # FBX is last — destructive prep (bake, import refs,
+            # FBX is last  -- destructive prep (bake, import refs,
             # strip namespaces) cannot be reliably undone, so we
             # save the scene to a temp file, run the prep + export,
             # then reopen the original to guarantee a clean restore.
@@ -10164,7 +10164,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         except Exception:
                             pass
                         if not restored:
-                            # Snapshot failed — fall back to the
+                            # Snapshot failed  -- fall back to the
                             # original file on disk.
                             try:
                                 cmds.file(
@@ -10297,7 +10297,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     short = camera.rsplit("|", 1)[-1].rsplit(
                         ":", 1)[-1]
                     if short == "cam_main":
-                        # Already named correctly — no rename
+                        # Already named correctly  -- no rename
                         pass
                     else:
                         renamed_cam = cmds.rename(
@@ -10414,7 +10414,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         "({} AlembicNode(s) disconnected).\n".format(
                             camera, len(abc_nodes)))
 
-            # Save a second snapshot with camera baked — MA/USD/FBX
+            # Save a second snapshot with camera baked  -- MA/USD/FBX
             # exports reopen from this so they get the baked camera
             # without needing to re-bake each time.
             if tmp_scene and (do_ma or do_usd or do_fbx):
@@ -10470,7 +10470,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 mp4_mode = True
                 if not Exporter._find_ffmpeg():
                     self._log(
-                        "Playblast skipped \u2014 ffmpeg not found.")
+                        "Playblast skipped -- ffmpeg not found.")
                     results["mov"] = False
                 else:
                     if mp4_mode:
@@ -10518,14 +10518,14 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
-            # MA, USD, and FBX — all require destructive scene
+            # MA, USD, and FBX  -- all require destructive scene
             # changes (import refs, strip namespaces, convert
             # ABC to blendshapes).  Reopen from the snapshot
             # saved above, run the prep + export for each format,
             # then restore from the snapshot in the finally block.
             if (do_ma or do_usd or do_fbx) and tmp_scene_baked:
                 try:
-                    # Reopen from post-camera-bake snapshot —
+                    # Reopen from post-camera-bake snapshot  --
                     # playblast geo baking was destructive.
                     cmds.file(
                         tmp_scene_baked, open=True, force=True)
@@ -10798,7 +10798,7 @@ def launch():
     """Open the Export Genie UI. Called by the shelf button.
 
     Aggressively clears all cached versions of the module so the
-    latest .py on disk is always used — no restart required.
+    latest .py on disk is always used  -- no restart required.
     """
     import importlib
 
@@ -10821,7 +10821,7 @@ def launch():
                 except Exception:
                     pass
 
-    # 4. Fresh import from disk — use spec loader to bypass any
+    # 4. Fresh import from disk  -- use spec loader to bypass any
     #    residual import cache that __import__ might still honour.
     scripts_file = os.path.join(scripts_dir, "ExportGenie.py")
     if os.path.isfile(scripts_file):
@@ -10836,7 +10836,7 @@ def launch():
 
 
 def _launch_inner():
-    """Internal launcher — called after the module has been reloaded."""
+    """Internal launcher  -- called after the module has been reloaded."""
     global _ui_instance
 
     # Tear down existing workspace control if present
@@ -11015,7 +11015,7 @@ def install():
     splash.show()
     QApplication.processEvents()
 
-    # Resolve source file — if __file__ points into __pycache__
+    # Resolve source file  -- if __file__ points into __pycache__
     # (stale bytecache), walk up to the actual .py location.
     source_file = os.path.abspath(__file__)
     if os.path.basename(os.path.dirname(source_file)) == "__pycache__":
@@ -11181,7 +11181,7 @@ def install():
             "expected at {}".format(dest_ffmpeg)))
 
     # Clear compiled .pyc cache to ensure a fresh import.
-    # Remove ALL ExportGenie .pyc/.pyo files — match broadly to
+    # Remove ALL ExportGenie .pyc/.pyo files  -- match broadly to
     # catch any cpython version variants.
     pycache_dir = os.path.join(scripts_dir, "__pycache__")
     if os.path.isdir(pycache_dir):
@@ -11230,7 +11230,7 @@ def install():
 
     # If the UI was already open, tear it down and relaunch from the
     # freshly loaded module so the version shown on the tab and in the
-    # header updates immediately — no restart required.
+    # header updates immediately  -- no restart required.
     ui_was_open = cmds.workspaceControl(
         WORKSPACE_CONTROL_NAME, exists=True)
 
@@ -11253,7 +11253,7 @@ def install():
 
 
 def onMayaDroppedPythonFile(*args, **kwargs):
-    """Maya drag-and-drop hook — called when this file is dropped
+    """Maya drag-and-drop hook  -- called when this file is dropped
     into the viewport.
 
     Maya 2022+ uses ``importlib.import_module()`` to load the dropped
@@ -11286,7 +11286,7 @@ def onMayaDroppedPythonFile(*args, **kwargs):
                 except Exception:
                     pass
 
-    # Re-import — sys.path[0] is the drop directory (set by Maya),
+    # Re-import  -- sys.path[0] is the drop directory (set by Maya),
     # so this loads the NEW dragged file, not the installed copy.
     try:
         mod = importlib.import_module("ExportGenie")
