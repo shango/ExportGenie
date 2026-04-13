@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13-beta-17"
+TOOL_VERSION = "v13-beta-18"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -2103,6 +2103,22 @@ class Exporter(object):
             sys.stderr.write(
                 LOG_PREFIX + " USD export: {}\n".format(usd_path))
 
+            # Only request blendshape export when there are
+            # actual blendShape nodes in the selection — avoids
+            # thousands of harmless but noisy USD plugin warnings.
+            has_blendshapes = False
+            for node in select_nodes:
+                all_meshes = cmds.listRelatives(
+                    node, allDescendents=True,
+                    type="mesh", fullPath=True) or []
+                for m in all_meshes:
+                    if cmds.listConnections(
+                            m, type="blendShape"):
+                        has_blendshapes = True
+                        break
+                if has_blendshapes:
+                    break
+
             try:
                 # Note: mayaUSDExport has no worldspace flag —
                 # transforms are exported in local/hierarchy space.
@@ -2117,7 +2133,7 @@ class Exporter(object):
                     defaultMeshScheme="none",
                     exportSkels="auto",
                     exportSkin="auto",
-                    exportBlendShapes=True,
+                    exportBlendShapes=has_blendshapes,
                     exportVisibility=True,
                     eulerFilter=True,
                     filterTypes=["nurbsCurve"],
@@ -6363,6 +6379,7 @@ class Exporter(object):
         jsx.append(
             "if (srcFootage.mainSource.hasAlpha) "
             "srcFootage.mainSource.alphaMode = AlphaMode.IGNORE;")
+        jsx.append("srcFootage.parentFolder = platesFolder;")
         jsx.append("var bkgLayer = comp.layers.add(srcFootage, {});".format(
             duration))
         jsx.append("srcFootage.selected = false;")
@@ -6615,7 +6632,8 @@ class Exporter(object):
 
     def export_jsx(self, jsx_path, obj_paths, camera, geo_children,
                    start_frame, end_frame,
-                   stmap_undistort="", stmap_redistort=""):
+                   stmap_undistort="", stmap_redistort="",
+                   raw_plate=""):
         """Export After Effects JSX + OBJ files.
 
         Args:
@@ -6627,6 +6645,7 @@ class Exporter(object):
             end_frame: Last frame.
             stmap_undistort: Path to undistort STMap EXR (optional).
             stmap_redistort: Path to redistort STMap EXR (optional).
+            raw_plate: Path to raw (distorted) plate first frame (optional).
 
         Returns:
             bool: True on success.
@@ -6662,13 +6681,17 @@ class Exporter(object):
             jsx_lines.append("app.beginUndoGroup('Scene Import');")
             jsx_lines.append("")
 
-            # Create composition
+            # Create composition and file it into a _Comps folder
+            jsx_lines.append(
+                "var compsFolder = app.project.items.addFolder('_Comps');")
+            work_comp_name = scene_base + "_work"
             jsx_lines.append(
                 "var comp = app.project.items.addComp('{name}', {w}, {h}, 1.0, {dur}, {fps});".format(
-                    name=scene_base, w=comp_width, h=comp_height,
+                    name=work_comp_name, w=comp_width, h=comp_height,
                     dur=duration, fps=fps
                 )
             )
+            jsx_lines.append("comp.parentFolder = compsFolder;")
             jsx_lines.append("comp.displayStartFrame = {};".format(
                 int(start_frame)))
             jsx_lines.append("")
@@ -6761,6 +6784,12 @@ class Exporter(object):
                     )
                     jsx_lines.extend(geo_jsx)
 
+            # Plates folder for footage items
+            jsx_lines.append(
+                "var platesFolder = app.project.items"
+                ".addFolder('Plates');")
+            jsx_lines.append("")
+
             # Source footage (from camera image plane, added last = bottom layer)
             if camera:
                 img_path = self._get_image_plane_path(camera)
@@ -6778,7 +6807,9 @@ class Exporter(object):
                         comp_width, comp_height))
 
             # Mesh Warp lens distortion presets (adjustment layers at top)
-            if stmap_undistort or stmap_redistort:
+            has_lens_distortion = bool(
+                stmap_undistort or stmap_redistort)
+            if has_lens_distortion:
                 ae_dir = os.path.dirname(os.path.abspath(jsx_path))
                 mw_folder = os.path.basename(os.path.dirname(ae_dir))
                 _, v_str = VersionParser.parse_folder_name(mw_folder)
@@ -6788,8 +6819,132 @@ class Exporter(object):
                     fps, start_frame, duration)
                 jsx_lines.extend(mw_jsx)
 
-            # Footer
-            jsx_lines.extend(self._jsx_footer())
+            # Outer comp — wraps the work comp with the raw
+            # (distorted) plate at its native resolution.
+            has_outer_comp = False
+            if has_lens_distortion and raw_plate:
+                raw_res = None
+                resolved_raw = self._resolve_image_sequence_path(
+                    raw_plate)
+                if resolved_raw and os.path.isfile(resolved_raw):
+                    raw_res = self._get_image_resolution(resolved_raw)
+                if raw_res:
+                    has_outer_comp = True
+                    raw_w, raw_h = raw_res
+                    outer_comp_name = scene_base + "_comp"
+
+                    # Make raw plate path relative to JSX when
+                    # possible (same logic as undistorted plate).
+                    try:
+                        jsx_dir = os.path.dirname(
+                            os.path.abspath(jsx_path))
+                        raw_plate_jsx = os.path.relpath(
+                            raw_plate, jsx_dir)
+                    except ValueError:
+                        raw_plate_jsx = raw_plate
+                    raw_plate_jsx = raw_plate_jsx.replace("\\", "/")
+
+                    jsx_lines.append("// Outer comp — raw plate "
+                                     "resolution")
+                    jsx_lines.append(
+                        "var outerComp = app.project.items.addComp("
+                        "'{name}', {w}, {h}, 1.0, {dur}, {fps});"
+                        .format(name=outer_comp_name,
+                                w=raw_w, h=raw_h,
+                                dur=duration, fps=fps))
+                    jsx_lines.append(
+                        "outerComp.parentFolder = compsFolder;")
+                    jsx_lines.append(
+                        "outerComp.displayStartFrame = {};".format(
+                            int(start_frame)))
+                    jsx_lines.append("")
+
+                    # Import raw plate footage
+                    jsx_lines.append("// Raw plate footage")
+                    if not os.path.isabs(raw_plate):
+                        jsx_lines.append(
+                            "var _rawDir = (new File($.fileName))"
+                            ".parent;")
+                        jsx_lines.append(
+                            "var rawFile = new File("
+                            "_rawDir.fsName + '/' + '{}');"
+                            .format(raw_plate_jsx))
+                    else:
+                        jsx_lines.append(
+                            "var rawFile = File('{}');"
+                            .format(raw_plate_jsx))
+                    jsx_lines.append("var rawFootage;")
+                    jsx_lines.append("if (!rawFile.exists) {")
+                    jsx_lines.append(
+                        "    rawFootage = app.project"
+                        ".importPlaceholder("
+                        "'RawPlatePH', {w}, {h}, {fps}, {dur});"
+                        .format(w=raw_w, h=raw_h,
+                                fps=fps, dur=duration))
+                    jsx_lines.append("} else {")
+                    jsx_lines.append(
+                        "    var rawOpts = new ImportOptions();")
+                    jsx_lines.append(
+                        "    rawOpts.file = rawFile;")
+                    jsx_lines.append(
+                        "    rawOpts.sequence = true;")
+                    jsx_lines.append(
+                        "    rawOpts.importAs = "
+                        "ImportAsType.FOOTAGE;")
+                    jsx_lines.append(
+                        "    rawFootage = app.project"
+                        ".importFile(rawOpts);")
+                    jsx_lines.append("};")
+                    jsx_lines.append(
+                        "rawFootage.pixelAspect = 1;")
+                    jsx_lines.append(
+                        "rawFootage.mainSource.conformFrameRate"
+                        " = {};".format(fps))
+                    jsx_lines.append(
+                        "if (rawFootage.mainSource.hasAlpha) "
+                        "rawFootage.mainSource.alphaMode = "
+                        "AlphaMode.IGNORE;")
+                    jsx_lines.append(
+                        "rawFootage.parentFolder = platesFolder;")
+                    jsx_lines.append("")
+
+                    # Add raw plate as bottom layer
+                    jsx_lines.append(
+                        "var rawLayer = outerComp.layers.add("
+                        "rawFootage, {});".format(duration))
+                    jsx_lines.append("rawLayer.startTime = 0;")
+                    jsx_lines.append("")
+
+                    # Add work comp as top layer, scaled to fit
+                    jsx_lines.append(
+                        "var workLayer = outerComp.layers.add("
+                        "comp, {});".format(duration))
+                    jsx_lines.append("workLayer.startTime = 0;")
+                    scale_x = raw_w / float(comp_width) * 100.0
+                    scale_y = raw_h / float(comp_height) * 100.0
+                    jsx_lines.append(
+                        "workLayer.property('Transform')"
+                        ".property('Scale')"
+                        ".setValue([{sx}, {sy}]);"
+                        .format(sx=round(scale_x, 4),
+                                sy=round(scale_y, 4)))
+                    jsx_lines.append("")
+                else:
+                    sys.stderr.write(
+                        LOG_PREFIX + " Raw plate resolution "
+                        "could not be read — skipping outer "
+                        "comp.\n")
+
+            # Footer — open the outermost comp in the viewer
+            footer = self._jsx_footer()
+            if has_outer_comp:
+                footer = [
+                    line.replace("comp.selected",
+                                 "outerComp.selected")
+                        .replace("comp.openInViewer",
+                                 "outerComp.openInViewer")
+                    for line in footer]
+            jsx_lines.extend(footer)
 
             # Write JSX file
             with open(jsx_path, "w") as f:
@@ -7022,6 +7177,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_obj_track_minus_btn = None
         self.ct_stmap_undistort_field = None
         self.ct_stmap_redistort_field = None
+        self.ct_raw_plate_field = None
         self.ct_ma_checkbox = None
         self.ct_jsx_checkbox = None
         self.ct_fbx_checkbox = None
@@ -7361,6 +7517,23 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             partial(self._browse_stmap, self.ct_stmap_redistort_field))
         rd_row.addWidget(rd_btn)
         stmap_layout.addLayout(rd_row)
+
+        rp_lbl = QLabel("Raw Plate (distorted sequence):")
+        stmap_layout.addWidget(rp_lbl)
+        rp_row = QHBoxLayout()
+        rp_row.setSpacing(6)
+        self.ct_raw_plate_field = QLineEdit()
+        self.ct_raw_plate_field.setReadOnly(True)
+        self.ct_raw_plate_field.setToolTip(
+            "First frame of the raw (distorted) plate sequence "
+            "for the outer AE comp")
+        rp_row.addWidget(self.ct_raw_plate_field, 2)
+        rp_btn = QPushButton("Browse...")
+        rp_btn.setFixedWidth(85)
+        rp_btn.clicked.connect(
+            partial(self._browse_plate, self.ct_raw_plate_field))
+        rp_row.addWidget(rp_btn)
+        stmap_layout.addLayout(rp_row)
 
         stmap_group.setLayout(stmap_layout)
         stmap_group.setChecked(False)          # collapsed by default
@@ -8330,6 +8503,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         if result:
             self.export_root_field.setText(result)
 
+    def _browse_plate(self, target_field):
+        result = QFileDialog.getOpenFileName(
+            self, "Select Plate (first frame)", "",
+            "Image Files (*.exr *.dpx *.png *.jpg *.tif *.tiff)"
+            ";;All Files (*)")
+        if isinstance(result, (list, tuple)):
+            result = result[0]
+        if result:
+            target_field.setText(result)
+
     def _browse_stmap(self, target_field):
         result = QFileDialog.getOpenFileName(
             self, "Select STMap EXR", "",
@@ -9154,6 +9337,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                           if self.ct_stmap_undistort_field else "")
         stmap_redistort = (self.ct_stmap_redistort_field.text().strip()
                           if self.ct_stmap_redistort_field else "")
+        raw_plate = (self.ct_raw_plate_field.text().strip()
+                     if self.ct_raw_plate_field else "")
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
 
@@ -9413,7 +9598,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     ae_paths["jsx"], ae_paths["obj"],
                     primary_camera,
                     geo_children, start_frame, end_frame,
-                    stmap_undistort, stmap_redistort)
+                    stmap_undistort, stmap_redistort,
+                    raw_plate)
                 self._log_result("JSX + OBJ", results["jsx"])
                 self._advance_progress()
 
