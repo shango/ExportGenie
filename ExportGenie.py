@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13-beta-16"
+TOOL_VERSION = "v13-beta-17"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -10101,7 +10101,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         renamed_cam = None
         original_cam_name = camera
-        baked_abc_cam = False
+        tmp_scene = None
+        tmp_scene_baked = None
+        tmp_dir = None
+        scene_path = None
         try:
             if camera:
                 if cmds.objExists(camera):
@@ -10120,6 +10123,38 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     self._log("Camera not found. See Script Editor.")
                     camera = None
 
+            # Save scene snapshot before any baking.  Temp-file
+            # save/restore is used instead of undo chunks so that
+            # both camera and geo transforms can be baked before
+            # the playblast and reliably reverted afterward.
+            scene_path = cmds.file(
+                query=True, sceneName=True)
+            if scene_path:
+                import tempfile
+                tmp_dir = tempfile.mkdtemp(
+                    prefix="ExportGenie_ft_")
+                scene_basename = os.path.basename(scene_path)
+                scene_type = ("mayaAscii"
+                              if scene_basename.endswith(".ma")
+                              else "mayaBinary")
+                tmp_scene = os.path.join(
+                    tmp_dir, scene_basename)
+                cmds.file(rename=tmp_scene)
+                cmds.file(save=True, type=scene_type)
+                cmds.file(rename=scene_path)
+                self._log("Scene snapshot saved.")
+            elif do_ma or do_usd or do_fbx:
+                self._log(
+                    "Scene must be saved before "
+                    "MA/USD/FBX export.")
+                if do_ma:
+                    results["ma"] = False
+                if do_usd:
+                    results["usd"] = False
+                if do_fbx:
+                    results["fbx"] = False
+
+            # ---- Bake Alembic camera ----
             if camera and cmds.objExists(camera):
                 cam_shapes = cmds.listRelatives(
                     camera, shapes=True, type="camera") or []
@@ -10141,8 +10176,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             abc_nodes.add(c)
                 if abc_nodes:
                     self._log("Baking Alembic camera...")
-                    cmds.undoInfo(openChunk=True)
-                    baked_abc_cam = True
+                    bake_pre = int(start_frame) - 1
                     trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                            "sx", "sy", "sz"]
                     for a in trs:
@@ -10155,7 +10189,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             pass
                     cmds.bakeResults(
                         camera,
-                        t=(int(start_frame), int(end_frame)),
+                        t=(bake_pre, int(end_frame)),
                         at=trs, simulation=True,
                         preserveOutsideKeys=True)
                     for shp in cam_shapes:
@@ -10167,7 +10201,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             pass
                         cmds.bakeResults(
                             shp,
-                            t=(int(start_frame), int(end_frame)),
+                            t=(bake_pre, int(end_frame)),
                             at=["focalLength"], simulation=True,
                             preserveOutsideKeys=True)
                     all_plugs = [
@@ -10193,6 +10227,57 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         LOG_PREFIX + " Baked Alembic camera: {} "
                         "({} AlembicNode(s) disconnected).\n".format(
                             camera, len(abc_nodes)))
+
+            # Save a second snapshot with camera baked — MA/USD/FBX
+            # exports reopen from this so they get the baked camera
+            # without needing to re-bake each time.
+            if tmp_scene and (do_ma or do_usd or do_fbx):
+                tmp_scene_baked = os.path.join(
+                    tmp_dir, "baked_" + scene_basename)
+                cmds.file(rename=tmp_scene_baked)
+                cmds.file(save=True, type=scene_type)
+                cmds.file(rename=scene_path)
+
+            # ---- Bake geo transforms for playblast ----
+            # Ensures motion blur on the first frame is clean
+            # (no pop from Alembic data starting abruptly).
+            if do_mov and face_meshes and tmp_scene:
+                bake_pre = int(start_frame) - 1
+                geo_to_bake = []
+                for fm in face_meshes:
+                    if not cmds.objExists(fm):
+                        continue
+                    all_xforms = [fm]
+                    all_xforms.extend(
+                        cmds.listRelatives(
+                            fm, allDescendents=True,
+                            type="transform",
+                            fullPath=True) or [])
+                    for xf in all_xforms:
+                        for attr in ("tx", "ty", "tz",
+                                     "rx", "ry", "rz",
+                                     "sx", "sy", "sz"):
+                            conns = cmds.listConnections(
+                                "{}.{}".format(xf, attr),
+                                source=True,
+                                destination=False) or []
+                            if any(cmds.nodeType(c) ==
+                                   "AlembicNode"
+                                   for c in conns):
+                                geo_to_bake.append(xf)
+                                break
+                if geo_to_bake:
+                    self._log(
+                        "Baking {} geo transform(s) for "
+                        "playblast...".format(
+                            len(geo_to_bake)))
+                    for xf in geo_to_bake:
+                        Exporter._bake_transform_curves(
+                            xf, bake_pre, int(end_frame))
+                    sys.stderr.write(
+                        LOG_PREFIX + " Baked {} geo "
+                        "transform(s) for playblast.\n"
+                        .format(len(geo_to_bake)))
 
             if do_mov:
                 png_mode = False
@@ -10247,274 +10332,247 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
-            # MA, USD, and FBX are last — all require destructive
-            # scene changes (import refs, strip namespaces, convert
-            # ABC to blendshapes) that cannot be reliably undone.
-            # We save the scene to a temp file, run the prep +
-            # export, then reopen the original for a clean restore.
-            if do_ma or do_usd or do_fbx:
-                scene_path = cmds.file(
-                    query=True, sceneName=True)
-                if not scene_path:
-                    self._log(
-                        "Scene must be saved before "
-                        "MA/USD/FBX export.")
+            # MA, USD, and FBX — all require destructive scene
+            # changes (import refs, strip namespaces, convert
+            # ABC to blendshapes).  Reopen from the snapshot
+            # saved above, run the prep + export for each format,
+            # then restore from the snapshot in the finally block.
+            if (do_ma or do_usd or do_fbx) and tmp_scene_baked:
+                try:
+                    # Reopen from post-camera-bake snapshot —
+                    # playblast geo baking was destructive.
+                    cmds.file(
+                        tmp_scene_baked, open=True, force=True)
+                    cmds.file(rename=scene_path)
+
                     if do_ma:
-                        results["ma"] = False
-                    if do_usd:
-                        results["usd"] = False
-                    if do_fbx:
-                        results["fbx"] = False
-                else:
-                    import tempfile
-                    tmp_dir = tempfile.mkdtemp(
-                        prefix="ExportGenie_ft_")
-                    tmp_scene = os.path.join(
-                        tmp_dir, os.path.basename(scene_path))
-                    try:
-                        # Save current scene state to temp file
-                        cmds.file(rename=tmp_scene)
-                        cmds.file(save=True, type="mayaAscii"
-                                  if tmp_scene.endswith(".ma")
-                                  else "mayaBinary")
-                        cmds.file(rename=scene_path)
-                        self._log("Scene snapshot saved.")
-
-                        if do_ma:
-                            self._log("Exporting MA...")
-                            static_geos = (
-                                [static_geo] if static_geo else [])
-                            try:
-                                # Import references
-                                all_refs = cmds.ls(
-                                    type="reference") or []
-                                for ref_node in all_refs:
-                                    if ref_node == \
-                                            "sharedReferenceNode":
-                                        continue
-                                    try:
-                                        cmds.file(
-                                            referenceNode=ref_node,
-                                            importReference=True)
-                                    except Exception:
-                                        pass
-
-                                # Strip namespaces
-                                all_ns = cmds.namespaceInfo(
-                                    listOnlyNamespaces=True,
-                                    recurse=True) or []
-                                skip_ns = {"UI", "shared"}
-                                all_ns = [ns for ns in all_ns
-                                          if ns not in skip_ns]
-                                all_ns.sort(key=len, reverse=True)
-                                for ns in all_ns:
-                                    try:
-                                        cmds.namespace(
-                                            removeNamespace=ns,
-                                            mergeNamespaceWithRoot=True)
-                                    except Exception:
-                                        pass
-
-                                def _resolve(name):
-                                    if not name:
-                                        return name
-                                    long_names = cmds.ls(
-                                        name, long=True)
-                                    if long_names:
-                                        return long_names[0]
-                                    short = name.rsplit(":", 1)[-1]
-                                    long_names = cmds.ls(
-                                        short, long=True)
-                                    if len(long_names) == 1:
-                                        return long_names[0]
-                                    if len(long_names) > 1:
-                                        return long_names[0]
-                                    return name
-
-                                resolved_meshes = [
-                                    _resolve(fm)
-                                    for fm in face_meshes]
-                                resolved_statics = [
-                                    _resolve(sg)
-                                    for sg in static_geos]
-                                resolved_cam = (
-                                    _resolve(camera)
-                                    if camera else camera)
-
-                                ma_prep = \
-                                    exporter.prepare_face_track_for_export(
-                                        resolved_meshes,
-                                        start_frame, end_frame)
-                                export_nodes = ma_prep.get(
-                                    "select_for_export",
-                                    resolved_meshes)
-                                results["ma"] = exporter.export_ma(
-                                    paths["ma"], resolved_cam,
-                                    export_nodes, [],
-                                    resolved_statics,
-                                    start_frame=start_frame,
-                                    end_frame=end_frame)
-                            except Exception as exc:
-                                self._log(
-                                    "MA export failed. "
-                                    "See Script Editor.")
-                                sys.stderr.write(
-                                    LOG_PREFIX + " MA error: "
-                                    "{}\n".format(exc))
-                                results["ma"] = False
-                            self._log_result(
-                                "MA", results.get("ma", False))
-                            self._advance_progress()
-
-                            # Reopen scene before USD/FBX (MA
-                            # prep was destructive)
-                            if do_usd or do_fbx:
-                                try:
-                                    cmds.file(
-                                        scene_path, open=True,
-                                        force=True)
-                                except Exception:
-                                    cmds.file(
-                                        tmp_scene, open=True,
-                                        force=True)
-                                    cmds.file(rename=scene_path)
-
-                        if do_usd:
-                            self._log("Exporting USD...")
-                            try:
-                                usd_prep = \
-                                    exporter.prepare_face_track_for_export(
-                                        face_meshes, start_frame,
-                                        end_frame)
-                                if not usd_prep[
-                                        "select_for_export"]:
-                                    self._log(
-                                        "No geometry found to "
-                                        "export.")
-                                    results["usd"] = False
-                                else:
-                                    static_geos = (
-                                        [static_geo]
-                                        if static_geo else [])
-                                    results["usd"] = \
-                                        exporter.export_usd(
-                                            paths["usd"], camera,
-                                            usd_prep[
-                                                "select_for_export"
-                                            ],
-                                            static_geos,
-                                            start_frame, end_frame)
-                            except Exception as exc:
-                                self._log(
-                                    "USD export failed. "
-                                    "See Script Editor.")
-                                sys.stderr.write(
-                                    LOG_PREFIX + " USD error: "
-                                    "{}\n".format(exc))
-                                results["usd"] = False
-                            self._log_result(
-                                "USD",
-                                results.get("usd", False))
-                            self._advance_progress()
-
-                            # Reopen scene before FBX (USD prep
-                            # was destructive)
-                            if do_fbx:
-                                try:
-                                    cmds.file(
-                                        scene_path, open=True,
-                                        force=True)
-                                except Exception:
-                                    cmds.file(
-                                        tmp_scene, open=True,
-                                        force=True)
-                                    cmds.file(rename=scene_path)
-
-                        if do_fbx:
-                            self._log("Exporting FBX...")
-                            try:
-                                prep = \
-                                    exporter.prepare_face_track_for_export(
-                                        face_meshes, start_frame,
-                                        end_frame)
-                                if not prep["select_for_export"]:
-                                    self._log(
-                                        "No geometry found to "
-                                        "export.")
-                                    results["fbx"] = False
-                                else:
-                                    static_geos = (
-                                        [static_geo]
-                                        if static_geo else [])
-                                    results["fbx"] = \
-                                        exporter.export_fbx(
-                                            paths["fbx"], camera,
-                                            prep[
-                                                "select_for_export"
-                                            ],
-                                            [], static_geos,
-                                            start_frame, end_frame,
-                                            export_input_connections=True)
-                            except Exception as exc:
-                                self._log(
-                                    "FBX export failed. "
-                                    "See Script Editor.")
-                                sys.stderr.write(
-                                    LOG_PREFIX + " FBX error: "
-                                    "{}\n".format(exc))
-                                results["fbx"] = False
-                            self._log_result(
-                                "FBX",
-                                results.get("fbx", False))
-                            self._advance_progress()
-
-                    except Exception as exc:
-                        sys.stderr.write(
-                            LOG_PREFIX + " Export error: "
-                            "{}\n".format(exc))
-                    finally:
-                        # Reopen the pre-export snapshot to
-                        # guarantee a clean restore (preserves
-                        # any unsaved changes the user had).
-                        restored = False
+                        self._log("Exporting MA...")
+                        static_geos = (
+                            [static_geo] if static_geo else [])
                         try:
-                            cmds.file(
-                                tmp_scene, open=True, force=True)
-                            cmds.file(rename=scene_path)
-                            self._log("Scene restored.")
-                            restored = True
-                        except Exception:
-                            pass
-                        if not restored:
+                            # Import references
+                            all_refs = cmds.ls(
+                                type="reference") or []
+                            for ref_node in all_refs:
+                                if ref_node == \
+                                        "sharedReferenceNode":
+                                    continue
+                                try:
+                                    cmds.file(
+                                        referenceNode=ref_node,
+                                        importReference=True)
+                                except Exception:
+                                    pass
+
+                            # Strip namespaces
+                            all_ns = cmds.namespaceInfo(
+                                listOnlyNamespaces=True,
+                                recurse=True) or []
+                            skip_ns = {"UI", "shared"}
+                            all_ns = [ns for ns in all_ns
+                                      if ns not in skip_ns]
+                            all_ns.sort(key=len, reverse=True)
+                            for ns in all_ns:
+                                try:
+                                    cmds.namespace(
+                                        removeNamespace=ns,
+                                        mergeNamespaceWithRoot=True)
+                                except Exception:
+                                    pass
+
+                            def _resolve(name):
+                                if not name:
+                                    return name
+                                long_names = cmds.ls(
+                                    name, long=True)
+                                if long_names:
+                                    return long_names[0]
+                                short = name.rsplit(":", 1)[-1]
+                                long_names = cmds.ls(
+                                    short, long=True)
+                                if len(long_names) == 1:
+                                    return long_names[0]
+                                if len(long_names) > 1:
+                                    return long_names[0]
+                                return name
+
+                            resolved_meshes = [
+                                _resolve(fm)
+                                for fm in face_meshes]
+                            resolved_statics = [
+                                _resolve(sg)
+                                for sg in static_geos]
+                            resolved_cam = (
+                                _resolve(camera)
+                                if camera else camera)
+
+                            ma_prep = \
+                                exporter.prepare_face_track_for_export(
+                                    resolved_meshes,
+                                    start_frame, end_frame)
+                            export_nodes = ma_prep.get(
+                                "select_for_export",
+                                resolved_meshes)
+                            results["ma"] = exporter.export_ma(
+                                paths["ma"], resolved_cam,
+                                export_nodes, [],
+                                resolved_statics,
+                                start_frame=start_frame,
+                                end_frame=end_frame)
+                        except Exception as exc:
+                            self._log(
+                                "MA export failed. "
+                                "See Script Editor.")
+                            sys.stderr.write(
+                                LOG_PREFIX + " MA error: "
+                                "{}\n".format(exc))
+                            results["ma"] = False
+                        self._log_result(
+                            "MA", results.get("ma", False))
+                        self._advance_progress()
+
+                        # Reopen scene before USD/FBX (MA
+                        # prep was destructive)
+                        if do_usd or do_fbx:
                             try:
+                                cmds.file(
+                                    tmp_scene_baked, open=True,
+                                    force=True)
+                                cmds.file(rename=scene_path)
+                            except Exception:
                                 cmds.file(
                                     scene_path, open=True,
                                     force=True)
-                                self._log(
-                                    "Restored from saved file.")
-                            except Exception:
-                                self._log(
-                                    "Scene restore failed! "
-                                    "Snapshot at: " + tmp_scene)
-                        # Clean up temp file
+
+                    if do_usd:
+                        self._log("Exporting USD...")
                         try:
-                            if os.path.isfile(tmp_scene):
-                                os.remove(tmp_scene)
-                            os.rmdir(tmp_dir)
-                        except Exception:
-                            pass
+                            usd_prep = \
+                                exporter.prepare_face_track_for_export(
+                                    face_meshes, start_frame,
+                                    end_frame)
+                            if not usd_prep[
+                                    "select_for_export"]:
+                                self._log(
+                                    "No geometry found to "
+                                    "export.")
+                                results["usd"] = False
+                            else:
+                                static_geos = (
+                                    [static_geo]
+                                    if static_geo else [])
+                                results["usd"] = \
+                                    exporter.export_usd(
+                                        paths["usd"], camera,
+                                        usd_prep[
+                                            "select_for_export"
+                                        ],
+                                        static_geos,
+                                        start_frame, end_frame)
+                        except Exception as exc:
+                            self._log(
+                                "USD export failed. "
+                                "See Script Editor.")
+                            sys.stderr.write(
+                                LOG_PREFIX + " USD error: "
+                                "{}\n".format(exc))
+                            results["usd"] = False
+                        self._log_result(
+                            "USD",
+                            results.get("usd", False))
+                        self._advance_progress()
+
+                        # Reopen scene before FBX (USD prep
+                        # was destructive)
+                        if do_fbx:
+                            try:
+                                cmds.file(
+                                    tmp_scene_baked, open=True,
+                                    force=True)
+                                cmds.file(rename=scene_path)
+                            except Exception:
+                                cmds.file(
+                                    scene_path, open=True,
+                                    force=True)
+
+                    if do_fbx:
+                        self._log("Exporting FBX...")
+                        try:
+                            prep = \
+                                exporter.prepare_face_track_for_export(
+                                    face_meshes, start_frame,
+                                    end_frame)
+                            if not prep["select_for_export"]:
+                                self._log(
+                                    "No geometry found to "
+                                    "export.")
+                                results["fbx"] = False
+                            else:
+                                static_geos = (
+                                    [static_geo]
+                                    if static_geo else [])
+                                results["fbx"] = \
+                                    exporter.export_fbx(
+                                        paths["fbx"], camera,
+                                        prep[
+                                            "select_for_export"
+                                        ],
+                                        [], static_geos,
+                                        start_frame, end_frame,
+                                        export_input_connections=True)
+                        except Exception as exc:
+                            self._log(
+                                "FBX export failed. "
+                                "See Script Editor.")
+                            sys.stderr.write(
+                                LOG_PREFIX + " FBX error: "
+                                "{}\n".format(exc))
+                            results["fbx"] = False
+                        self._log_result(
+                            "FBX",
+                            results.get("fbx", False))
+                        self._advance_progress()
+
+                except Exception as exc:
+                    sys.stderr.write(
+                        LOG_PREFIX + " Export error: "
+                        "{}\n".format(exc))
 
         finally:
-            if baked_abc_cam:
+            # Restore from the pre-bake snapshot (replaces
+            # the old undo-chunk approach).
+            if tmp_scene:
+                restored = False
                 try:
-                    cmds.undoInfo(closeChunk=True)
+                    cmds.file(
+                        tmp_scene, open=True, force=True)
+                    cmds.file(rename=scene_path)
+                    self._log("Scene restored.")
+                    restored = True
                 except Exception:
                     pass
+                if not restored:
+                    try:
+                        cmds.file(
+                            scene_path, open=True,
+                            force=True)
+                        self._log(
+                            "Restored from saved file.")
+                    except Exception:
+                        self._log(
+                            "Scene restore failed! "
+                            "Snapshot at: " + tmp_scene)
+                # Clean up temp files
                 try:
-                    cmds.undo()
+                    if os.path.isfile(tmp_scene):
+                        os.remove(tmp_scene)
+                    if (tmp_scene_baked
+                            and os.path.isfile(tmp_scene_baked)):
+                        os.remove(tmp_scene_baked)
+                    if tmp_dir:
+                        os.rmdir(tmp_dir)
                 except Exception:
-                    self._log(
-                        "Undo camera bake failed. See Script Editor.")
+                    pass
             if renamed_cam and cmds.objExists(renamed_cam):
                 try:
                     cmds.rename(renamed_cam, original_cam_name)
