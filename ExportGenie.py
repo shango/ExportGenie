@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13-beta-19"
+TOOL_VERSION = "v13"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -6929,6 +6929,26 @@ class Exporter(object):
                         .format(sx=round(scale_x, 4),
                                 sy=round(scale_y, 4)))
                     jsx_lines.append("")
+
+                    # Apply redistort mesh warp to work layer so it
+                    # matches the distorted raw plate underneath.
+                    if stmap_undistort:
+                        redistort_ffx = (
+                            "{}_mesh_warp_apply_LD_{}.ffx"
+                            .format(scene_base, v_str))
+                        jsx_lines.append(
+                            "// Redistort mesh warp on work layer")
+                        jsx_lines.append(
+                            "var _rdDir = (new File($.fileName))"
+                            ".parent;")
+                        jsx_lines.append(
+                            "var rdFfx = new File("
+                            "_rdDir.fsName + '/' + '{}');"
+                            .format(redistort_ffx))
+                        jsx_lines.append(
+                            "if (rdFfx.exists) "
+                            "workLayer.applyPreset(rdFfx);")
+                        jsx_lines.append("")
                 else:
                     sys.stderr.write(
                         LOG_PREFIX + " Raw plate resolution "
