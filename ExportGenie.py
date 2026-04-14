@@ -6385,6 +6385,7 @@ class Exporter(object):
         jsx.append("srcFootage.selected = false;")
         jsx.append("bkgLayer.startTime = 0;")
         jsx.append("bkgLayer.moveToEnd();")
+        jsx.append("bkgLayer.guideLayer = true;")
         jsx.append("")
         return jsx
 
