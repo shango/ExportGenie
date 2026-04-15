@@ -1106,13 +1106,21 @@ class Exporter(object):
             "-start_number", str(int(start_frame)),
             "-i", seq_pattern,
         ]
+
+        # Pad to even dimensions -- libx264 requires both width and
+        # height to be divisible by 2.
+        pad_filter = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
         vf_script = None
         if show_hud and self._has_drawtext():
             hud_filters = self._build_hud_drawtext(
                 start_frame, focal_length, resolution=resolution)
             # Strip stream labels  -- single-input uses plain vf
-            vf_script = hud_filters.replace(
+            vf_script = pad_filter + "," + hud_filters.replace(
                 "[pre_hud]", "").replace("[out]", "")
+        else:
+            vf_script = pad_filter
+
         cmd.extend([
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
@@ -1121,44 +1129,22 @@ class Exporter(object):
             "-preset", "ultrafast",
             "-crf", "18",
             "-movflags", "+faststart",
-            output_mp4,
         ])
 
         self.log("Encoding MP4...")
         try:
-            if vf_script is not None:
-                if sys.platform == "win32":
-                    # Windows: write to temp file to avoid colon
-                    # escaping issues with fontfile paths.
-                    import tempfile as _tf
-                    fd, script_path = _tf.mkstemp(
-                        suffix=".txt", prefix="ffmpeg_vf_")
-                    try:
-                        with os.fdopen(fd, "w") as fh:
-                            fh.write(vf_script)
-                        cmd.extend([
-                            "-filter_script:v", script_path])
-                        sys.stderr.write(
-                            "ffmpeg cmd: {}\n".format(
-                                " ".join(cmd)))
-                        result = subprocess.run(
-                            cmd,
-                            stdin=subprocess.DEVNULL,
-                            capture_output=True,
-                            text=True,
-                            timeout=600,
-                            creationflags=getattr(
-                                subprocess,
-                                "CREATE_NO_WINDOW", 0),
-                        )
-                    finally:
-                        try:
-                            os.remove(script_path)
-                        except Exception:
-                            pass
-                else:
-                    # macOS / Linux: pass inline.
-                    cmd.extend(["-vf", vf_script])
+            if sys.platform == "win32":
+                # Windows: write filter to temp file to avoid colon
+                # escaping issues with fontfile paths.
+                import tempfile as _tf
+                fd, script_path = _tf.mkstemp(
+                    suffix=".txt", prefix="ffmpeg_vf_")
+                try:
+                    with os.fdopen(fd, "w") as fh:
+                        fh.write(vf_script)
+                    cmd.extend([
+                        "-filter_script:v", script_path,
+                        output_mp4])
                     sys.stderr.write(
                         "ffmpeg cmd: {}\n".format(
                             " ".join(cmd)))
@@ -1172,9 +1158,17 @@ class Exporter(object):
                             subprocess,
                             "CREATE_NO_WINDOW", 0),
                     )
+                finally:
+                    try:
+                        os.remove(script_path)
+                    except Exception:
+                        pass
             else:
+                # macOS / Linux: pass filter inline.
+                cmd.extend(["-vf", vf_script, output_mp4])
                 sys.stderr.write(
-                    "ffmpeg cmd: {}\n".format(" ".join(cmd)))
+                    "ffmpeg cmd: {}\n".format(
+                        " ".join(cmd)))
                 result = subprocess.run(
                     cmd,
                     stdin=subprocess.DEVNULL,
@@ -1182,7 +1176,8 @@ class Exporter(object):
                     text=True,
                     timeout=600,
                     creationflags=getattr(
-                        subprocess, "CREATE_NO_WINDOW", 0),
+                        subprocess,
+                        "CREATE_NO_WINDOW", 0),
                 )
             if result.returncode != 0:
                 sys.stderr.write(
@@ -1284,6 +1279,13 @@ class Exporter(object):
             filter_complex = filter_complex.replace(
                 "[out]", "[pre_hud]")
             filter_complex += ";" + hud_chain
+
+        # Pad to even dimensions for libx264 (no-op if already even).
+        if not png_output:
+            filter_complex = filter_complex.replace(
+                "[out]", "[pre_pad]")
+            filter_complex += (
+                ";[pre_pad]pad=ceil(iw/2)*2:ceil(ih/2)*2[out]")
 
         # Write filter_complex to a temp script file to avoid
         # Windows colon-escaping issues with fontfile paths.
