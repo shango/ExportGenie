@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v13"
+TOOL_VERSION = "v14-beta-1"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -1203,13 +1203,16 @@ class Exporter(object):
                           opacity=1.0, png_output=False,
                           show_hud=False, focal_length=None,
                           resolution=None,
-                          crown_dir=None, crown_base=None):
-        """Composite passes (plate, color, matte, optional crown) via ffmpeg.
+                          crown_dir=None, crown_base=None,
+                          wireframe_dir=None, wireframe_base=None):
+        """Composite passes (plate, color, matte, optional crown, optional wireframe) via ffmpeg.
 
         Uses the matte as an alpha channel on the solid-color pass,
         then overlays it on the plate.  When crown_dir/crown_base are
-        provided, a 4th input (QC spline crown on black) is
-        screen-blended on top of the composite.
+        provided, an input with the QC spline crown on black is
+        screen-blended on top.  When wireframe_dir/wireframe_base are
+        provided, an input with the front-facing wireframe on black is
+        screen-blended as the top layer.
 
         Returns:
             bool: True if encoding succeeded.
@@ -1245,6 +1248,9 @@ class Exporter(object):
             "-i", matte_pattern,
         ]
 
+        next_input_idx = 3
+        crown_idx = None
+        wireframe_idx = None
         if crown_dir and crown_base:
             crown_pattern = os.path.join(
                 crown_dir, "{}.%04d.png".format(crown_base))
@@ -1253,25 +1259,58 @@ class Exporter(object):
                 "-start_number", start_num,
                 "-i", crown_pattern,
             ])
-            # 4-input: plate + color/matte overlay + crown screen blend
-            filter_complex = (
-                "[2:v]format=gray[matte];"
-                "[1:v][matte]alphamerge,format=rgba,"
-                "colorchannelmixer=aa={opacity:.4f}[fg];"
-                "[0:v][fg]overlay=format=auto[base];"
-                "[3:v]split[crown_color][crown_luma];"
+            crown_idx = next_input_idx
+            next_input_idx += 1
+        if wireframe_dir and wireframe_base:
+            wf_pattern = os.path.join(
+                wireframe_dir, "{}.%04d.png".format(wireframe_base))
+            cmd.extend([
+                "-framerate", str(fps),
+                "-start_number", start_num,
+                "-i", wf_pattern,
+            ])
+            wireframe_idx = next_input_idx
+            next_input_idx += 1
+
+        # Base composite: matte -> alpha on color -> overlay on plate.
+        # Screen-blend crown (if any) then wireframe (if any) on top.
+        base_out = (
+            "[out]" if (crown_idx is None
+                        and wireframe_idx is None)
+            else "[base]")
+        filter_complex = (
+            "[2:v]format=gray[matte];"
+            "[1:v][matte]alphamerge,format=rgba,"
+            "colorchannelmixer=aa={opacity:.4f}[fg];"
+            "[0:v][fg]overlay=format=auto{base_out}"
+        ).format(opacity=opacity_val, base_out=base_out)
+
+        prev_stage = "[base]"
+        if crown_idx is not None:
+            # Final stage is [out] only if wireframe won't follow
+            crown_out = (
+                "[out]" if wireframe_idx is None else "[stage1]")
+            filter_complex += (
+                ";[{idx}:v]split[crown_color][crown_luma];"
                 "[crown_luma]format=gray[crown_alpha];"
                 "[crown_color][crown_alpha]alphamerge,"
                 "format=rgba[crown_rgba];"
-                "[base][crown_rgba]overlay=format=auto[out]"
-            ).format(opacity=opacity_val)
-        else:
-            filter_complex = (
-                "[2:v]format=gray[matte];"
-                "[1:v][matte]alphamerge,format=rgba,"
-                "colorchannelmixer=aa={opacity:.4f}[fg];"
-                "[0:v][fg]overlay=format=auto[out]"
-            ).format(opacity=opacity_val)
+                "{prev}[crown_rgba]overlay=format=auto{out}"
+            ).format(
+                idx=crown_idx, prev=prev_stage, out=crown_out)
+            prev_stage = crown_out
+        if wireframe_idx is not None:
+            # Screen-blend the wireframe pass. Maya's mesh wireframe
+            # color is typically a dark blue-gray (~0.2 luma), so using
+            # luma as alpha would render the edges nearly invisible.
+            # blend=all_mode=screen ignores black pixels entirely and
+            # brightens-over for any non-black pixel.
+            filter_complex += (
+                ";{prev}format=gbrp[wf_bg];"
+                "[{idx}:v]format=gbrp[wf_fg];"
+                "[wf_bg][wf_fg]blend=all_mode=screen,"
+                "format=rgba[out]"
+            ).format(idx=wireframe_idx, prev=prev_stage)
 
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
@@ -1453,6 +1492,34 @@ class Exporter(object):
             mel.eval("MLdeleteUnused")
         except Exception:
             pass
+
+    @staticmethod
+    def _freeze_static_geo_transforms(proxy_geos):
+        """Freeze TRS on each static/proxy geo so exports get identity
+        root transforms (world-space position is baked into the shape).
+
+        Caller is responsible for reverting via an undo chunk or
+        snapshot restore  -- this function does NOT preserve the
+        original scene.  Per-node failures are logged but do not
+        abort the sweep.
+
+        Returns the number of nodes successfully frozen.
+        """
+        count = 0
+        for geo in proxy_geos or []:
+            if not geo or not cmds.objExists(geo):
+                continue
+            try:
+                cmds.makeIdentity(
+                    geo, apply=True, translate=True,
+                    rotate=True, scale=True, normal=0,
+                    preserveNormals=True)
+                count += 1
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " Freeze transform failed on "
+                    "'{}': {}\n".format(geo, e))
+        return count
 
     def export_ma(self, file_path, camera, geo_roots, rig_roots, proxy_geos,
                   start_frame=None, end_frame=None):
@@ -3558,6 +3625,8 @@ class Exporter(object):
                          composite_color_path=None,
                          composite_matte_path=None,
                          composite_tmp_dir=None,
+                         composite_wireframe_overlay=False,
+                         composite_wireframe_geo=None,
                          resolution=None):
         """Export a QC playblast.
 
@@ -3998,6 +4067,7 @@ class Exporter(object):
             composite_rendered = False
             auto_qc_crown = None
             has_crown_pass = False
+            has_wireframe_pass = False
 
             if matchmove_geo and model_panel and not raw_playblast:
                 # 1. Force all display layers visible so nothing is
@@ -4615,6 +4685,117 @@ class Exporter(object):
                                 except Exception:
                                     pass
 
+                        # --- Pass 5: Wireframe Overlay (matchmove) ---
+                        # Front-facing wireframe on the character mesh,
+                        # rendered on a black background for screen-
+                        # blend compositing in ffmpeg.  useBackground
+                        # shader makes surfaces transparent while still
+                        # writing depth, so only front-facing wireframe
+                        # edges are visible.
+                        if (composite_wireframe_overlay
+                                and mm_transforms
+                                and composite_tmp_dir):
+                            wf_path = os.path.join(
+                                composite_tmp_dir, "wireframe",
+                                os.path.basename(
+                                    composite_matte_path))
+                            wf_dir = os.path.dirname(wf_path)
+                            if not os.path.exists(wf_dir):
+                                os.makedirs(wf_dir)
+                            self.log("Rendering wireframe pass...")
+                            # Ensure black background
+                            cmds.displayRGBColor(
+                                "background", 0, 0, 0)
+                            cmds.displayRGBColor(
+                                "backgroundTop", 0, 0, 0)
+                            cmds.displayRGBColor(
+                                "backgroundBottom", 0, 0, 0)
+                            cmds.displayPref(displayGradient=False)
+
+                            # Create useBackground shader
+                            wf_bg_shader = cmds.shadingNode(
+                                "useBackground", asShader=True,
+                                name="mme_mmWf_mtl")
+                            wf_bg_sg = cmds.sets(
+                                renderable=True,
+                                noSurfaceShader=True,
+                                empty=True,
+                                name="mme_mmWf_SG")
+                            cmds.connectAttr(
+                                "{}.outColor".format(wf_bg_shader),
+                                "{}.surfaceShader".format(wf_bg_sg),
+                                force=True)
+
+                            # Save current shading (checker from
+                            # matte pass) and apply useBackground
+                            wf_orig_shading = {}
+                            for mt in mm_transforms:
+                                try:
+                                    sgs = cmds.listConnections(
+                                        mt,
+                                        type="shadingEngine") or []
+                                    if sgs:
+                                        wf_orig_shading[mt] = sgs[0]
+                                except Exception:
+                                    pass
+                            cmds.select(
+                                mm_transforms, replace=True)
+                            cmds.hyperShade(assign=wf_bg_shader)
+                            cmds.select(clear=True)
+
+                            # Enable wireframe-on-shaded so the
+                            # useBackground meshes render their
+                            # wireframe edges.  The final cleanup
+                            # block restores wireframeOnShaded from
+                            # original_mm_wos.
+                            cmds.modelEditor(
+                                model_panel, edit=True,
+                                wireframeOnShaded=True)
+
+                            cmds.modelEditor(
+                                model_panel, edit=True,
+                                imagePlane=False,
+                                polymeshes=True,
+                                nurbsSurfaces=False,
+                                subdivSurfaces=False,
+                                nurbsCurves=False)
+                            cmds.ogs(reset=True)
+                            cmds.refresh(force=True)
+                            cmds.playblast(
+                                filename=wf_path,
+                                format="image",
+                                compression="png",
+                                startTime=start_frame,
+                                endTime=end_frame,
+                                forceOverwrite=True,
+                                sequenceTime=False,
+                                clearCache=True,
+                                viewer=False,
+                                showOrnaments=False,
+                                framePadding=4,
+                                percent=100,
+                                quality=100,
+                                widthHeight=[pb_width, pb_height],
+                            )
+                            has_wireframe_pass = True
+
+                            # Restore shading and delete shader
+                            for mt, sg in wf_orig_shading.items():
+                                try:
+                                    if (cmds.objExists(mt)
+                                            and cmds.objExists(sg)):
+                                        cmds.sets(
+                                            mt, edit=True,
+                                            forceElement=sg)
+                                except Exception:
+                                    pass
+                            for node in (wf_bg_sg, wf_bg_shader):
+                                try:
+                                    if cmds.objExists(node):
+                                        cmds.delete(node)
+                                except Exception:
+                                    pass
+
                         # Restore background
                         cmds.displayRGBColor(
                             "background", *original_bg)
@@ -4822,6 +5003,14 @@ class Exporter(object):
                         c_crown_base = os.path.basename(
                             composite_matte_path)
 
+                    c_wf_dir = None
+                    c_wf_base = None
+                    if has_wireframe_pass:
+                        c_wf_dir = os.path.join(
+                            composite_tmp_dir, "wireframe")
+                        c_wf_base = os.path.basename(
+                            composite_matte_path)
+
                     if png_mode:
                         # Composite to PNG sequence
                         out_dir = os.path.dirname(file_path)
@@ -4838,7 +5027,9 @@ class Exporter(object):
                             focal_length=hud_focal_length,
                             resolution=(pb_width, pb_height),
                             crown_dir=c_crown_dir,
-                            crown_base=c_crown_base)
+                            crown_base=c_crown_base,
+                            wireframe_dir=c_wf_dir,
+                            wireframe_base=c_wf_base)
                     elif mp4_mode:
                         encode_ok = self._encode_composite(
                             plate_dir, plate_base,
@@ -4850,7 +5041,9 @@ class Exporter(object):
                             focal_length=hud_focal_length,
                             resolution=(pb_width, pb_height),
                             crown_dir=c_crown_dir,
-                            crown_base=c_crown_base)
+                            crown_base=c_crown_base,
+                            wireframe_dir=c_wf_dir,
+                            wireframe_base=c_wf_base)
                     else:
                         # Composite output  -- use .mp4 on macOS for
                         # reliable ffmpeg encoding; .mov on Windows.
@@ -4868,7 +5061,9 @@ class Exporter(object):
                             focal_length=hud_focal_length,
                             resolution=(pb_width, pb_height),
                             crown_dir=c_crown_dir,
-                            crown_base=c_crown_base)
+                            crown_base=c_crown_base,
+                            wireframe_dir=c_wf_dir,
+                            wireframe_base=c_wf_base)
 
                     if encode_ok:
                         # Cleanup composite temp dirs
@@ -5763,8 +5958,20 @@ class Exporter(object):
         """
         import zlib
 
+        # Read in 1 MB chunks rather than a single f.read().  On Windows,
+        # slurping a whole multi-MB file over a slow/unreliable network
+        # share (SMB, OneDrive hydration, etc.) can return
+        # OSError [Errno 22] Invalid argument when an underlying request
+        # stalls or times out.  Chunked reads are retried transparently
+        # by the SMB client and survive flaky links.
+        chunks = []
         with open(path, 'rb') as f:
-            data = f.read()
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        data = b''.join(chunks)
 
         pos = 8  # skip magic + version
 
@@ -6235,6 +6442,20 @@ class Exporter(object):
             "    adj_{v}.moveToBeginning();".format(v=safe_var))
         jsx.append(
             "    adj_{v}.applyPreset(ffxFile_{v});".format(v=safe_var))
+        # Rename the Mesh Warp effect so it reads as
+        # "undistort" / "distort" in the Effect Controls panel.
+        effect_name = "undistort" if label == "Undistort" else "distort"
+        jsx.append(
+            "    for (var i_{v} = adj_{v}.Effects.numProperties; "
+            "i_{v} >= 1; i_{v}--) {{".format(v=safe_var))
+        jsx.append(
+            "        var ef_{v} = adj_{v}.Effects.property(i_{v});".format(
+                v=safe_var))
+        jsx.append(
+            "        if (ef_{v}.matchName == 'ADBE Mesh Warp') "
+            "{{ ef_{v}.name = '{n}'; break; }}".format(
+                v=safe_var, n=effect_name))
+        jsx.append("    }")
         jsx.append(
             "    adj_{v}.enabled = false;".format(v=safe_var))
         jsx.append("}")
@@ -6949,8 +7170,24 @@ class Exporter(object):
                             "_rdDir.fsName + '/' + '{}');"
                             .format(redistort_ffx))
                         jsx_lines.append(
-                            "if (rdFfx.exists) "
-                            "workLayer.applyPreset(rdFfx);")
+                            "if (rdFfx.exists) {")
+                        jsx_lines.append(
+                            "    workLayer.applyPreset(rdFfx);")
+                        # Rename the Mesh Warp effect to "distort"
+                        # in the Effect Controls panel.
+                        jsx_lines.append(
+                            "    for (var i_wl = "
+                            "workLayer.Effects.numProperties; "
+                            "i_wl >= 1; i_wl--) {")
+                        jsx_lines.append(
+                            "        var ef_wl = "
+                            "workLayer.Effects.property(i_wl);")
+                        jsx_lines.append(
+                            "        if (ef_wl.matchName == "
+                            "'ADBE Mesh Warp') "
+                            "{ ef_wl.name = 'distort'; break; }")
+                        jsx_lines.append("    }")
+                        jsx_lines.append("}")
                         jsx_lines.append("")
                 else:
                     sys.stderr.write(
@@ -7940,6 +8177,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_motion_blur_cb.setToolTip(
             "Enable VP2.0 motion blur during playblast")
         mmft_layout.addWidget(self.pb_motion_blur_cb)
+
+        self.pb_wireframe_overlay_cb = QCheckBox(
+            "  Wireframe Overlay (MM + Face Track only)")
+        self.pb_wireframe_overlay_cb.setChecked(False)
+        self.pb_wireframe_overlay_cb.setToolTip(
+            "Composite the character mesh as a front-facing wireframe\n"
+            "on top of the Matchmove / Face Track QC render. Uses a\n"
+            "useBackground shader so back faces are occluded — only\n"
+            "front-facing wireframe edges are shown. Not used for the\n"
+            "Camera Track output.")
+        mmft_layout.addWidget(self.pb_wireframe_overlay_cb)
+
         mmft_layout.addWidget(QLabel("QC Checker Overlay"))
 
         # Color
@@ -9989,30 +10238,56 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         except Exception:
                             pass
 
-            if do_ma:
-                self._log("Exporting MA...")
-                results["ma"] = exporter.export_ma(
-                    paths["ma"], camera, geo_roots, rig_roots,
-                    proxy_geos,
-                    start_frame=start_frame, end_frame=end_frame)
-                self._log_result("MA", results["ma"])
-                self._advance_progress()
+            # Freeze transforms on static/proxy geo for MA/ABC/USD
+            # so the exported files have identity root transforms.
+            # Wrapped in its own undo chunk so the source scene is
+            # untouched after this block finishes.  FBX runs later
+            # under a separate tmp-file snapshot and freezes there.
+            freeze_chunk_open = False
+            try:
+                if proxy_geos and (do_ma or do_abc or do_usd):
+                    cmds.undoInfo(openChunk=True)
+                    freeze_chunk_open = True
+                    n = Exporter._freeze_static_geo_transforms(
+                        proxy_geos)
+                    if n:
+                        self._log(
+                            "Froze transforms on {} static "
+                            "geo.".format(n))
 
-            if do_abc:
-                self._log("Exporting ABC...")
-                results["abc"] = exporter.export_abc(
-                    paths["abc"], camera, geo_roots, proxy_geos,
-                    tpose_start, end_frame, rig_roots=rig_roots)
-                self._log_result("ABC", results["abc"])
-                self._advance_progress()
+                if do_ma:
+                    self._log("Exporting MA...")
+                    results["ma"] = exporter.export_ma(
+                        paths["ma"], camera, geo_roots, rig_roots,
+                        proxy_geos,
+                        start_frame=start_frame, end_frame=end_frame)
+                    self._log_result("MA", results["ma"])
+                    self._advance_progress()
 
-            if do_usd:
-                self._log("Exporting USD...")
-                results["usd"] = exporter.export_usd(
-                    paths["usd"], camera, geo_roots, proxy_geos,
-                    tpose_start, end_frame, rig_roots=rig_roots)
-                self._log_result("USD", results["usd"])
-                self._advance_progress()
+                if do_abc:
+                    self._log("Exporting ABC...")
+                    results["abc"] = exporter.export_abc(
+                        paths["abc"], camera, geo_roots, proxy_geos,
+                        tpose_start, end_frame, rig_roots=rig_roots)
+                    self._log_result("ABC", results["abc"])
+                    self._advance_progress()
+
+                if do_usd:
+                    self._log("Exporting USD...")
+                    results["usd"] = exporter.export_usd(
+                        paths["usd"], camera, geo_roots, proxy_geos,
+                        tpose_start, end_frame, rig_roots=rig_roots)
+                    self._log_result("USD", results["usd"])
+                    self._advance_progress()
+            finally:
+                if freeze_chunk_open:
+                    try:
+                        cmds.undoInfo(closeChunk=True)
+                        cmds.undo()
+                    except Exception:
+                        self._log(
+                            "Undo static geo freeze failed. "
+                            "See Script Editor.")
 
             if do_mov:
                 png_mode = False
@@ -10042,6 +10317,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     mb = self.pb_motion_blur_cb.isChecked()
                     far_clip = self.pb_far_clip_spin.value()
                     show_hud = self.pb_hud_overlay_cb.isChecked()
+                    wf_overlay = (
+                        self.pb_wireframe_overlay_cb.isChecked())
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
@@ -10062,7 +10339,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_matte_path=paths.get(
                             "composite_matte"),
                         composite_tmp_dir=paths.get(
-                            "composite_tmp"))
+                            "composite_tmp"),
+                        composite_wireframe_overlay=wf_overlay,
+                        composite_wireframe_geo=geo_roots)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
@@ -10160,6 +10439,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                        for p in proxy_geos]
                         fbx_cam = (_resolve_name(camera)
                                    if camera else camera)
+                        # Freeze static geo transforms so the FBX has
+                        # identity roots.  Scene state is reverted by
+                        # the tmp-file reopen in the finally block.
+                        if fbx_proxies:
+                            n_frozen = \
+                                Exporter._freeze_static_geo_transforms(
+                                    fbx_proxies)
+                            if n_frozen:
+                                self._log(
+                                    "Froze transforms on {} static "
+                                    "geo.".format(n_frozen))
                         results["fbx"] = exporter.export_fbx(
                             paths["fbx"], fbx_cam, fbx_geo,
                             fbx_rigs, fbx_proxies,
@@ -10516,6 +10806,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     mb = self.pb_motion_blur_cb.isChecked()
                     far_clip = self.pb_far_clip_spin.value()
                     show_hud = self.pb_hud_overlay_cb.isChecked()
+                    wf_overlay = (
+                        self.pb_wireframe_overlay_cb.isChecked())
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         face_track_mode=True,
@@ -10537,7 +10829,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_matte_path=paths.get(
                             "composite_matte"),
                         composite_tmp_dir=paths.get(
-                            "composite_tmp"))
+                            "composite_tmp"),
+                        composite_wireframe_overlay=wf_overlay,
+                        composite_wireframe_geo=face_meshes)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
@@ -10622,6 +10916,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             export_nodes = ma_prep.get(
                                 "select_for_export",
                                 resolved_meshes)
+                            # Freeze static geo transforms.  Scene is
+                            # restored from tmp_scene in the outer
+                            # finally, so no explicit undo needed.
+                            if resolved_statics:
+                                n_frozen = \
+                                    Exporter._freeze_static_geo_transforms(
+                                        resolved_statics)
+                                if n_frozen:
+                                    self._log(
+                                        "Froze transforms on {} "
+                                        "static geo.".format(
+                                            n_frozen))
                             results["ma"] = exporter.export_ma(
                                 paths["ma"], resolved_cam,
                                 export_nodes, [],
@@ -10670,6 +10976,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                 static_geos = (
                                     [static_geo]
                                     if static_geo else [])
+                                # Freeze static geo transforms; scene
+                                # restore happens in the outer finally.
+                                if static_geos:
+                                    n_frozen = \
+                                        Exporter._freeze_static_geo_transforms(
+                                            static_geos)
+                                    if n_frozen:
+                                        self._log(
+                                            "Froze transforms on {}"
+                                            " static geo.".format(
+                                                n_frozen))
                                 results["usd"] = \
                                     exporter.export_usd(
                                         paths["usd"], camera,
@@ -10720,6 +11037,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                 static_geos = (
                                     [static_geo]
                                     if static_geo else [])
+                                # Freeze static geo transforms; scene
+                                # restore happens in the outer finally.
+                                if static_geos:
+                                    n_frozen = \
+                                        Exporter._freeze_static_geo_transforms(
+                                            static_geos)
+                                    if n_frozen:
+                                        self._log(
+                                            "Froze transforms on {}"
+                                            " static geo.".format(
+                                                n_frozen))
                                 results["fbx"] = \
                                     exporter.export_fbx(
                                         paths["fbx"], camera,
