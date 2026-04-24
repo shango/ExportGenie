@@ -7445,7 +7445,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_usd_checkbox = None
         self.ct_mov_checkbox = None
         # Playblast settings
-        self.pb_context_menu = None
         self.pb_raw_playblast_cb = None
         self.pb_custom_vt_cb = None
         self.pb_wireframe_shader_cb = None
@@ -8084,24 +8083,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         tab = QWidget()
         tab_layout = QVBoxLayout(tab)
         tab_layout.setSpacing(6)
-
-        # Export Context
-        ctx_row = QHBoxLayout()
-        ctx_row.setSpacing(8)
-        ctx_row.addWidget(QLabel("Export Context:"))
-        self.pb_context_menu = QComboBox()
-        self.pb_context_menu.addItems(
-            ["-- Choose --", "Camera Track", "Matchmove", "Face Track"])
-        self.pb_context_menu.setToolTip(
-            "Which export tab these settings apply to for preview")
-        ctx_row.addWidget(self.pb_context_menu)
-        ctx_row.addStretch()
-        tab_layout.addLayout(ctx_row)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #555;")
-        tab_layout.addWidget(sep)
 
         # General
         gen = CollapsibleGroupBox("General")
@@ -8743,7 +8724,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 TAB_CAMERA_TRACK, TAB_MATCHMOVE, TAB_FACE_TRACK][index]
 
     def _get_active_tab(self):
-        """Return the active export tab identifier."""
+        """Return the active export tab identifier, or None if the
+        user is on the Playblast Settings tab (which has no export
+        context of its own)."""
         idx = self.tab_widget.currentIndex()
         if idx == 0:
             self._last_export_tab = TAB_CAMERA_TRACK
@@ -8754,15 +8737,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         elif idx == 2:
             self._last_export_tab = TAB_FACE_TRACK
             return TAB_FACE_TRACK
-        # Tab 3 = Playblast Settings  -- use context menu selection
-        if self.pb_context_menu:
-            ctx = self.pb_context_menu.currentText()
-            if ctx == "Camera Track":
-                return TAB_CAMERA_TRACK
-            elif ctx == "Matchmove":
-                return TAB_MATCHMOVE
-            elif ctx == "Face Track":
-                return TAB_FACE_TRACK
         return None
 
     # ------------------------------------------------------------------
@@ -9372,10 +9346,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         active_tab = self._get_active_tab()
         if active_tab is None:
             self._confirm_dialog(
-                "Export Context Required",
-                "Please select an Export Context (Camera Track, "
-                "Matchmove, or Face Track) in the Playblast "
-                "Settings tab before exporting.")
+                "Select an Export Tab",
+                "Playblast Settings are shared settings and don't "
+                "export on their own. Switch to the Camera Track, "
+                "Matchmove, or Face Track tab and click Export there.")
             return
         if active_tab == TAB_CAMERA_TRACK:
             self._export_camera_track()
@@ -9396,10 +9370,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         active_tab = self._get_active_tab()
         if active_tab is None:
             self._confirm_dialog(
-                "Export Context Required",
-                "Please select an Export Context (Camera Track, "
-                "Matchmove, or Face Track) in the Playblast "
-                "Settings tab before previewing.")
+                "Select an Export Tab",
+                "Playblast Settings are shared settings and don't "
+                "preview on their own. Switch to the Camera Track, "
+                "Matchmove, or Face Track tab and click Render "
+                "Preview Frame there.")
             return
 
         # Resolve camera from the active tab
