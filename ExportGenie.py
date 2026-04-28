@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-4"
+TOOL_VERSION = "v14-beta-5"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -7462,6 +7462,25 @@ class Exporter(object):
     _NK_WRITE_DEFAULTS = {
         "Write1": "_nukeQC.mov",
     }
+    # Knobs Nuke creates dynamically on Camera3 / ReadGeo2 when an
+    # alembic loads. They're saved back into the .nk on re-save and
+    # then complain on reload if the node's current state doesn't
+    # match ("could not find knob X"). Stripping them at generation
+    # time leaves Nuke free to recreate them with current alembic
+    # state -- no warnings, no functional loss.
+    _NK_ALEMBIC_DYNAMIC_KNOBS = frozenset({
+        "fbx_node_name",
+        "frame_rate",
+        "use_frame_rate",
+        "frame_offset",
+        "lock_frame_offset",
+        "range_first",
+        "range_last",
+        "read_on_each_frame",
+        "use_geometry_colors",
+        "scene_view",
+        "all_objects",
+    })
 
     @staticmethod
     def _nk_relpath(asset_path, nk_dir):
@@ -7632,12 +7651,18 @@ class Exporter(object):
                         block, rel_paths[asset_key],
                         is_seq, is_movie,
                         start_frame, end_frame))
-                elif block_name in self._NK_WRITE_DEFAULTS:
-                    suffix = self._NK_WRITE_DEFAULTS[block_name]
-                    nk_stem = os.path.splitext(
-                        os.path.basename(file_path))[0]
+                elif node_type == "Write":
+                    # Substitute file knob if this Write has a
+                    # default; either way strip OCIO knobs.
+                    if block_name in self._NK_WRITE_DEFAULTS:
+                        suffix = self._NK_WRITE_DEFAULTS[block_name]
+                        nk_stem = os.path.splitext(
+                            os.path.basename(file_path))[0]
+                        rel = nk_stem + suffix
+                    else:
+                        rel = None
                     out_lines.extend(self._rewrite_nk_write_block(
-                        block, nk_stem + suffix))
+                        block, rel))
                 elif node_type == "TimeOffset":
                     out_lines.extend(self._rewrite_nk_time_offset_block(
                         block, start_frame))
@@ -7695,15 +7720,31 @@ class Exporter(object):
     @staticmethod
     def _rewrite_nk_write_block(block, rel_path):
         """Rewrite the `file` knob on a Write block to a default
-        path relative to the .nk. Preserves the template's
-        no-quotes style for Write paths.
+        path relative to the .nk (only when rel_path is not None),
+        and strip OCIO display/view/colorspace knobs whose values
+        are tied to a specific OCIO config.
+
+        The template was authored with `display ACES`, `view sRGB`,
+        `ocioColorspace scene_linear` baked in -- those names don't
+        exist in every artist's OCIO config and Nuke warns
+        "Bad value for display: ACES" on load. Removing them lets
+        Nuke fall back to the current config's defaults; the artist
+        can set the right values per-shot.
         """
+        strip = ("display", "view", "ocioColorspace")
         out = []
         for ln in block:
-            if ln.startswith(" file "):
+            if rel_path is not None and ln.startswith(" file "):
                 out.append(" file " + rel_path)
-            else:
-                out.append(ln)
+                continue
+            stripped = False
+            for k in strip:
+                if ln.startswith(" " + k + " "):
+                    stripped = True
+                    break
+            if stripped:
+                continue
+            out.append(ln)
         return out
 
     @staticmethod
@@ -7717,15 +7758,25 @@ class Exporter(object):
         the frame fields use the movie's file-internal range
         (1..N where N=end-start+1). For other Reads (alembic, etc.)
         only the `file` knob is touched.
+
+        For Camera3 / ReadGeo2 blocks, alembic-dynamic knobs are
+        stripped (see _NK_ALEMBIC_DYNAMIC_KNOBS) so Nuke recreates
+        them from the live alembic state on load.
         """
         # Movie file-internal range. Frame count = (end-start+1).
         movie_last = None
         if (is_movie and start_frame is not None
                 and end_frame is not None):
             movie_last = max(1, int(end_frame) - int(start_frame) + 1)
+        dyn_knobs = Exporter._NK_ALEMBIC_DYNAMIC_KNOBS
+        # Match knob lines like ` <knob_name> ...` at single-space indent.
+        knob_re = re.compile(r"^ ([a-zA-Z_][a-zA-Z0-9_]*) ")
 
         out = []
         for ln in block:
+            knob_match = knob_re.match(ln)
+            if knob_match and knob_match.group(1) in dyn_knobs:
+                continue  # strip alembic-dynamic knob
             if ln.startswith(" file "):
                 if rel_path:
                     out.append(' file "{}"'.format(rel_path))
@@ -8042,7 +8093,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
-        self.mm_nk_checkbox = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -8059,7 +8109,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ft_fbx_checkbox = None
         self.ft_usd_checkbox = None
         self.ft_mov_checkbox = None
-        self.ft_nk_checkbox = None
         # Render preview state
         self._preview_buttons = []
         self._last_preview_tmp = None
@@ -8513,15 +8562,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.mm_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.mm_mov_checkbox.setChecked(True)
-        self.mm_nk_checkbox = QCheckBox("  Nuke script (.nk)")
-        self.mm_nk_checkbox.setChecked(True)
 
         fmt_layout.addWidget(self.mm_ma_checkbox)
         fmt_layout.addWidget(self.mm_fbx_checkbox)
         fmt_layout.addWidget(self.mm_abc_checkbox)
         fmt_layout.addWidget(self.mm_usd_checkbox)
         fmt_layout.addWidget(self.mm_mov_checkbox)
-        fmt_layout.addWidget(self.mm_nk_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -8653,14 +8699,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.ft_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ft_mov_checkbox.setChecked(True)
-        self.ft_nk_checkbox = QCheckBox("  Nuke script (.nk)")
-        self.ft_nk_checkbox.setChecked(True)
 
         fmt_layout.addWidget(self.ft_ma_checkbox)
         fmt_layout.addWidget(self.ft_fbx_checkbox)
         fmt_layout.addWidget(self.ft_usd_checkbox)
         fmt_layout.addWidget(self.ft_mov_checkbox)
-        fmt_layout.addWidget(self.ft_nk_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -9784,8 +9827,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = self.mm_usd_checkbox.isChecked()
         do_mov = self.mm_mov_checkbox.isChecked()
-        do_nk = self.mm_nk_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_abc or do_usd or do_mov or do_nk):
+        if not (do_ma or do_fbx or do_abc or do_usd or do_mov):
             errors.append("No export format selected.")
 
         camera = (self.mm_camera_entries[0]["field"].text().strip()
@@ -9875,8 +9917,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_fbx = self.ft_fbx_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
         do_mov = self.ft_mov_checkbox.isChecked()
-        do_nk = self.ft_nk_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_usd or do_mov or do_nk):
+        if not (do_ma or do_fbx or do_usd or do_mov):
             errors.append("No export format selected.")
 
         camera = (self.ft_camera_entries[0]["field"].text().strip()
@@ -10748,7 +10789,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = self.mm_usd_checkbox.isChecked()
         do_mov = self.mm_mov_checkbox.isChecked()
-        do_nk = self.mm_nk_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
 
@@ -10794,7 +10834,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov, do_nk])
+        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -11198,28 +11238,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 self._log_result("FBX", results.get("fbx", False))
                 self._advance_progress()
 
-            if do_nk:
-                nk_path = paths["nk"]
-                template_path = _nk_template_path()
-                self._log("Exporting Nuke .nk...")
-                raw_for_nk = (
-                    Exporter._get_image_plane_path(camera) or "")
-                plate_w, plate_h = \
-                    Exporter._get_image_plane_resolution(camera)
-                FolderManager.ensure_directories({"nk": nk_path})
-                # Reference standard alembic + playblast paths
-                # regardless of whether they're being exported this
-                # run -- the .nk picks them up if they exist.
-                results["nk"] = exporter.export_nk(
-                    nk_path, template_path,
-                    raw_plate=raw_for_nk,
-                    alembic=paths.get("abc", ""),
-                    playblast=paths.get("mp4", ""),
-                    start_frame=start_frame, end_frame=end_frame,
-                    plate_width=plate_w, plate_height=plate_h)
-                self._log_result("Nuke", results["nk"])
-                self._advance_progress()
-
         finally:
             # Undo Alembic camera bake (restores original connections)
             if baked_abc_cam:
@@ -11287,7 +11305,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_fbx = self.ft_fbx_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
         do_mov = self.ft_mov_checkbox.isChecked()
-        do_nk = self.ft_nk_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
 
@@ -11325,7 +11342,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum([do_ma, do_fbx, do_usd, do_mov, do_nk])
+        total_formats = sum([do_ma, do_fbx, do_usd, do_mov])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -11810,29 +11827,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     sys.stderr.write(
                         LOG_PREFIX + " Export error: "
                         "{}\n".format(exc))
-
-            if do_nk:
-                nk_path = paths["nk"]
-                template_path = _nk_template_path()
-                self._log("Exporting Nuke .nk...")
-                raw_for_nk = (
-                    Exporter._get_image_plane_path(camera) or "")
-                plate_w, plate_h = \
-                    Exporter._get_image_plane_resolution(camera)
-                FolderManager.ensure_directories({"nk": nk_path})
-                # Reference the standard playblast path regardless
-                # of whether it's being exported this run -- the
-                # .nk picks it up if/when it exists. Face Track
-                # has no ABC concept, so the alembic Read is left
-                # blank.
-                results["nk"] = exporter.export_nk(
-                    nk_path, template_path,
-                    raw_plate=raw_for_nk,
-                    playblast=paths.get("mp4", ""),
-                    start_frame=start_frame, end_frame=end_frame,
-                    plate_width=plate_w, plate_height=plate_h)
-                self._log_result("Nuke", results["nk"])
-                self._advance_progress()
 
         finally:
             # Restore from the pre-bake snapshot (replaces
