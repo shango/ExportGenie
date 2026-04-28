@@ -6150,6 +6150,43 @@ class Exporter(object):
         return w, h, pixels
 
     @staticmethod
+    def _read_exr_dimensions(path):
+        """Read just the dataWindow from an EXR header and return
+        (width, height). Returns None on any failure.
+
+        Lightweight: parses only enough of the header to find the
+        dataWindow attribute, then stops -- no decompression, no
+        scanline read.
+        """
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4096)
+            magic = head[:4]
+            if magic != b"\x76\x2f\x31\x01":
+                return None  # not an EXR
+            pos = 8
+            while pos < len(head):
+                end = head.index(b"\x00", pos)
+                attr_name = head[pos:end].decode("ascii", errors="replace")
+                pos = end + 1
+                if not attr_name:
+                    break
+                end = head.index(b"\x00", pos)
+                pos = end + 1  # skip type name
+                attr_size = struct.unpack("<I", head[pos:pos + 4])[0]
+                pos += 4
+                attr_data = head[pos:pos + attr_size]
+                pos += attr_size
+                if attr_name == "dataWindow" and len(attr_data) >= 16:
+                    x1, y1, x2, y2 = struct.unpack("<iiii", attr_data[:16])
+                    return (x2 - x1 + 1, y2 - y1 + 1)
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
     def _read_exr_float(path):
         """Minimal OpenEXR reader for scanline float/half EXRs.
 
@@ -7650,7 +7687,8 @@ class Exporter(object):
                     out_lines.extend(self._rewrite_nk_read_block(
                         block, rel_paths[asset_key],
                         is_seq, is_movie,
-                        start_frame, end_frame))
+                        start_frame, end_frame,
+                        plate_width, plate_height))
                 elif node_type == "Write":
                     # Substitute file knob if this Write has a
                     # default; either way strip OCIO knobs.
@@ -7666,6 +7704,9 @@ class Exporter(object):
                 elif node_type == "TimeOffset":
                     out_lines.extend(self._rewrite_nk_time_offset_block(
                         block, start_frame))
+                elif node_type == "Reformat":
+                    out_lines.extend(self._rewrite_nk_reformat_block(
+                        block, plate_width, plate_height))
                 else:
                     out_lines.extend(block)
 
@@ -7748,8 +7789,22 @@ class Exporter(object):
         return out
 
     @staticmethod
+    def _is_uhd_4k_format_line(ln):
+        """Return True if the line is a hardcoded UHD_4K format
+        knob value (i.e. starts a 3840 2160 format)."""
+        m = re.match(r'^ format "(\d+) (\d+)', ln)
+        return bool(m) and (m.group(1), m.group(2)) == ("3840", "2160")
+
+    @staticmethod
+    def _format_line_for(plate_w, plate_h, name="plate"):
+        """Return a Nuke format-knob line for the given dimensions."""
+        return (' format "{w} {h} 0 0 {w} {h} 1 {n}"'
+                .format(w=int(plate_w), h=int(plate_h), n=name))
+
+    @staticmethod
     def _rewrite_nk_read_block(block, rel_path, is_sequence, is_movie,
-                               start_frame, end_frame):
+                               start_frame, end_frame,
+                               plate_w=None, plate_h=None):
         """Rewrite `file` (and optionally frame range) on a Read/
         ReadGeo/Camera block.
 
@@ -7762,6 +7817,10 @@ class Exporter(object):
         For Camera3 / ReadGeo2 blocks, alembic-dynamic knobs are
         stripped (see _NK_ALEMBIC_DYNAMIC_KNOBS) so Nuke recreates
         them from the live alembic state on load.
+
+        Hardcoded UHD_4K `format` knobs are rewritten to the
+        working resolution (plate_w x plate_h) so the .nk reflects
+        the actual plate dims, not the template's 4K assumption.
         """
         # Movie file-internal range. Frame count = (end-start+1).
         movie_last = None
@@ -7777,6 +7836,10 @@ class Exporter(object):
             knob_match = knob_re.match(ln)
             if knob_match and knob_match.group(1) in dyn_knobs:
                 continue  # strip alembic-dynamic knob
+            if (plate_w and plate_h
+                    and Exporter._is_uhd_4k_format_line(ln)):
+                out.append(Exporter._format_line_for(plate_w, plate_h))
+                continue
             if ln.startswith(" file "):
                 if rel_path:
                     out.append(' file "{}"'.format(rel_path))
@@ -7806,6 +7869,25 @@ class Exporter(object):
             elif is_movie and ln.startswith(" origlast ") \
                     and movie_last is not None:
                 out.append(" origlast {}".format(movie_last))
+            else:
+                out.append(ln)
+        return out
+
+    @staticmethod
+    def _rewrite_nk_reformat_block(block, plate_w, plate_h):
+        """Rewrite a Reformat block's hardcoded UHD_4K `format` knob
+        to the working resolution. HD_1080 (1920x1080) Reformats
+        are left alone -- those are intentional delivery downscales
+        in the comp branch and shouldn't follow the working res.
+        Dynamic format expressions (`format {{...}}`) are also
+        skipped since they already follow another node's format.
+        """
+        if not (plate_w and plate_h):
+            return block
+        out = []
+        for ln in block:
+            if Exporter._is_uhd_4k_format_line(ln):
+                out.append(Exporter._format_line_for(plate_w, plate_h))
             else:
                 out.append(ln)
         return out
@@ -10128,6 +10210,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             chk_color = self.pb_checker_color_btn._color
             chk_opacity = self.pb_checker_opacity_spin.value()
             mb = self.pb_motion_blur_cb.isChecked()
+            wf_overlay = self.pb_wireframe_overlay_cb.isChecked()
+            wf_opacity = (
+                self.pb_wireframe_opacity_spin.value() / 100.0)
             if active_tab == TAB_MATCHMOVE:
                 geo_roots = [
                     p["geo_field"].text().strip()
@@ -10136,6 +10221,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 pb_kwargs.update(
                     matchmove_geo=geo_roots,
                     motion_blur=mb,
+                    composite_wireframe_overlay=wf_overlay,
+                    composite_wireframe_geo=geo_roots,
+                    composite_wireframe_opacity=wf_opacity,
                 )
             else:
                 face_meshes = [
@@ -10146,6 +10234,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     face_track_mode=True,
                     matchmove_geo=face_meshes,
                     motion_blur=mb,
+                    composite_wireframe_overlay=wf_overlay,
+                    composite_wireframe_geo=face_meshes,
+                    composite_wireframe_opacity=wf_opacity,
                 )
             pb_kwargs.update(
                 checker_scale=chk_scale,
@@ -10682,8 +10773,21 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 else:
                     raw_for_nk = raw_plate or image_plane
                     ud_for_nk = ""
-                plate_w, plate_h = \
-                    Exporter._get_image_plane_resolution(primary_camera)
+                # Working resolution for the .nk's project format:
+                # - STMap workflow -> raw plate dims (the undistorted
+                #   image plane may differ in resolution from the raw)
+                # - No-STMap workflow -> camera image plane dims
+                # Falls back to image-plane dims if the EXR header
+                # can't be read for whatever reason.
+                plate_w = plate_h = None
+                if have_stmaps and raw_for_nk:
+                    dims = Exporter._read_exr_dimensions(raw_for_nk)
+                    if dims:
+                        plate_w, plate_h = dims
+                if plate_w is None:
+                    plate_w, plate_h = \
+                        Exporter._get_image_plane_resolution(
+                            primary_camera)
                 FolderManager.ensure_directories({"nk": nk_path})
                 # Reference the standard playblast and alembic
                 # filenames whether or not they were exported this
