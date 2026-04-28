@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-3"
+TOOL_VERSION = "v14-beta-4"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -1325,23 +1325,35 @@ class Exporter(object):
                 idx=crown_idx, prev=prev_stage, out=crown_out)
             prev_stage = crown_out
         if wireframe_idx is not None:
-            # Screen-blend the wireframe pass. Maya's mesh wireframe
-            # color is typically a dark blue-gray (~0.2 luma), so the
-            # raw screen blend leaves the edges very faint. Boost the
-            # foreground by `wireframe_opacity / 0.2` first so a
-            # 0.2-luma edge lands at `wireframe_opacity` before
-            # screen-blending (effective opacity over dark areas;
-            # clamps cleanly over bright areas).
+            # Alpha-keyed overlay of the wireframe pass.
+            #
+            # Assumes the wireframe playblast PNG carries a useful
+            # alpha channel from the useBackground shader (alpha=1
+            # at the front-facing edges, 0 elsewhere). The wireframe
+            # RGB is boosted via lutrgb so Maya's dark default
+            # wireframe color (~0.2 luma) lands near-white at the
+            # edges, then the alpha is scaled by `wireframe_opacity`
+            # so the artist controls transparency directly. Final
+            # composite is a true alpha-over `overlay`, so edges
+            # remain visible even over bright areas of the comp
+            # (screen-blend would wash out there).
+            #
+            # If the playblast turns out NOT to carry meaningful
+            # alpha, this will white-wash the whole frame at the
+            # configured opacity -- in that case revert to the
+            # screen-blend approach (boost RGB, blend=all_mode=
+            # screen) which works on RGB-only data.
             wf_op = max(0.1, min(1.0, float(wireframe_opacity)))
-            wf_boost = wf_op / 0.2
+            wf_boost = 5.0  # 0.2 luma -> ~1.0; alpha controls visibility
             filter_complex += (
-                ";{prev}format=gbrp[wf_bg];"
-                "[{idx}:v]format=gbrp,"
-                "colorchannelmixer=rr={b}:gg={b}:bb={b}[wf_fg];"
-                "[wf_bg][wf_fg]blend=all_mode=screen,"
-                "format=rgba[out]"
+                ";{prev}format=rgba[wf_bg];"
+                "[{idx}:v]format=rgba,"
+                "lutrgb=r=val*{b}:g=val*{b}:b=val*{b},"
+                "colorchannelmixer=aa={op}[wf_fg];"
+                "[wf_bg][wf_fg]overlay=format=auto[out]"
             ).format(idx=wireframe_idx, prev=prev_stage,
-                     b="{:.3f}".format(wf_boost))
+                     b="{:.3f}".format(wf_boost),
+                     op="{:.3f}".format(wf_op))
 
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
@@ -1406,12 +1418,44 @@ class Exporter(object):
 
     @staticmethod
     def _cleanup_temp_pngs(png_dir):
-        """Delete a temporary PNG sequence directory."""
-        if os.path.isdir(png_dir):
+        """Delete a temporary PNG sequence directory.
+
+        Robust to Windows quirks: clears read-only attributes and
+        retries on PermissionError. Logs unrecoverable failures to
+        the Script Editor so they don't hide silently.
+        """
+        if not png_dir or not os.path.isdir(png_dir):
+            return
+
+        def _on_rm_error(func, path, exc_info):
+            # Common Windows case: file marked read-only or briefly
+            # locked. Clear the bit and retry.
             try:
-                shutil.rmtree(png_dir)
+                import stat as _stat
+                os.chmod(path, _stat.S_IWRITE | _stat.S_IREAD)
+                func(path)
             except Exception:
                 pass
+
+        try:
+            shutil.rmtree(png_dir, onerror=_on_rm_error)
+        except Exception as e:
+            sys.stderr.write(
+                "{} temp cleanup failed for {}: {}\n".format(
+                    LOG_PREFIX, png_dir, e))
+            return
+        # Verify it's actually gone -- onerror swallows individual
+        # file failures. If anything remains, surface it so the
+        # artist knows where the leftovers are.
+        if os.path.isdir(png_dir):
+            try:
+                remaining = os.listdir(png_dir)
+            except Exception:
+                remaining = ["<unreadable>"]
+            sys.stderr.write(
+                "{} temp dir not fully removed: {} ({} item(s) "
+                "remain)\n".format(
+                    LOG_PREFIX, png_dir, len(remaining)))
 
     @staticmethod
     def _is_descendant_of(node, ancestor):
@@ -3660,7 +3704,8 @@ class Exporter(object):
                          composite_wireframe_overlay=False,
                          composite_wireframe_geo=None,
                          composite_wireframe_opacity=0.9,
-                         resolution=None):
+                         resolution=None,
+                         shot_name=None):
         """Export a QC playblast.
 
         Supports H.264 .mov (via QuickTime), PNG image sequence, or
@@ -3874,11 +3919,12 @@ class Exporter(object):
                     except Exception:
                         pass
 
-            # Resolve plate name (camera image plane → top-left HUD)
-            hud_plate_name = ""
-            if camera:
-                hud_plate_name = Exporter._plate_name_from_path(
-                    Exporter._get_image_plane_path(camera))
+            # Top-left HUD label = the shot/export name the artist
+            # typed (e.g. "AVAL0007_pl01_charMM_v04"). Comes from the
+            # caller; we no longer derive it from the image plane
+            # path so the HUD reflects the export context, not
+            # whichever plate happens to be loaded on the camera.
+            hud_plate_name = shot_name or ""
 
             # --- HUD overlay for frame / focal length ---
             original_hud_vis = {}
@@ -5262,6 +5308,18 @@ class Exporter(object):
                             plate_name=hud_plate_name)
                     if encode_ok:
                         self._cleanup_temp_pngs(ct_tmp)
+                        # Camera Track routes through a system
+                        # tempdir, but the orchestrator still
+                        # pre-creates _tmp_mp4 next to the final
+                        # .mp4. If it's empty, remove it.
+                        if mp4_mode and file_path:
+                            mp4_tmp = os.path.dirname(file_path)
+                            try:
+                                if (os.path.isdir(mp4_tmp)
+                                        and not os.listdir(mp4_tmp)):
+                                    os.rmdir(mp4_tmp)
+                            except Exception:
+                                pass
                     else:
                         self.log(
                             "Encode failed  -- temp PNGs kept at "
@@ -7379,12 +7437,25 @@ class Exporter(object):
         "Camera1":             "alembic",
         "Camera2":             "alembic",
     }
-    # Subset that read image sequences / movies — these get
-    # first/last/origfirst/origlast rewritten to the shot range.
+    # Image-sequence Reads: file frame numbers equal timeline frame
+    # numbers (e.g. raw_plate_1001.exr -> raw_plate_1195.exr), so
+    # first/last/origfirst/origlast are rewritten to start/end_frame.
     _NK_SEQUENCE_NODES = frozenset({
         "Read_RAW_4K_PLATE", "Read_RAW_4K_PLATE1",
-        "Read_UD_PLATE", "Read_MAYA_PLAYBLAST",
+        "Read_UD_PLATE",
     })
+    # Movie Reads: the file's internal frames are 1..N regardless of
+    # the shot's timeline range, so last/origlast are rewritten to
+    # the shot's frame count, not its end frame. A separate
+    # TimeOffset node (see _NK_TIME_OFFSET_NODES) handles the
+    # timeline shift.
+    _NK_MOVIE_NODES = frozenset({
+        "Read_MAYA_PLAYBLAST",
+    })
+    # All TimeOffset nodes are treated as "shift the upstream movie
+    # to the shot's start frame": time_offset = start_frame - 1.
+    # Matched by node type rather than name so a non-1001 start
+    # frame doesn't leave a misleading template-baked label behind.
     # Write-node name → suffix appended to the .nk's basename to
     # form a default output filename in the same folder as the .nk.
     # Write nodes whose names aren't here are left untouched.
@@ -7424,10 +7495,78 @@ class Exporter(object):
         node's `file` knob blank — Nuke will report a missing file
         and the artist can repoint or delete the node.
         """
+        # Build the diagnostic context up front so every failure
+        # path can echo it to the Script Editor for support.
+        ctx = {
+            "tool_version": TOOL_VERSION,
+            "output_nk": file_path,
+            "output_dir_exists": os.path.isdir(
+                os.path.dirname(file_path)) if file_path else None,
+            "template": template_path,
+            "template_isfile": (bool(template_path)
+                                and os.path.isfile(template_path or "")),
+            "template_size": (os.path.getsize(template_path)
+                              if template_path
+                              and os.path.isfile(template_path)
+                              else None),
+            "raw_plate": raw_plate,
+            "ud_plate": ud_plate,
+            "stmap_undistort": stmap_undistort,
+            "stmap_redistort": stmap_redistort,
+            "alembic": alembic,
+            "playblast": playblast,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "plate_width": plate_width,
+            "plate_height": plate_height,
+        }
+        current_block = "<pre-parse>"
+
+        def _dump(reason, exc=None):
+            div = "=" * 64
+            buf = ["", div,
+                   "  Export Genie {} -- NUKE FAILED".format(TOOL_VERSION),
+                   div,
+                   "  Reason          : {}".format(reason),
+                   "  Last block seen : {}".format(current_block),
+                   "",
+                   "  Context:"]
+            for k in (
+                "tool_version", "output_nk", "output_dir_exists",
+                "template", "template_isfile", "template_size",
+                "raw_plate", "ud_plate",
+                "stmap_undistort", "stmap_redistort",
+                "alembic", "playblast",
+                "start_frame", "end_frame",
+                "plate_width", "plate_height",
+            ):
+                buf.append("    {:<18} = {!r}".format(k, ctx.get(k)))
+            buf.append("")
+            if exc is not None:
+                buf.append("  Traceback (most recent call last):")
+                buf.append(traceback.format_exc().rstrip("\n"))
+                buf.append("")
+            buf.append(div)
+            sys.stderr.write("\n".join(buf) + "\n\n")
+
         try:
-            if not template_path or not os.path.exists(template_path):
-                self._log("ERROR: Nuke template not found: {}".format(
-                    template_path))
+            if not template_path:
+                self.log("ERROR: Nuke template path is empty.")
+                _dump("template path argument was empty/None")
+                return False
+            if not os.path.isfile(template_path):
+                self.log(
+                    "ERROR: Nuke template not found: {}".format(
+                        template_path))
+                _dump(
+                    "template file does not exist or is not a "
+                    "regular file")
+                return False
+            if not os.access(template_path, os.R_OK):
+                self.log(
+                    "ERROR: Nuke template is not readable: {}".format(
+                        template_path))
+                _dump("template file exists but is not readable")
                 return False
 
             nk_dir = os.path.dirname(os.path.abspath(file_path))
@@ -7478,6 +7617,8 @@ class Exporter(object):
                     if nm:
                         block_name = nm.group(1)
                         break
+                current_block = "{} (name={})".format(
+                    node_type, block_name)
 
                 if node_type == "Root":
                     out_lines.extend(self._rewrite_nk_root(
@@ -7486,23 +7627,46 @@ class Exporter(object):
                 elif block_name in self._NK_NODE_TO_ASSET:
                     asset_key = self._NK_NODE_TO_ASSET[block_name]
                     is_seq = block_name in self._NK_SEQUENCE_NODES
+                    is_movie = block_name in self._NK_MOVIE_NODES
                     out_lines.extend(self._rewrite_nk_read_block(
                         block, rel_paths[asset_key],
-                        is_seq, start_frame, end_frame))
+                        is_seq, is_movie,
+                        start_frame, end_frame))
                 elif block_name in self._NK_WRITE_DEFAULTS:
                     suffix = self._NK_WRITE_DEFAULTS[block_name]
                     nk_stem = os.path.splitext(
                         os.path.basename(file_path))[0]
                     out_lines.extend(self._rewrite_nk_write_block(
                         block, nk_stem + suffix))
+                elif node_type == "TimeOffset":
+                    out_lines.extend(self._rewrite_nk_time_offset_block(
+                        block, start_frame))
                 else:
                     out_lines.extend(block)
 
-            with open(file_path, "w") as f:
-                f.write("\n".join(out_lines))
-                f.write("\n")
+            current_block = "<write output>"
+            try:
+                if not os.path.isdir(nk_dir):
+                    os.makedirs(nk_dir)
+            except Exception as mk_e:
+                _dump(
+                    "could not create output directory '{}': {}".format(
+                        nk_dir, mk_e),
+                    exc=mk_e)
+                return False
+            try:
+                with open(file_path, "w") as f:
+                    f.write("\n".join(out_lines))
+                    f.write("\n")
+            except Exception as wr_e:
+                _dump(
+                    "could not write .nk to '{}': {}".format(
+                        file_path, wr_e),
+                    exc=wr_e)
+                return False
             return True
         except Exception as e:
+            _dump("unhandled exception in export_nk: " + repr(e), exc=e)
             self._log_error("Nuke", e)
             return False
 
@@ -7543,9 +7707,23 @@ class Exporter(object):
         return out
 
     @staticmethod
-    def _rewrite_nk_read_block(block, rel_path, is_sequence,
+    def _rewrite_nk_read_block(block, rel_path, is_sequence, is_movie,
                                start_frame, end_frame):
-        """Rewrite `file` (and optionally frame range) on a Read/ReadGeo/Camera block."""
+        """Rewrite `file` (and optionally frame range) on a Read/
+        ReadGeo/Camera block.
+
+        For image sequences (is_sequence=True) the frame fields use
+        the shot's timeline range. For movie files (is_movie=True)
+        the frame fields use the movie's file-internal range
+        (1..N where N=end-start+1). For other Reads (alembic, etc.)
+        only the `file` knob is touched.
+        """
+        # Movie file-internal range. Frame count = (end-start+1).
+        movie_last = None
+        if (is_movie and start_frame is not None
+                and end_frame is not None):
+            movie_last = max(1, int(end_frame) - int(start_frame) + 1)
+
         out = []
         for ln in block:
             if ln.startswith(" file "):
@@ -7565,6 +7743,43 @@ class Exporter(object):
             elif is_sequence and ln.startswith(" origlast ") \
                     and end_frame is not None:
                 out.append(" origlast {}".format(int(end_frame)))
+            elif is_movie and ln.startswith(" first ") \
+                    and movie_last is not None:
+                out.append(" first 1")
+            elif is_movie and ln.startswith(" last ") \
+                    and movie_last is not None:
+                out.append(" last {}".format(movie_last))
+            elif is_movie and ln.startswith(" origfirst ") \
+                    and movie_last is not None:
+                out.append(" origfirst 1")
+            elif is_movie and ln.startswith(" origlast ") \
+                    and movie_last is not None:
+                out.append(" origlast {}".format(movie_last))
+            else:
+                out.append(ln)
+        return out
+
+    @staticmethod
+    def _rewrite_nk_time_offset_block(block, start_frame):
+        """Rewrite a TimeOffset block so a movie with file-internal
+        frames 1..N lands on the shot's start frame:
+        time_offset = (start_frame - 1).
+
+        Also rewrites the node's `name` knob to reflect the actual
+        start frame (e.g. ``TimeOffset_ToStartAtFrame1010``) so a
+        non-1001 shot doesn't leave the template's misleading
+        ``...Frame1001`` label behind.
+        """
+        if start_frame is None:
+            return block
+        offset = int(start_frame) - 1
+        new_name = "TimeOffset_ToStartAtFrame{}".format(int(start_frame))
+        out = []
+        for ln in block:
+            if ln.startswith(" time_offset "):
+                out.append(" time_offset {}".format(offset))
+            elif ln.startswith(" name "):
+                out.append(" name " + new_name)
             else:
                 out.append(ln)
         return out
@@ -8537,7 +8752,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.pb_wireframe_overlay_cb = QCheckBox(
             "  Wireframe Overlay (MM + Face Track only)")
-        self.pb_wireframe_overlay_cb.setChecked(False)
+        self.pb_wireframe_overlay_cb.setChecked(True)
         self.pb_wireframe_overlay_cb.setToolTip(
             "Composite the character mesh as a front-facing wireframe\n"
             "on top of the Matchmove / Face Track QC render. Uses a\n"
@@ -9844,6 +10059,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         frame = int(cmds.currentTime(query=True))
 
         # Build tab-specific keyword arguments
+        folder_name = self.export_name_field.text().strip()
         pb_kwargs = dict(
             raw_playblast=raw_pb,
             render_raw_srgb=not custom_vt,
@@ -9851,6 +10067,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             far_clip=far_clip,
             png_mode=True,
             show_hud=False,
+            shot_name=folder_name,
         )
 
         if active_tab == TAB_CAMERA_TRACK:
@@ -10399,37 +10616,53 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         msaa_16=aa16, far_clip=far_clip,
                         png_mode=png_mode, mp4_mode=mp4_mode,
                         mp4_output=paths.get("mp4"),
-                        show_hud=show_hud)
+                        show_hud=show_hud,
+                        shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
             if do_nk:
+                paths = FolderManager.build_export_paths(
+                    export_root, scene_base, version_str, tag="cam",
+                    folder_name=folder_name)
                 nk_path = paths["nk"]
                 template_path = _nk_template_path()
-                if not template_path:
-                    self._log(
-                        "Nuke .nk skipped -- template not found "
-                        "(expected at <plugin>/templates/).")
-                    results["nk"] = False
+                self._log("Exporting Nuke .nk...")
+                # With STMaps, the camera image plane is the
+                # undistorted plate. Without STMaps, the image
+                # plane is the raw plate.
+                image_plane = (
+                    Exporter._get_image_plane_path(primary_camera)
+                    or "")
+                have_stmaps = bool(
+                    stmap_undistort and stmap_redistort)
+                if have_stmaps:
+                    raw_for_nk = raw_plate or ""
+                    ud_for_nk = image_plane
                 else:
-                    self._log("Exporting Nuke .nk...")
-                    raw_for_nk = (raw_plate
-                                  or Exporter._get_image_plane_path(
-                                      primary_camera) or "")
-                    plate_w, plate_h = \
-                        Exporter._get_image_plane_resolution(primary_camera)
-                    FolderManager.ensure_directories({"nk": nk_path})
-                    results["nk"] = exporter.export_nk(
-                        nk_path, template_path,
-                        raw_plate=raw_for_nk,
-                        stmap_undistort=stmap_undistort or "",
-                        stmap_redistort=stmap_redistort or "",
-                        alembic=all_paths.get("abc", ""),
-                        playblast=all_paths.get("mov", ""),
-                        start_frame=start_frame, end_frame=end_frame,
-                        plate_width=plate_w, plate_height=plate_h)
-                    if results["nk"]:
-                        all_paths["nk"] = nk_path
-                    self._log_result("Nuke", results["nk"])
+                    raw_for_nk = raw_plate or image_plane
+                    ud_for_nk = ""
+                plate_w, plate_h = \
+                    Exporter._get_image_plane_resolution(primary_camera)
+                FolderManager.ensure_directories({"nk": nk_path})
+                # Reference the standard playblast and alembic
+                # filenames whether or not they were exported this
+                # run -- if the artist re-exports those formats
+                # later (or one already exists in the folder), the
+                # .nk picks them up automatically via the relative
+                # path.
+                results["nk"] = exporter.export_nk(
+                    nk_path, template_path,
+                    raw_plate=raw_for_nk,
+                    ud_plate=ud_for_nk,
+                    stmap_undistort=stmap_undistort or "",
+                    stmap_redistort=stmap_redistort or "",
+                    alembic=paths.get("abc", ""),
+                    playblast=paths.get("mp4") or paths.get("mov") or "",
+                    start_frame=start_frame, end_frame=end_frame,
+                    plate_width=plate_w, plate_height=plate_h)
+                if results["nk"]:
+                    all_paths["nk"] = nk_path
+                self._log_result("Nuke", results["nk"])
                 self._advance_progress()
         finally:
             # Undo bakes in reverse order (object tracks first,
@@ -10806,7 +11039,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             "composite_tmp"),
                         composite_wireframe_overlay=wf_overlay,
                         composite_wireframe_geo=geo_roots,
-                        composite_wireframe_opacity=wf_opacity)
+                        composite_wireframe_opacity=wf_opacity,
+                        shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
@@ -10967,28 +11201,23 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if do_nk:
                 nk_path = paths["nk"]
                 template_path = _nk_template_path()
-                if not template_path:
-                    self._log(
-                        "Nuke .nk skipped -- template not found "
-                        "(expected at <plugin>/templates/).")
-                    results["nk"] = False
-                else:
-                    self._log("Exporting Nuke .nk...")
-                    raw_for_nk = (
-                        Exporter._get_image_plane_path(camera) or "")
-                    plate_w, plate_h = \
-                        Exporter._get_image_plane_resolution(camera)
-                    FolderManager.ensure_directories({"nk": nk_path})
-                    pb_for_nk = paths.get("mp4", "") if do_mov else ""
-                    abc_for_nk = paths.get("abc", "") if do_abc else ""
-                    results["nk"] = exporter.export_nk(
-                        nk_path, template_path,
-                        raw_plate=raw_for_nk,
-                        alembic=abc_for_nk,
-                        playblast=pb_for_nk,
-                        start_frame=start_frame, end_frame=end_frame,
-                        plate_width=plate_w, plate_height=plate_h)
-                    self._log_result("Nuke", results["nk"])
+                self._log("Exporting Nuke .nk...")
+                raw_for_nk = (
+                    Exporter._get_image_plane_path(camera) or "")
+                plate_w, plate_h = \
+                    Exporter._get_image_plane_resolution(camera)
+                FolderManager.ensure_directories({"nk": nk_path})
+                # Reference standard alembic + playblast paths
+                # regardless of whether they're being exported this
+                # run -- the .nk picks them up if they exist.
+                results["nk"] = exporter.export_nk(
+                    nk_path, template_path,
+                    raw_plate=raw_for_nk,
+                    alembic=paths.get("abc", ""),
+                    playblast=paths.get("mp4", ""),
+                    start_frame=start_frame, end_frame=end_frame,
+                    plate_width=plate_w, plate_height=plate_h)
+                self._log_result("Nuke", results["nk"])
                 self._advance_progress()
 
         finally:
@@ -11337,7 +11566,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             "composite_tmp"),
                         composite_wireframe_overlay=wf_overlay,
                         composite_wireframe_geo=face_meshes,
-                        composite_wireframe_opacity=wf_opacity)
+                        composite_wireframe_opacity=wf_opacity,
+                        shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
@@ -11584,26 +11814,24 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if do_nk:
                 nk_path = paths["nk"]
                 template_path = _nk_template_path()
-                if not template_path:
-                    self._log(
-                        "Nuke .nk skipped -- template not found "
-                        "(expected at <plugin>/templates/).")
-                    results["nk"] = False
-                else:
-                    self._log("Exporting Nuke .nk...")
-                    raw_for_nk = (
-                        Exporter._get_image_plane_path(camera) or "")
-                    plate_w, plate_h = \
-                        Exporter._get_image_plane_resolution(camera)
-                    FolderManager.ensure_directories({"nk": nk_path})
-                    pb_for_nk = paths.get("mp4", "") if do_mov else ""
-                    results["nk"] = exporter.export_nk(
-                        nk_path, template_path,
-                        raw_plate=raw_for_nk,
-                        playblast=pb_for_nk,
-                        start_frame=start_frame, end_frame=end_frame,
-                        plate_width=plate_w, plate_height=plate_h)
-                    self._log_result("Nuke", results["nk"])
+                self._log("Exporting Nuke .nk...")
+                raw_for_nk = (
+                    Exporter._get_image_plane_path(camera) or "")
+                plate_w, plate_h = \
+                    Exporter._get_image_plane_resolution(camera)
+                FolderManager.ensure_directories({"nk": nk_path})
+                # Reference the standard playblast path regardless
+                # of whether it's being exported this run -- the
+                # .nk picks it up if/when it exists. Face Track
+                # has no ABC concept, so the alembic Read is left
+                # blank.
+                results["nk"] = exporter.export_nk(
+                    nk_path, template_path,
+                    raw_plate=raw_for_nk,
+                    playblast=paths.get("mp4", ""),
+                    start_frame=start_frame, end_frame=end_frame,
+                    plate_width=plate_w, plate_height=plate_h)
+                self._log_result("Nuke", results["nk"])
                 self._advance_progress()
 
         finally:
@@ -12061,6 +12289,44 @@ def install():
         installed_items.append((
             "ffmpeg NOT FOUND",
             "expected at {}".format(dest_ffmpeg)))
+
+    # Copy bundled templates/ directory (Nuke .nk template, etc.).
+    # The .nk exporter resolves its template via _nk_template_path,
+    # which expects <scripts_dir>/templates/ to exist.
+    source_templates = os.path.join(source_dir, "templates")
+    dest_templates = os.path.join(scripts_dir, "templates")
+    same_templates = False
+    try:
+        same_templates = (
+            os.path.isdir(dest_templates)
+            and os.path.samefile(source_templates, dest_templates))
+    except (OSError, ValueError):
+        same_templates = (os.path.normpath(source_templates)
+                          == os.path.normpath(dest_templates))
+    if os.path.isdir(source_templates) and not same_templates:
+        try:
+            shutil.copytree(
+                source_templates, dest_templates,
+                dirs_exist_ok=True)
+            for fname in sorted(os.listdir(dest_templates)):
+                fpath = os.path.join(dest_templates, fname)
+                if os.path.isfile(fpath):
+                    installed_items.append(("Template", fpath))
+        except Exception as exc:
+            installed_items.append((
+                "Templates COPY FAILED",
+                "{} -> {}: {}".format(
+                    source_templates, dest_templates, exc)))
+    elif not os.path.isdir(source_templates):
+        installed_items.append((
+            "Templates NOT FOUND in installer",
+            "expected at {}".format(source_templates)))
+    else:
+        # Same path -- already in scripts dir.
+        for fname in sorted(os.listdir(dest_templates)):
+            fpath = os.path.join(dest_templates, fname)
+            if os.path.isfile(fpath):
+                installed_items.append(("Template (in place)", fpath))
 
     # Clear compiled .pyc cache to ensure a fresh import.
     # Remove ALL ExportGenie .pyc/.pyo files  -- match broadly to
