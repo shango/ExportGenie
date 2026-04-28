@@ -1228,6 +1228,7 @@ class Exporter(object):
                           resolution=None,
                           crown_dir=None, crown_base=None,
                           wireframe_dir=None, wireframe_base=None,
+                          wireframe_opacity=0.9,
                           plate_name=None):
         """Composite passes (plate, color, matte, optional crown, optional wireframe) via ffmpeg.
 
@@ -1325,16 +1326,22 @@ class Exporter(object):
             prev_stage = crown_out
         if wireframe_idx is not None:
             # Screen-blend the wireframe pass. Maya's mesh wireframe
-            # color is typically a dark blue-gray (~0.2 luma), so using
-            # luma as alpha would render the edges nearly invisible.
-            # blend=all_mode=screen ignores black pixels entirely and
-            # brightens-over for any non-black pixel.
+            # color is typically a dark blue-gray (~0.2 luma), so the
+            # raw screen blend leaves the edges very faint. Boost the
+            # foreground by `wireframe_opacity / 0.2` first so a
+            # 0.2-luma edge lands at `wireframe_opacity` before
+            # screen-blending (effective opacity over dark areas;
+            # clamps cleanly over bright areas).
+            wf_op = max(0.1, min(1.0, float(wireframe_opacity)))
+            wf_boost = wf_op / 0.2
             filter_complex += (
                 ";{prev}format=gbrp[wf_bg];"
-                "[{idx}:v]format=gbrp[wf_fg];"
+                "[{idx}:v]format=gbrp,"
+                "colorchannelmixer=rr={b}:gg={b}:bb={b}[wf_fg];"
                 "[wf_bg][wf_fg]blend=all_mode=screen,"
                 "format=rgba[out]"
-            ).format(idx=wireframe_idx, prev=prev_stage)
+            ).format(idx=wireframe_idx, prev=prev_stage,
+                     b="{:.3f}".format(wf_boost))
 
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
@@ -3652,6 +3659,7 @@ class Exporter(object):
                          composite_tmp_dir=None,
                          composite_wireframe_overlay=False,
                          composite_wireframe_geo=None,
+                         composite_wireframe_opacity=0.9,
                          resolution=None):
         """Export a QC playblast.
 
@@ -5061,6 +5069,7 @@ class Exporter(object):
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
                             wireframe_base=c_wf_base,
+                            wireframe_opacity=composite_wireframe_opacity,
                             plate_name=hud_plate_name)
                     elif mp4_mode:
                         encode_ok = self._encode_composite(
@@ -5076,6 +5085,7 @@ class Exporter(object):
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
                             wireframe_base=c_wf_base,
+                            wireframe_opacity=composite_wireframe_opacity,
                             plate_name=hud_plate_name)
                     else:
                         # Composite output  -- use .mp4 on macOS for
@@ -5097,6 +5107,7 @@ class Exporter(object):
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
                             wireframe_base=c_wf_base,
+                            wireframe_opacity=composite_wireframe_opacity,
                             plate_name=hud_plate_name)
 
                     if encode_ok:
@@ -7799,6 +7810,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_color_btn = None
         self.pb_checker_scale_spin = None
         self.pb_checker_opacity_spin = None
+        self.pb_wireframe_opacity_spin = None
         # Matchmove tab (mm_)
         self.mm_camera_entries = []
         self.mm_camera_layout = None
@@ -8174,6 +8186,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
+        sep_p, preview_btn = self._build_preview_button_row()
+        tab_layout.addWidget(sep_p)
+        tab_layout.addWidget(preview_btn)
         tab_layout.addStretch()
         return tab
 
@@ -8317,6 +8332,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         tpose_row.addStretch()
         tab_layout.addLayout(tpose_row)
 
+        sep_p, preview_btn = self._build_preview_button_row()
+        tab_layout.addWidget(sep_p)
+        tab_layout.addWidget(preview_btn)
         tab_layout.addStretch()
         return tab
 
@@ -8431,6 +8449,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
+        sep_p, preview_btn = self._build_preview_button_row()
+        tab_layout.addWidget(sep_p)
+        tab_layout.addWidget(preview_btn)
         tab_layout.addStretch()
         return tab
 
@@ -8525,6 +8546,31 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             "Camera Track output.")
         mmft_layout.addWidget(self.pb_wireframe_overlay_cb)
 
+        # Wireframe overlay opacity slider (effective on dark areas).
+        wf_op_row = QHBoxLayout()
+        wf_op_row.setSpacing(8)
+        wf_op_row.addWidget(QLabel("Wireframe Opacity:"))
+        self.pb_wireframe_opacity_spin = QSpinBox()
+        self.pb_wireframe_opacity_spin.setRange(10, 100)
+        self.pb_wireframe_opacity_spin.setValue(90)
+        self.pb_wireframe_opacity_spin.setSuffix("%")
+        self.pb_wireframe_opacity_spin.setFixedWidth(60)
+        self.pb_wireframe_opacity_spin.setToolTip(
+            "Effective opacity of the wireframe edges over dark "
+            "areas of the composite. Maya wireframes are dark "
+            "(~20% luma) so the edges are boosted by "
+            "<opacity>/20% before screen-blending.")
+        wf_op_slider = QSlider(Qt.Horizontal)
+        wf_op_slider.setRange(10, 100)
+        wf_op_slider.setValue(90)
+        self.pb_wireframe_opacity_spin.valueChanged.connect(
+            wf_op_slider.setValue)
+        wf_op_slider.valueChanged.connect(
+            self.pb_wireframe_opacity_spin.setValue)
+        wf_op_row.addWidget(self.pb_wireframe_opacity_spin)
+        wf_op_row.addWidget(wf_op_slider)
+        mmft_layout.addLayout(wf_op_row)
+
         mmft_layout.addWidget(QLabel("QC Checker Overlay"))
 
         # Color
@@ -8581,19 +8627,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         mmft.setLayout(mmft_layout)
         tab_layout.addWidget(mmft)
-
-        # Render Preview
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.HLine)
-        sep3.setStyleSheet("color: #555;")
-        tab_layout.addWidget(sep3)
-        pb_preview_btn = QPushButton("Render Preview")
-        pb_preview_btn.setFixedHeight(28)
-        pb_preview_btn.setToolTip(
-            "Render current frame and open in image viewer.")
-        pb_preview_btn.clicked.connect(self._render_preview_frame)
-        self._preview_buttons.append(pb_preview_btn)
-        tab_layout.addWidget(pb_preview_btn)
 
         tab_layout.addStretch()
         return tab
@@ -9752,6 +9785,23 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
     # Render Preview
     # ------------------------------------------------------------------
 
+    def _build_preview_button_row(self):
+        """Build the (separator, button) widget pair for a tab's
+        bottom 'Render Preview' row. Each tab owns its own button;
+        all of them are tracked in self._preview_buttons so the
+        existing label-toggle logic flips them in unison.
+        """
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #555;")
+        btn = QPushButton("Render Preview")
+        btn.setFixedHeight(28)
+        btn.setToolTip(
+            "Render current frame and open in image viewer.")
+        btn.clicked.connect(self._render_preview_frame)
+        self._preview_buttons.append(btn)
+        return sep, btn
+
     def _render_preview_frame(self):
         """Render the current frame and open it in the system viewer."""
         import tempfile as _tf
@@ -10731,6 +10781,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     wf_overlay = (
                         self.pb_wireframe_overlay_cb.isChecked())
+                    wf_opacity = (
+                        self.pb_wireframe_opacity_spin.value() / 100.0)
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
@@ -10753,7 +10805,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_tmp_dir=paths.get(
                             "composite_tmp"),
                         composite_wireframe_overlay=wf_overlay,
-                        composite_wireframe_geo=geo_roots)
+                        composite_wireframe_geo=geo_roots,
+                        composite_wireframe_opacity=wf_opacity)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
@@ -11258,6 +11311,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     wf_overlay = (
                         self.pb_wireframe_overlay_cb.isChecked())
+                    wf_opacity = (
+                        self.pb_wireframe_opacity_spin.value() / 100.0)
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         face_track_mode=True,
@@ -11281,7 +11336,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_tmp_dir=paths.get(
                             "composite_tmp"),
                         composite_wireframe_overlay=wf_overlay,
-                        composite_wireframe_geo=face_meshes)
+                        composite_wireframe_geo=face_meshes,
+                        composite_wireframe_opacity=wf_opacity)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
 
