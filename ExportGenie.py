@@ -82,6 +82,15 @@ _THIRDPARTY_RENDERER_PLUGINS = {
     "substancenode",           # Substance (3rd-party builds)
 }
 
+# Path to the Nuke .nk template shipped alongside this script.
+# Resolved lazily so the module loads even if the template is missing.
+def _nk_template_path():
+    """Return the absolute path to the bundled Nuke template (or None)."""
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(
+        plugin_dir, "templates", "Nuke_UDQC_and_comp_template_v01.nk")
+    return candidate if os.path.exists(candidate) else None
+
 
 # Base64-encoded 32x32 RGBA PNG icon (purple-to-cyan gradient with export arrow and badge)
 ICON_DATA = (
@@ -217,7 +226,7 @@ class FolderManager(object):
         dir_name = folder_name if folder_name else scene_base_name
         dir_path = os.path.join(export_root, dir_name)
         for fmt, ext in [("ma", ".ma"), ("fbx", ".fbx"), ("abc", ".abc"),
-                         ("usd", ".usd")]:
+                         ("usd", ".usd"), ("nk", ".nk")]:
             file_name = "{base}_{tag}_{ver}{ext}".format(
                 base=scene_base_name, tag=tag, ver=version_str, ext=ext
             )
@@ -1014,7 +1023,7 @@ class Exporter(object):
         return None
 
     def _build_hud_drawtext(self, start_frame, focal_length=None,
-                            resolution=None):
+                            resolution=None, plate_name=None):
         """Build ffmpeg drawtext filter chain for metadata overlay.
 
         Returns a filter fragment (no leading/trailing semicolons)
@@ -1023,6 +1032,8 @@ class Exporter(object):
         Args:
             start_frame: First frame number (int).
             focal_length: Camera focal length in mm, or None.
+            plate_name: Plate identifier (e.g. SHOT_pl01_raw_v01) to
+                burn at the top-left. Empty/None -> no plate HUD.
 
         Returns:
             str: drawtext filter chain string.
@@ -1070,12 +1081,23 @@ class Exporter(object):
             ":x=w-tw-30:y=h-th-30"
         ).format(opts=font_opts, text=right_text)
 
-        return "[pre_hud]{frame},{meta}[out]".format(
-            frame=frame_dt, meta=meta_dt)
+        # Top-left: plate name (escape ffmpeg drawtext metachars).
+        plate_dt = None
+        if plate_name:
+            safe = plate_name.replace("\\", "\\\\").replace(
+                ":", "\\:").replace("'", "\\'").replace("%", "\\%")
+            plate_dt = (
+                "drawtext={opts}:text='{text}':x=30:y=30"
+            ).format(opts=font_opts, text=safe)
+
+        chain = "{frame},{meta}".format(frame=frame_dt, meta=meta_dt)
+        if plate_dt:
+            chain = "{plate},{rest}".format(plate=plate_dt, rest=chain)
+        return "[pre_hud]{}[out]".format(chain)
 
     def _encode_mp4(self, png_dir, png_base, start_frame, output_mp4,
                     show_hud=False, focal_length=None,
-                    resolution=None):
+                    resolution=None, plate_name=None):
         """Encode a PNG image sequence to H.264 .mp4 via bundled ffmpeg.
 
         Args:
@@ -1114,7 +1136,8 @@ class Exporter(object):
         vf_script = None
         if show_hud and self._has_drawtext():
             hud_filters = self._build_hud_drawtext(
-                start_frame, focal_length, resolution=resolution)
+                start_frame, focal_length, resolution=resolution,
+                plate_name=plate_name)
             # Strip stream labels  -- single-input uses plain vf
             vf_script = pad_filter + "," + hud_filters.replace(
                 "[pre_hud]", "").replace("[out]", "")
@@ -1204,7 +1227,8 @@ class Exporter(object):
                           show_hud=False, focal_length=None,
                           resolution=None,
                           crown_dir=None, crown_base=None,
-                          wireframe_dir=None, wireframe_base=None):
+                          wireframe_dir=None, wireframe_base=None,
+                          plate_name=None):
         """Composite passes (plate, color, matte, optional crown, optional wireframe) via ffmpeg.
 
         Uses the matte as an alpha channel on the solid-color pass,
@@ -1314,7 +1338,8 @@ class Exporter(object):
 
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
-                start_frame, focal_length, resolution=resolution)
+                start_frame, focal_length, resolution=resolution,
+                plate_name=plate_name)
             filter_complex = filter_complex.replace(
                 "[out]", "[pre_hud]")
             filter_complex += ";" + hud_chain
@@ -3841,6 +3866,12 @@ class Exporter(object):
                     except Exception:
                         pass
 
+            # Resolve plate name (camera image plane → top-left HUD)
+            hud_plate_name = ""
+            if camera:
+                hud_plate_name = Exporter._plate_name_from_path(
+                    Exporter._get_image_plane_path(camera))
+
             # --- HUD overlay for frame / focal length ---
             original_hud_vis = {}
             hud_names_to_remove = []
@@ -5029,7 +5060,8 @@ class Exporter(object):
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
-                            wireframe_base=c_wf_base)
+                            wireframe_base=c_wf_base,
+                            plate_name=hud_plate_name)
                     elif mp4_mode:
                         encode_ok = self._encode_composite(
                             plate_dir, plate_base,
@@ -5043,7 +5075,8 @@ class Exporter(object):
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
-                            wireframe_base=c_wf_base)
+                            wireframe_base=c_wf_base,
+                            plate_name=hud_plate_name)
                     else:
                         # Composite output  -- use .mp4 on macOS for
                         # reliable ffmpeg encoding; .mov on Windows.
@@ -5063,7 +5096,8 @@ class Exporter(object):
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
-                            wireframe_base=c_wf_base)
+                            wireframe_base=c_wf_base,
+                            plate_name=hud_plate_name)
 
                     if encode_ok:
                         # Cleanup composite temp dirs
@@ -5109,7 +5143,8 @@ class Exporter(object):
                             mp4_output,
                             show_hud=show_hud,
                             focal_length=hud_focal_length,
-                            resolution=(pb_width, pb_height))
+                            resolution=(pb_width, pb_height),
+                            plate_name=hud_plate_name)
                     elif png_mode:
                         # Burn HUD into PNG sequence via ffmpeg
                         out_dir = os.path.dirname(file_path)
@@ -5123,7 +5158,8 @@ class Exporter(object):
                         if show_hud and self._has_drawtext():
                             hud_f = self._build_hud_drawtext(
                                 start_frame, hud_focal_length,
-                                resolution=(pb_width, pb_height))
+                                resolution=(pb_width, pb_height),
+                                plate_name=hud_plate_name)
                             hud_filters = hud_f.replace(
                                 "[pre_hud]", "").replace(
                                 "[out]", "")
@@ -5211,7 +5247,8 @@ class Exporter(object):
                             ct_output,
                             show_hud=show_hud,
                             focal_length=hud_focal_length,
-                            resolution=(pb_width, pb_height))
+                            resolution=(pb_width, pb_height),
+                            plate_name=hud_plate_name)
                     if encode_ok:
                         self._cleanup_temp_pngs(ct_tmp)
                     else:
@@ -5771,6 +5808,101 @@ class Exporter(object):
             return None
         except Exception:
             return None
+
+    @staticmethod
+    def compute_far_distance(camera, geo_nodes,
+                             frames=None, padding=1.0):
+        """Return camera-to-farthest-geo-corner distance + padding,
+        sampled across the given frames. Returns None if no usable
+        camera+geo or zero distance.
+
+        Walks the world bounding box of `geo_nodes` at each frame
+        and measures the camera world position against all 8 BB
+        corners, taking the overall max. Restores currentTime.
+        """
+        nodes = [g for g in (geo_nodes or [])
+                 if g and cmds.objExists(g)]
+        if not nodes or not camera or not cmds.objExists(camera):
+            return None
+        if not frames:
+            frames = [cmds.currentTime(query=True)]
+        saved = cmds.currentTime(query=True)
+        max_d = 0.0
+        try:
+            for f in frames:
+                try:
+                    cmds.currentTime(f, edit=True)
+                except Exception:
+                    continue
+                try:
+                    bb = cmds.exactWorldBoundingBox(nodes)
+                    cam_pos = cmds.xform(
+                        camera, query=True, worldSpace=True,
+                        translation=True)
+                except Exception:
+                    continue
+                x0, y0, z0, x1, y1, z1 = bb
+                cx, cy, cz = cam_pos
+                for gx in (x0, x1):
+                    for gy in (y0, y1):
+                        for gz in (z0, z1):
+                            dx, dy, dz = gx - cx, gy - cy, gz - cz
+                            d2 = dx * dx + dy * dy + dz * dz
+                            if d2 > max_d * max_d:
+                                max_d = d2 ** 0.5
+        finally:
+            try:
+                cmds.currentTime(saved, edit=True)
+            except Exception:
+                pass
+        return (max_d + padding) if max_d > 0 else None
+
+    @staticmethod
+    def apply_camera_far_for_scene(camera, far_value, log_fn=None):
+        """Set camera.farClipPlane and all attached imagePlane.depth
+        to `far_value` in the live scene. No-op on empty inputs.
+        """
+        if not camera or far_value is None or not cmds.objExists(camera):
+            return
+        cam_shapes = cmds.listRelatives(
+            camera, shapes=True, type="camera") or []
+        for cs in cam_shapes:
+            try:
+                cmds.setAttr(cs + ".farClipPlane", float(far_value))
+            except Exception:
+                pass
+            try:
+                ips = cmds.listConnections(
+                    cs + ".imagePlane", type="imagePlane") or []
+            except Exception:
+                ips = []
+            for ip in ips:
+                try:
+                    cmds.setAttr(ip + ".depth", float(far_value))
+                except Exception:
+                    pass
+        if log_fn:
+            log_fn(
+                "{}: far clip + image plane depth set to {:.1f}".format(
+                    camera, float(far_value)))
+
+    @staticmethod
+    def _plate_name_from_path(path):
+        """Return the plate's basename with directory, frame-padding
+        token, and extension stripped.
+
+        Examples::
+            '/foo/SHOT_pl01_raw_v01_%04d.exr' -> 'SHOT_pl01_raw_v01'
+            '/foo/SHOT_pl01_raw_v01.####.exr' -> 'SHOT_pl01_raw_v01'
+            '/foo/SHOT_pl01_cam_v02.mp4'      -> 'SHOT_pl01_cam_v02'
+        """
+        if not path:
+            return ""
+        stem, _ = os.path.splitext(os.path.basename(path))
+        # Strip trailing padding tokens: _%04d, .####, _####, .%04d, etc.
+        stem = re.sub(r'[._]?%\d+d$', '', stem)
+        stem = re.sub(r'[._]?#+$', '', stem)
+        return stem
 
     @staticmethod
     def _get_image_plane_transforms(camera):
@@ -7215,6 +7347,217 @@ class Exporter(object):
             self._log_error("JSX", e)
             return False
 
+    # Node-name → asset-key mapping for the bundled Nuke template.
+    # Any Read/ReadGeo/Camera node whose `name` knob isn't in this
+    # map is left untouched at generation time (preserves the
+    # beeble pass Read so artists can repoint it).
+    # NOTE: "Read_RAW_4K_PLATE2" is intentionally absent — in the
+    # bundled template that node holds the beeble pass file path
+    # despite its misleading name. Leaving it out preserves the
+    # beeble Read for the artist to repoint.
+    _NK_NODE_TO_ASSET = {
+        "Read_RAW_4K_PLATE":   "raw_plate",
+        "Read_RAW_4K_PLATE1":  "raw_plate",
+        "Read_UD_PLATE":       "ud_plate",
+        "Read_UD_STMAP":       "stmap_undistort",
+        "Read_RD_STMAP":       "stmap_redistort",
+        "Read_RD_STMAP1":      "stmap_redistort",
+        "Read_MAYA_PLAYBLAST": "playblast",
+        "ReadGeo1":            "alembic",
+        "ReadGeo2":            "alembic",
+        "Camera1":             "alembic",
+        "Camera2":             "alembic",
+    }
+    # Subset that read image sequences / movies — these get
+    # first/last/origfirst/origlast rewritten to the shot range.
+    _NK_SEQUENCE_NODES = frozenset({
+        "Read_RAW_4K_PLATE", "Read_RAW_4K_PLATE1",
+        "Read_UD_PLATE", "Read_MAYA_PLAYBLAST",
+    })
+    # Write-node name → suffix appended to the .nk's basename to
+    # form a default output filename in the same folder as the .nk.
+    # Write nodes whose names aren't here are left untouched.
+    _NK_WRITE_DEFAULTS = {
+        "Write1": "_nukeQC.mov",
+    }
+
+    @staticmethod
+    def _nk_relpath(asset_path, nk_dir):
+        """Return asset_path relative to nk_dir, forward-slashed.
+
+        Falls back to the absolute path when relpath isn't possible
+        (e.g. different drives on Windows).
+        """
+        try:
+            rel = os.path.relpath(asset_path, nk_dir)
+        except ValueError:
+            rel = os.path.abspath(asset_path)
+        return rel.replace("\\", "/")
+
+    def export_nk(self, file_path, template_path,
+                  raw_plate=None, ud_plate=None,
+                  stmap_undistort=None, stmap_redistort=None,
+                  alembic=None, playblast=None,
+                  start_frame=None, end_frame=None,
+                  plate_width=None, plate_height=None):
+        """Generate a Nuke .nk script from the bundled template.
+
+        Rewrites Read/ReadGeo/Camera node `file` paths (relative to
+        the .nk's folder, forward-slashed), per-Read frame ranges
+        for sequence nodes, and the project-level Root node's
+        format/first_frame/last_frame/name. Any Read with a name
+        not in `_NK_NODE_TO_ASSET` (e.g. the beeble pass) is left
+        untouched.
+
+        Missing assets (None / empty) leave the corresponding Read
+        node's `file` knob blank — Nuke will report a missing file
+        and the artist can repoint or delete the node.
+        """
+        try:
+            if not template_path or not os.path.exists(template_path):
+                self._log("ERROR: Nuke template not found: {}".format(
+                    template_path))
+                return False
+
+            nk_dir = os.path.dirname(os.path.abspath(file_path))
+            assets = {
+                "raw_plate": raw_plate,
+                "ud_plate": ud_plate,
+                "stmap_undistort": stmap_undistort,
+                "stmap_redistort": stmap_redistort,
+                "alembic": alembic,
+                "playblast": playblast,
+            }
+            rel_paths = {}
+            for k, v in assets.items():
+                rel_paths[k] = self._nk_relpath(v, nk_dir) if v else ""
+
+            with open(template_path, "r") as f:
+                lines = f.read().splitlines()
+
+            # Top-level node block: NodeType { at column 0, ending } at col 0.
+            block_start_re = re.compile(r"^([A-Z][A-Za-z0-9_]*) \{$")
+            name_re = re.compile(r"^ name (\S+)\s*$")
+
+            out_lines = []
+            i = 0
+            n = len(lines)
+            while i < n:
+                line = lines[i]
+                m = block_start_re.match(line)
+                if not m:
+                    out_lines.append(line)
+                    i += 1
+                    continue
+
+                node_type = m.group(1)
+                block = [line]
+                i += 1
+                while i < n:
+                    bl = lines[i]
+                    block.append(bl)
+                    i += 1
+                    if bl.startswith("}"):
+                        break
+
+                # Identify block by its `name` knob.
+                block_name = None
+                for bl in block:
+                    nm = name_re.match(bl)
+                    if nm:
+                        block_name = nm.group(1)
+                        break
+
+                if node_type == "Root":
+                    out_lines.extend(self._rewrite_nk_root(
+                        block, file_path, start_frame, end_frame,
+                        plate_width, plate_height))
+                elif block_name in self._NK_NODE_TO_ASSET:
+                    asset_key = self._NK_NODE_TO_ASSET[block_name]
+                    is_seq = block_name in self._NK_SEQUENCE_NODES
+                    out_lines.extend(self._rewrite_nk_read_block(
+                        block, rel_paths[asset_key],
+                        is_seq, start_frame, end_frame))
+                elif block_name in self._NK_WRITE_DEFAULTS:
+                    suffix = self._NK_WRITE_DEFAULTS[block_name]
+                    nk_stem = os.path.splitext(
+                        os.path.basename(file_path))[0]
+                    out_lines.extend(self._rewrite_nk_write_block(
+                        block, nk_stem + suffix))
+                else:
+                    out_lines.extend(block)
+
+            with open(file_path, "w") as f:
+                f.write("\n".join(out_lines))
+                f.write("\n")
+            return True
+        except Exception as e:
+            self._log_error("Nuke", e)
+            return False
+
+    @staticmethod
+    def _rewrite_nk_root(block, nk_path, start_frame, end_frame,
+                         plate_w, plate_h):
+        """Rewrite Root node knobs: name, format, first/last_frame, frame."""
+        out = []
+        abs_nk = os.path.abspath(nk_path).replace("\\", "/")
+        for ln in block:
+            if ln.startswith(" name "):
+                out.append(" name " + abs_nk)
+            elif ln.startswith(" format ") and plate_w and plate_h:
+                out.append(' format "{w} {h} 0 0 {w} {h} 1 plate"'.format(
+                    w=int(plate_w), h=int(plate_h)))
+            elif ln.startswith(" first_frame ") and start_frame is not None:
+                out.append(" first_frame {}".format(int(start_frame)))
+            elif ln.startswith(" last_frame ") and end_frame is not None:
+                out.append(" last_frame {}".format(int(end_frame)))
+            elif ln.startswith(" frame ") and start_frame is not None:
+                out.append(" frame {}".format(int(start_frame)))
+            else:
+                out.append(ln)
+        return out
+
+    @staticmethod
+    def _rewrite_nk_write_block(block, rel_path):
+        """Rewrite the `file` knob on a Write block to a default
+        path relative to the .nk. Preserves the template's
+        no-quotes style for Write paths.
+        """
+        out = []
+        for ln in block:
+            if ln.startswith(" file "):
+                out.append(" file " + rel_path)
+            else:
+                out.append(ln)
+        return out
+
+    @staticmethod
+    def _rewrite_nk_read_block(block, rel_path, is_sequence,
+                               start_frame, end_frame):
+        """Rewrite `file` (and optionally frame range) on a Read/ReadGeo/Camera block."""
+        out = []
+        for ln in block:
+            if ln.startswith(" file "):
+                if rel_path:
+                    out.append(' file "{}"'.format(rel_path))
+                else:
+                    out.append(' file ""')
+            elif is_sequence and ln.startswith(" first ") \
+                    and start_frame is not None:
+                out.append(" first {}".format(int(start_frame)))
+            elif is_sequence and ln.startswith(" last ") \
+                    and end_frame is not None:
+                out.append(" last {}".format(int(end_frame)))
+            elif is_sequence and ln.startswith(" origfirst ") \
+                    and start_frame is not None:
+                out.append(" origfirst {}".format(int(start_frame)))
+            elif is_sequence and ln.startswith(" origlast ") \
+                    and end_frame is not None:
+                out.append(" origlast {}".format(int(end_frame)))
+            else:
+                out.append(ln)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # PySide2/6 Stylesheet
@@ -7444,6 +7787,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_abc_checkbox = None
         self.ct_usd_checkbox = None
         self.ct_mov_checkbox = None
+        self.ct_nk_checkbox = None
         # Playblast settings
         self.pb_raw_playblast_cb = None
         self.pb_custom_vt_cb = None
@@ -7471,6 +7815,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
+        self.mm_nk_checkbox = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -7487,6 +7832,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ft_fbx_checkbox = None
         self.ft_usd_checkbox = None
         self.ft_mov_checkbox = None
+        self.ft_nk_checkbox = None
         # Render preview state
         self._preview_buttons = []
         self._last_preview_tmp = None
@@ -7815,6 +8161,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.ct_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ct_mov_checkbox.setChecked(True)
+        self.ct_nk_checkbox = QCheckBox("  Nuke script (.nk)")
+        self.ct_nk_checkbox.setChecked(True)
 
         fmt_layout.addWidget(self.ct_ma_checkbox)
         fmt_layout.addWidget(self.ct_jsx_checkbox)
@@ -7822,6 +8170,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         fmt_layout.addWidget(self.ct_abc_checkbox)
         fmt_layout.addWidget(self.ct_usd_checkbox)
         fmt_layout.addWidget(self.ct_mov_checkbox)
+        fmt_layout.addWidget(self.ct_nk_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -7934,12 +8283,15 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.mm_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.mm_mov_checkbox.setChecked(True)
+        self.mm_nk_checkbox = QCheckBox("  Nuke script (.nk)")
+        self.mm_nk_checkbox.setChecked(True)
 
         fmt_layout.addWidget(self.mm_ma_checkbox)
         fmt_layout.addWidget(self.mm_fbx_checkbox)
         fmt_layout.addWidget(self.mm_abc_checkbox)
         fmt_layout.addWidget(self.mm_usd_checkbox)
         fmt_layout.addWidget(self.mm_mov_checkbox)
+        fmt_layout.addWidget(self.mm_nk_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -8068,11 +8420,14 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.ft_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ft_mov_checkbox.setChecked(True)
+        self.ft_nk_checkbox = QCheckBox("  Nuke script (.nk)")
+        self.ft_nk_checkbox.setChecked(True)
 
         fmt_layout.addWidget(self.ft_ma_checkbox)
         fmt_layout.addWidget(self.ft_fbx_checkbox)
         fmt_layout.addWidget(self.ft_usd_checkbox)
         fmt_layout.addWidget(self.ft_mov_checkbox)
+        fmt_layout.addWidget(self.ft_nk_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -8944,6 +9299,37 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         else:
             self._log("{} failed. See Script Editor.".format(label))
 
+    def _auto_fit_camera_far(self, cameras, geo_nodes,
+                             start_frame, end_frame):
+        """Set each camera's far clip + image plane depth so the
+        scene's farthest geo+1u sits inside the view volume.
+
+        Samples [start, mid, end] frames so animated cameras and
+        animated geo are both covered. Returns the largest far
+        value applied across all cameras (for downstream playblast),
+        or None if nothing was computed.
+        """
+        cams = [c for c in (cameras or [])
+                if c and cmds.objExists(c)]
+        if not cams or not geo_nodes:
+            return None
+        sf, ef = int(start_frame), int(end_frame)
+        if ef < sf:
+            sf, ef = ef, sf
+        mid = sf + (ef - sf) // 2
+        frames = sorted(set([sf, mid, ef]))
+        max_far = 0.0
+        for cam in cams:
+            far = Exporter.compute_far_distance(
+                cam, geo_nodes, frames=frames, padding=1.0)
+            if far is None:
+                continue
+            Exporter.apply_camera_far_for_scene(
+                cam, far, log_fn=self._log)
+            if far > max_far:
+                max_far = far
+        return max_far if max_far > 0 else None
+
     # ------------------------------------------------------------------
     # Progress Bar
     # ------------------------------------------------------------------
@@ -9040,7 +9426,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.ct_abc_checkbox.isChecked()
         do_usd = self.ct_usd_checkbox.isChecked()
         do_mov = self.ct_mov_checkbox.isChecked()
-        if not (do_ma or do_jsx or do_fbx or do_abc or do_usd or do_mov):
+        do_nk = self.ct_nk_checkbox.isChecked()
+        if not (do_ma or do_jsx or do_fbx or do_abc
+                or do_usd or do_mov or do_nk):
             errors.append("No export format selected.")
 
         cameras = []
@@ -9148,7 +9536,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = self.mm_usd_checkbox.isChecked()
         do_mov = self.mm_mov_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_abc or do_usd or do_mov):
+        do_nk = self.mm_nk_checkbox.isChecked()
+        if not (do_ma or do_fbx or do_abc or do_usd or do_mov or do_nk):
             errors.append("No export format selected.")
 
         camera = (self.mm_camera_entries[0]["field"].text().strip()
@@ -9238,7 +9627,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_fbx = self.ft_fbx_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
         do_mov = self.ft_mov_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_usd or do_mov):
+        do_nk = self.ft_nk_checkbox.isChecked()
+        if not (do_ma or do_fbx or do_usd or do_mov or do_nk):
             errors.append("No export format selected.")
 
         camera = (self.ft_camera_entries[0]["field"].text().strip()
@@ -9580,6 +9970,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.ct_abc_checkbox.isChecked()
         do_usd = self.ct_usd_checkbox.isChecked()
         do_mov = self.ct_mov_checkbox.isChecked()
+        do_nk = self.ct_nk_checkbox.isChecked()
         stmap_undistort = (self.ct_stmap_undistort_field.text().strip()
                           if self.ct_stmap_undistort_field else "")
         stmap_redistort = (self.ct_stmap_redistort_field.text().strip()
@@ -9588,6 +9979,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                      if self.ct_raw_plate_field else "")
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
+
+        # Auto-fit each camera's far clip + image plane depth to the
+        # farthest geo+tracked-object corner over the shot range, so
+        # distant geometry isn't occluded by the image plane.
+        ct_far = self._auto_fit_camera_far(
+            cameras, geo_roots + obj_tracks, start_frame, end_frame)
 
         folder_name = self.export_name_field.text().strip()
         scene_base, version_str = VersionParser.parse_folder_name(
@@ -9604,7 +10001,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         results = {}
         all_paths = {}
 
-        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
+        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov, do_nk])
         if do_jsx:
             total_formats += 2
         self._reset_progress(total_formats)
@@ -9938,6 +10335,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     wf_shader = self.pb_wireframe_shader_cb.isChecked()
                     aa16 = self.pb_aa16_cb.isChecked()
                     far_clip = self.pb_far_clip_spin.value()
+                    if ct_far is not None:
+                        far_clip = max(far_clip, int(ct_far) + 1)
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     results["mov"] = exporter.export_playblast(
                         pb_path, primary_camera,
@@ -9952,6 +10351,35 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         mp4_output=paths.get("mp4"),
                         show_hud=show_hud)
                     self._log_result("Playblast", results["mov"])
+                self._advance_progress()
+            if do_nk:
+                nk_path = paths["nk"]
+                template_path = _nk_template_path()
+                if not template_path:
+                    self._log(
+                        "Nuke .nk skipped -- template not found "
+                        "(expected at <plugin>/templates/).")
+                    results["nk"] = False
+                else:
+                    self._log("Exporting Nuke .nk...")
+                    raw_for_nk = (raw_plate
+                                  or Exporter._get_image_plane_path(
+                                      primary_camera) or "")
+                    plate_w, plate_h = \
+                        Exporter._get_image_plane_resolution(primary_camera)
+                    FolderManager.ensure_directories({"nk": nk_path})
+                    results["nk"] = exporter.export_nk(
+                        nk_path, template_path,
+                        raw_plate=raw_for_nk,
+                        stmap_undistort=stmap_undistort or "",
+                        stmap_redistort=stmap_redistort or "",
+                        alembic=all_paths.get("abc", ""),
+                        playblast=all_paths.get("mov", ""),
+                        start_frame=start_frame, end_frame=end_frame,
+                        plate_width=plate_w, plate_height=plate_h)
+                    if results["nk"]:
+                        all_paths["nk"] = nk_path
+                    self._log_result("Nuke", results["nk"])
                 self._advance_progress()
         finally:
             # Undo bakes in reverse order (object tracks first,
@@ -10037,8 +10465,15 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = self.mm_usd_checkbox.isChecked()
         do_mov = self.mm_mov_checkbox.isChecked()
+        do_nk = self.mm_nk_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
+
+        # Auto-fit camera far clip + image plane depth to scene extent.
+        mm_far = self._auto_fit_camera_far(
+            [camera] if camera else [],
+            geo_roots + rig_roots + proxy_geos,
+            start_frame, end_frame)
 
         tpose_start = start_frame
         if self.tpose_checkbox.isChecked():
@@ -10076,7 +10511,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
+        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov, do_nk])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -10291,6 +10726,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     aa16 = self.pb_aa16_cb.isChecked()
                     mb = self.pb_motion_blur_cb.isChecked()
                     far_clip = self.pb_far_clip_spin.value()
+                    if mm_far is not None:
+                        far_clip = max(far_clip, int(mm_far) + 1)
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     wf_overlay = (
                         self.pb_wireframe_overlay_cb.isChecked())
@@ -10474,6 +10911,33 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 self._log_result("FBX", results.get("fbx", False))
                 self._advance_progress()
 
+            if do_nk:
+                nk_path = paths["nk"]
+                template_path = _nk_template_path()
+                if not template_path:
+                    self._log(
+                        "Nuke .nk skipped -- template not found "
+                        "(expected at <plugin>/templates/).")
+                    results["nk"] = False
+                else:
+                    self._log("Exporting Nuke .nk...")
+                    raw_for_nk = (
+                        Exporter._get_image_plane_path(camera) or "")
+                    plate_w, plate_h = \
+                        Exporter._get_image_plane_resolution(camera)
+                    FolderManager.ensure_directories({"nk": nk_path})
+                    pb_for_nk = paths.get("mp4", "") if do_mov else ""
+                    abc_for_nk = paths.get("abc", "") if do_abc else ""
+                    results["nk"] = exporter.export_nk(
+                        nk_path, template_path,
+                        raw_plate=raw_for_nk,
+                        alembic=abc_for_nk,
+                        playblast=pb_for_nk,
+                        start_frame=start_frame, end_frame=end_frame,
+                        plate_width=plate_w, plate_height=plate_h)
+                    self._log_result("Nuke", results["nk"])
+                self._advance_progress()
+
         finally:
             # Undo Alembic camera bake (restores original connections)
             if baked_abc_cam:
@@ -10541,8 +11005,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_fbx = self.ft_fbx_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
         do_mov = self.ft_mov_checkbox.isChecked()
+        do_nk = self.ft_nk_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
+
+        # Auto-fit camera far clip + image plane depth to scene extent.
+        ft_geo_for_far = list(face_meshes)
+        if static_geo:
+            ft_geo_for_far.append(static_geo)
+        ft_far = self._auto_fit_camera_far(
+            [camera] if camera else [], ft_geo_for_far,
+            start_frame, end_frame)
 
         folder_name = self.export_name_field.text().strip()
         scene_base, version_str = VersionParser.parse_folder_name(
@@ -10570,7 +11043,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum([do_ma, do_fbx, do_usd, do_mov])
+        total_formats = sum([do_ma, do_fbx, do_usd, do_mov, do_nk])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -10780,6 +11253,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     aa16 = self.pb_aa16_cb.isChecked()
                     mb = self.pb_motion_blur_cb.isChecked()
                     far_clip = self.pb_far_clip_spin.value()
+                    if ft_far is not None:
+                        far_clip = max(far_clip, int(ft_far) + 1)
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     wf_overlay = (
                         self.pb_wireframe_overlay_cb.isChecked())
@@ -11049,6 +11524,31 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     sys.stderr.write(
                         LOG_PREFIX + " Export error: "
                         "{}\n".format(exc))
+
+            if do_nk:
+                nk_path = paths["nk"]
+                template_path = _nk_template_path()
+                if not template_path:
+                    self._log(
+                        "Nuke .nk skipped -- template not found "
+                        "(expected at <plugin>/templates/).")
+                    results["nk"] = False
+                else:
+                    self._log("Exporting Nuke .nk...")
+                    raw_for_nk = (
+                        Exporter._get_image_plane_path(camera) or "")
+                    plate_w, plate_h = \
+                        Exporter._get_image_plane_resolution(camera)
+                    FolderManager.ensure_directories({"nk": nk_path})
+                    pb_for_nk = paths.get("mp4", "") if do_mov else ""
+                    results["nk"] = exporter.export_nk(
+                        nk_path, template_path,
+                        raw_plate=raw_for_nk,
+                        playblast=pb_for_nk,
+                        start_frame=start_frame, end_frame=end_frame,
+                        plate_width=plate_w, plate_height=plate_h)
+                    self._log_result("Nuke", results["nk"])
+                self._advance_progress()
 
         finally:
             # Restore from the pre-bake snapshot (replaces
