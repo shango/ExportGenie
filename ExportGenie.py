@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-7"
+TOOL_VERSION = "v14-beta-8"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -82,13 +82,17 @@ _THIRDPARTY_RENDERER_PLUGINS = {
     "substancenode",           # Substance (3rd-party builds)
 }
 
-# Path to the Nuke .nk template shipped alongside this script.
-# Resolved lazily so the module loads even if the template is missing.
-def _nk_template_path():
-    """Return the absolute path to the bundled Nuke template (or None)."""
+# Path to the bundled Nuke template. Two flavors:
+#  - have_stmaps=True  -> ud_qc_v01_.nk: full undistort/redistort QC pipe.
+#  - have_stmaps=False -> qc_v01_.nk: minimal raw-plate + alembic + playblast
+#    pipe, no STMap branches.
+# Resolved lazily so the module loads even if a template is missing.
+def _nk_template_path(have_stmaps=True):
+    """Return the absolute path to the bundled Nuke template, or None
+    if it's not present alongside the plugin."""
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(
-        plugin_dir, "templates", "ud_qc_v01_.nk")
+    fname = "ud_qc_v01_.nk" if have_stmaps else "qc_v01_.nk"
+    candidate = os.path.join(plugin_dir, "templates", fname)
     return candidate if os.path.exists(candidate) else None
 
 
@@ -1578,9 +1582,40 @@ class Exporter(object):
             pass
 
     @staticmethod
+    def _is_locator_only_subtree(node):
+        """Return True if `node`'s subtree (itself + all descendants)
+        contains at least one shape and every shape is a locator.
+
+        Used to identify tracking-marker transforms / groups that
+        must be skipped by the freeze sweep -- artists need the
+        markers' world-space positions preserved, and freezing
+        would push the parent TRS down into the locator children.
+        Empty groups (no shapes anywhere) are NOT treated as
+        markers; freezing them is a no-op so they fall through to
+        the normal path.
+        """
+        all_shapes = cmds.listRelatives(
+            node, allDescendents=True, shapes=True,
+            fullPath=True) or []
+        if not all_shapes:
+            return False
+        for shp in all_shapes:
+            try:
+                if cmds.nodeType(shp) != "locator":
+                    return False
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
     def _freeze_static_geo_transforms(proxy_geos):
         """Freeze TRS on each static/proxy geo so exports get identity
         root transforms (world-space position is baked into the shape).
+
+        Tracking-marker transforms (those whose subtree contains only
+        locator shapes) are skipped so their world-space positions
+        survive into the export -- artists rely on them as scene-space
+        reference points.
 
         Caller is responsible for reverting via an undo chunk or
         snapshot restore  -- this function does NOT preserve the
@@ -1592,6 +1627,11 @@ class Exporter(object):
         count = 0
         for geo in proxy_geos or []:
             if not geo or not cmds.objExists(geo):
+                continue
+            if Exporter._is_locator_only_subtree(geo):
+                sys.stderr.write(
+                    LOG_PREFIX + " Skipping freeze on tracking "
+                    "marker '{}' (locator-only subtree)\n".format(geo))
                 continue
             try:
                 cmds.makeIdentity(
@@ -5336,7 +5376,7 @@ class Exporter(object):
                         self.log(
                             "Encode failed  -- temp PNGs kept at "
                             "{}".format(ct_tmp))
-                return True
+                return encode_ok
             finally:
                 # --- Restore Camera Track overrides ---
                 for flag, val in original_editor_vis.items():
@@ -10870,45 +10910,52 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     export_root, scene_base, version_str, tag="cam",
                     folder_name=folder_name)
                 nk_path = paths["nk"]
-                template_path = _nk_template_path()
-                self._log("Exporting Nuke .nk...")
                 # With STMaps, the camera image plane is the
                 # undistorted plate. Without STMaps, the image
-                # plane is the raw plate.
+                # plane IS the raw plate (no separate UD step).
                 image_plane = (
                     Exporter._get_image_plane_path(primary_camera)
                     or "")
                 have_stmaps = bool(
                     stmap_undistort and stmap_redistort)
+                template_path = _nk_template_path(
+                    have_stmaps=have_stmaps)
+                self._log("Exporting Nuke .nk...")
                 if have_stmaps:
                     raw_for_nk = raw_plate or ""
                     ud_for_nk = image_plane
                 else:
                     raw_for_nk = raw_plate or image_plane
                     ud_for_nk = ""
-                # Per-asset dims for the .nk Reads/Reformats:
-                #  - ud_plate (and ud_stmap) come from the camera's
-                #    image plane, where the matchmove pipeline
-                #    stores the undistorted plate.
-                #  - raw_plate (and rd_stmap) come from sniffing the
-                #    raw EXR header; if that fails, fall back by
-                #    size class against the ud dims (raw is either
-                #    HD or 4K UHD on this show).
+                # Per-asset dims for the .nk Reads/Reformats.
+                #  - ud_dims = camera image plane resolution.
+                #    With STMaps that's the undistorted plate; without
+                #    STMaps that IS the raw plate.
+                #  - raw_dims = preferred from sniffing whatever EXR
+                #    we plan to wire into the raw_plate Read; if the
+                #    sniff fails, fall back per workflow:
+                #      * have_stmaps  -> size-class rule (raw is HD
+                #        or 4K UHD on this show, ud may be larger
+                #        because of the undistort margin)
+                #      * no STMaps    -> raw == ud (same image)
                 # Working resolution for the .nk's project format:
-                #  - STMap workflow -> raw plate dims
+                #  - STMap workflow    -> raw plate dims
                 #  - No-STMap workflow -> ud_plate (image plane) dims
                 ud_dims = Exporter._get_image_plane_resolution(
                     primary_camera)
                 raw_dims = None
-                if have_stmaps and raw_for_nk:
+                if raw_for_nk:
                     raw_dims = Exporter._read_exr_dimensions(
                         raw_for_nk)
                 if raw_dims is None and ud_dims:
-                    ud_w = int(ud_dims[0])
-                    if ud_w >= 3840:
-                        raw_dims = (3840, 2160)
-                    elif ud_w >= 1920:
-                        raw_dims = (1920, 1080)
+                    if have_stmaps:
+                        ud_w = int(ud_dims[0])
+                        if ud_w >= 3840:
+                            raw_dims = (3840, 2160)
+                        elif ud_w >= 1920:
+                            raw_dims = (1920, 1080)
+                        else:
+                            raw_dims = ud_dims
                     else:
                         raw_dims = ud_dims
                 if have_stmaps:
