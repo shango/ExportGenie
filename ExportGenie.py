@@ -10913,9 +10913,34 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 # With STMaps, the camera image plane is the
                 # undistorted plate. Without STMaps, the image
                 # plane IS the raw plate (no separate UD step).
-                image_plane = (
+                # Maya's `.imageName` always stores the currently
+                # displayed concrete frame (sequence playback is
+                # driven separately by `useFrameExtension`), so
+                # for the .nk Read knob we swap the trailing frame
+                # number out for `####` to get a proper Nuke
+                # sequence pattern. The artist-supplied raw_plate
+                # is trusted to already be in pattern form.
+                image_plane_concrete = (
                     Exporter._get_image_plane_path(primary_camera)
                     or "")
+                if image_plane_concrete:
+                    ip_dir = os.path.dirname(image_plane_concrete)
+                    ip_base = os.path.basename(image_plane_concrete)
+                    m = re.match(
+                        r"^(.+?)([._])(\d+)(\.[A-Za-z0-9]+)$",
+                        ip_base)
+                    if m:
+                        stem, sep, digits, ext = m.groups()
+                        ip_seq_base = (stem + sep
+                                       + ("#" * len(digits))
+                                       + ext)
+                        image_plane = os.path.join(
+                            ip_dir, ip_seq_base) if ip_dir \
+                            else ip_seq_base
+                    else:
+                        image_plane = image_plane_concrete
+                else:
+                    image_plane = ""
                 have_stmaps = bool(
                     stmap_undistort and stmap_redistort)
                 template_path = _nk_template_path(
@@ -10943,10 +10968,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 #  - No-STMap workflow -> ud_plate (image plane) dims
                 ud_dims = Exporter._get_image_plane_resolution(
                     primary_camera)
+                # Sniff the raw EXR for dims. If raw_for_nk is the
+                # IP-derived `####` pattern, sniff the original
+                # concrete frame instead -- _read_exr_dimensions
+                # needs a real file on disk, not a token.
+                raw_sniff_path = raw_for_nk
+                if (raw_for_nk
+                        and raw_for_nk == image_plane
+                        and image_plane_concrete):
+                    raw_sniff_path = image_plane_concrete
                 raw_dims = None
-                if raw_for_nk:
+                if raw_sniff_path:
                     raw_dims = Exporter._read_exr_dimensions(
-                        raw_for_nk)
+                        raw_sniff_path)
                 if raw_dims is None and ud_dims:
                     if have_stmaps:
                         ud_w = int(ud_dims[0])
