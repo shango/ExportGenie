@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-5"
+TOOL_VERSION = "v14-beta-7"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -88,7 +88,7 @@ def _nk_template_path():
     """Return the absolute path to the bundled Nuke template (or None)."""
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     candidate = os.path.join(
-        plugin_dir, "templates", "Nuke_UDQC_and_comp_template_v01.nk")
+        plugin_dir, "templates", "ud_qc_v01_.nk")
     return candidate if os.path.exists(candidate) else None
 
 
@@ -1229,6 +1229,7 @@ class Exporter(object):
                           crown_dir=None, crown_base=None,
                           wireframe_dir=None, wireframe_base=None,
                           wireframe_opacity=0.9,
+                          wireframe_color=(0.6, 0.1, 0.1),
                           plate_name=None):
         """Composite passes (plate, color, matte, optional crown, optional wireframe) via ffmpeg.
 
@@ -1344,15 +1345,22 @@ class Exporter(object):
             # screen-blend approach (boost RGB, blend=all_mode=
             # screen) which works on RGB-only data.
             wf_op = max(0.1, min(1.0, float(wireframe_opacity)))
-            wf_boost = 5.0  # 0.2 luma -> ~1.0; alpha controls visibility
+            # Maya wireframe luma ~0.2; multiply per channel to land
+            # on the requested color (0.2 * 5 = 1.0).
+            wf_boost = 5.0
+            wf_r = max(0.0, float(wireframe_color[0])) * wf_boost
+            wf_g = max(0.0, float(wireframe_color[1])) * wf_boost
+            wf_b = max(0.0, float(wireframe_color[2])) * wf_boost
             filter_complex += (
                 ";{prev}format=rgba[wf_bg];"
                 "[{idx}:v]format=rgba,"
-                "lutrgb=r=val*{b}:g=val*{b}:b=val*{b},"
+                "lutrgb=r=val*{r}:g=val*{g}:b=val*{b},"
                 "colorchannelmixer=aa={op}[wf_fg];"
                 "[wf_bg][wf_fg]overlay=format=auto[out]"
             ).format(idx=wireframe_idx, prev=prev_stage,
-                     b="{:.3f}".format(wf_boost),
+                     r="{:.3f}".format(wf_r),
+                     g="{:.3f}".format(wf_g),
+                     b="{:.3f}".format(wf_b),
                      op="{:.3f}".format(wf_op))
 
         if show_hud and self._has_drawtext():
@@ -3704,6 +3712,7 @@ class Exporter(object):
                          composite_wireframe_overlay=False,
                          composite_wireframe_geo=None,
                          composite_wireframe_opacity=0.9,
+                         composite_wireframe_color=(0.6, 0.1, 0.1),
                          resolution=None,
                          shot_name=None):
         """Export a QC playblast.
@@ -5116,6 +5125,7 @@ class Exporter(object):
                             wireframe_dir=c_wf_dir,
                             wireframe_base=c_wf_base,
                             wireframe_opacity=composite_wireframe_opacity,
+                            wireframe_color=composite_wireframe_color,
                             plate_name=hud_plate_name)
                     elif mp4_mode:
                         encode_ok = self._encode_composite(
@@ -5132,6 +5142,7 @@ class Exporter(object):
                             wireframe_dir=c_wf_dir,
                             wireframe_base=c_wf_base,
                             wireframe_opacity=composite_wireframe_opacity,
+                            wireframe_color=composite_wireframe_color,
                             plate_name=hud_plate_name)
                     else:
                         # Composite output  -- use .mp4 on macOS for
@@ -5154,6 +5165,7 @@ class Exporter(object):
                             wireframe_dir=c_wf_dir,
                             wireframe_base=c_wf_base,
                             wireframe_opacity=composite_wireframe_opacity,
+                            wireframe_color=composite_wireframe_color,
                             plate_name=hud_plate_name)
 
                     if encode_ok:
@@ -7453,33 +7465,34 @@ class Exporter(object):
             self._log_error("JSX", e)
             return False
 
-    # Node-name → asset-key mapping for the bundled Nuke template.
-    # Any Read/ReadGeo/Camera node whose `name` knob isn't in this
-    # map is left untouched at generation time (preserves the
-    # beeble pass Read so artists can repoint it).
-    # NOTE: "Read_RAW_4K_PLATE2" is intentionally absent — in the
-    # bundled template that node holds the beeble pass file path
-    # despite its misleading name. Leaving it out preserves the
-    # beeble Read for the artist to repoint.
+    # Node-name → asset-key mapping for the bundled Nuke template
+    # (templates/ud_qc_v01_.nk). Any Read/ReadGeo/Camera node whose
+    # `name` knob isn't in this map is left untouched at generation
+    # time.
     _NK_NODE_TO_ASSET = {
-        "Read_RAW_4K_PLATE":   "raw_plate",
-        "Read_RAW_4K_PLATE1":  "raw_plate",
-        "Read_UD_PLATE":       "ud_plate",
-        "Read_UD_STMAP":       "stmap_undistort",
-        "Read_RD_STMAP":       "stmap_redistort",
-        "Read_RD_STMAP1":      "stmap_redistort",
-        "Read_MAYA_PLAYBLAST": "playblast",
-        "ReadGeo1":            "alembic",
-        "ReadGeo2":            "alembic",
-        "Camera1":             "alembic",
-        "Camera2":             "alembic",
+        "raw_plate": "raw_plate",
+        "ud_plate":  "ud_plate",
+        "rd_stmap":  "stmap_redistort",
+        "ud_stmap":  "stmap_undistort",
+        "playblast": "playblast",
+        "alembic":   "alembic",
+        "Camera1":   "alembic",
+    }
+    # Reformat-name → asset-key whose dimensions drive the `format`
+    # knob. Names follow a `set_<element>_res` convention defined in
+    # the template. set_HD is intentionally absent — it's a fixed
+    # 1920x1080 delivery downscale.
+    _NK_REFORMAT_TO_ASSET = {
+        "set_plate_res":     "raw_plate",
+        "set_plate_res2":    "raw_plate",
+        "set_ud_plate_res":  "ud_plate",
+        "set_ud_stmap_res":  "ud_stmap",
     }
     # Image-sequence Reads: file frame numbers equal timeline frame
     # numbers (e.g. raw_plate_1001.exr -> raw_plate_1195.exr), so
     # first/last/origfirst/origlast are rewritten to start/end_frame.
     _NK_SEQUENCE_NODES = frozenset({
-        "Read_RAW_4K_PLATE", "Read_RAW_4K_PLATE1",
-        "Read_UD_PLATE",
+        "raw_plate", "ud_plate",
     })
     # Movie Reads: the file's internal frames are 1..N regardless of
     # the shot's timeline range, so last/origlast are rewritten to
@@ -7487,7 +7500,7 @@ class Exporter(object):
     # TimeOffset node (see _NK_TIME_OFFSET_NODES) handles the
     # timeline shift.
     _NK_MOVIE_NODES = frozenset({
-        "Read_MAYA_PLAYBLAST",
+        "playblast",
     })
     # All TimeOffset nodes are treated as "shift the upstream movie
     # to the shot's start frame": time_offset = start_frame - 1.
@@ -7521,31 +7534,51 @@ class Exporter(object):
 
     @staticmethod
     def _nk_relpath(asset_path, nk_dir):
-        """Return asset_path relative to nk_dir, forward-slashed.
+        """Return a Nuke-portable relative path for asset_path,
+        anchored at the directory of the loaded .nk via the Tcl
+        expression ``[file dirname [knob root.name]]``.
 
-        Falls back to the absolute path when relpath isn't possible
-        (e.g. different drives on Windows).
+        Plain relative paths in a .nk are NOT reliably resolved
+        relative to the script -- Nuke can resolve them against
+        its CWD instead, depending on launch context. Using the
+        explicit Tcl expression always anchors at the script's
+        own directory, so relocating the export folder still
+        works.
+
+        Falls back to a forward-slashed absolute path when relpath
+        isn't possible (e.g. different drives on Windows).
         """
         try:
             rel = os.path.relpath(asset_path, nk_dir)
         except ValueError:
-            rel = os.path.abspath(asset_path)
-        return rel.replace("\\", "/")
+            return os.path.abspath(asset_path).replace("\\", "/")
+        rel = rel.replace("\\", "/")
+        return "[file dirname [knob root.name]]/" + rel
 
     def export_nk(self, file_path, template_path,
                   raw_plate=None, ud_plate=None,
                   stmap_undistort=None, stmap_redistort=None,
                   alembic=None, playblast=None,
                   start_frame=None, end_frame=None,
-                  plate_width=None, plate_height=None):
+                  plate_width=None, plate_height=None,
+                  raw_plate_dims=None, ud_plate_dims=None):
         """Generate a Nuke .nk script from the bundled template.
 
         Rewrites Read/ReadGeo/Camera node `file` paths (relative to
         the .nk's folder, forward-slashed), per-Read frame ranges
-        for sequence nodes, and the project-level Root node's
-        format/first_frame/last_frame/name. Any Read with a name
-        not in `_NK_NODE_TO_ASSET` (e.g. the beeble pass) is left
-        untouched.
+        for sequence nodes, the per-Read `format` knob,
+        `set_<element>_res` Reformat `format` knobs, and the
+        project-level Root node's format/first_frame/last_frame/
+        name. Any node with a name not in `_NK_NODE_TO_ASSET` /
+        `_NK_REFORMAT_TO_ASSET` is left untouched.
+
+        plate_width/plate_height drive the Root node's format.
+        raw_plate_dims and ud_plate_dims (each a `(w, h)` tuple)
+        drive the per-Read format and the `set_<element>_res`
+        Reformats; rd_stmap follows raw_plate dims and ud_stmap
+        follows ud_plate dims. When either is missing the
+        corresponding Reads/Reformats are left as the template
+        had them.
 
         Missing assets (None / empty) leave the corresponding Read
         node's `file` knob blank — Nuke will report a missing file
@@ -7575,6 +7608,8 @@ class Exporter(object):
             "end_frame": end_frame,
             "plate_width": plate_width,
             "plate_height": plate_height,
+            "raw_plate_dims": raw_plate_dims,
+            "ud_plate_dims": ud_plate_dims,
         }
         current_block = "<pre-parse>"
 
@@ -7595,6 +7630,7 @@ class Exporter(object):
                 "alembic", "playblast",
                 "start_frame", "end_frame",
                 "plate_width", "plate_height",
+                "raw_plate_dims", "ud_plate_dims",
             ):
                 buf.append("    {:<18} = {!r}".format(k, ctx.get(k)))
             buf.append("")
@@ -7637,6 +7673,26 @@ class Exporter(object):
             rel_paths = {}
             for k, v in assets.items():
                 rel_paths[k] = self._nk_relpath(v, nk_dir) if v else ""
+
+            # Per-Read dims: rd_stmap shares raw_plate's domain;
+            # ud_stmap shares ud_plate's domain. Movies and geo
+            # carry no static dims — the template's existing format
+            # is correct for them.
+            read_dims_by_block_name = {}
+            if raw_plate_dims:
+                read_dims_by_block_name["raw_plate"] = raw_plate_dims
+                read_dims_by_block_name["rd_stmap"] = raw_plate_dims
+            if ud_plate_dims:
+                read_dims_by_block_name["ud_plate"] = ud_plate_dims
+                read_dims_by_block_name["ud_stmap"] = ud_plate_dims
+
+            # Per-Reformat dims: looked up by `set_<element>_res` name.
+            reformat_dims_by_block_name = {}
+            for rfn, asset in self._NK_REFORMAT_TO_ASSET.items():
+                if asset in ("raw_plate",) and raw_plate_dims:
+                    reformat_dims_by_block_name[rfn] = raw_plate_dims
+                elif asset in ("ud_plate", "ud_stmap") and ud_plate_dims:
+                    reformat_dims_by_block_name[rfn] = ud_plate_dims
 
             with open(template_path, "r") as f:
                 lines = f.read().splitlines()
@@ -7684,11 +7740,12 @@ class Exporter(object):
                     asset_key = self._NK_NODE_TO_ASSET[block_name]
                     is_seq = block_name in self._NK_SEQUENCE_NODES
                     is_movie = block_name in self._NK_MOVIE_NODES
+                    asset_dims = read_dims_by_block_name.get(block_name)
                     out_lines.extend(self._rewrite_nk_read_block(
                         block, rel_paths[asset_key],
                         is_seq, is_movie,
                         start_frame, end_frame,
-                        plate_width, plate_height))
+                        asset_dims=asset_dims))
                 elif node_type == "Write":
                     # Substitute file knob if this Write has a
                     # default; either way strip OCIO knobs.
@@ -7696,7 +7753,8 @@ class Exporter(object):
                         suffix = self._NK_WRITE_DEFAULTS[block_name]
                         nk_stem = os.path.splitext(
                             os.path.basename(file_path))[0]
-                        rel = nk_stem + suffix
+                        rel = ("[file dirname [knob root.name]]/"
+                               + nk_stem + suffix)
                     else:
                         rel = None
                     out_lines.extend(self._rewrite_nk_write_block(
@@ -7706,7 +7764,8 @@ class Exporter(object):
                         block, start_frame))
                 elif node_type == "Reformat":
                     out_lines.extend(self._rewrite_nk_reformat_block(
-                        block, plate_width, plate_height))
+                        block, reformat_dims_by_block_name.get(
+                            block_name)))
                 else:
                     out_lines.extend(block)
 
@@ -7746,8 +7805,7 @@ class Exporter(object):
             if ln.startswith(" name "):
                 out.append(" name " + abs_nk)
             elif ln.startswith(" format ") and plate_w and plate_h:
-                out.append(' format "{w} {h} 0 0 {w} {h} 1 plate"'.format(
-                    w=int(plate_w), h=int(plate_h)))
+                out.append(Exporter._format_line_for(plate_w, plate_h))
             elif ln.startswith(" first_frame ") and start_frame is not None:
                 out.append(" first_frame {}".format(int(start_frame)))
             elif ln.startswith(" last_frame ") and end_frame is not None:
@@ -7776,7 +7834,9 @@ class Exporter(object):
         out = []
         for ln in block:
             if rel_path is not None and ln.startswith(" file "):
-                out.append(" file " + rel_path)
+                # Quote the value -- Tcl-expression paths contain
+                # spaces and brackets that Nuke's parser splits on.
+                out.append(' file "{}"'.format(rel_path))
                 continue
             stripped = False
             for k in strip:
@@ -7788,25 +7848,45 @@ class Exporter(object):
             out.append(ln)
         return out
 
-    @staticmethod
-    def _is_uhd_4k_format_line(ln):
-        """Return True if the line is a hardcoded UHD_4K format
-        knob value (i.e. starts a 3840 2160 format)."""
-        m = re.match(r'^ format "(\d+) (\d+)', ln)
-        return bool(m) and (m.group(1), m.group(2)) == ("3840", "2160")
+    # Common dims Nuke ships with a built-in format name. Reusing
+    # the canonical name keeps the .nk consistent with the template
+    # (which already references HD_1080 / UHD_4K) and avoids two
+    # registered formats sharing the same dims under different
+    # names.
+    _NK_BUILTIN_FORMAT_NAMES = {
+        (1920, 1080): "HD_1080",
+        (1280, 720):  "HD_720",
+        (3840, 2160): "UHD_4K",
+        (4096, 2160): "DCI_4K",
+        (2048, 1080): "DCI_2K",
+    }
 
     @staticmethod
-    def _format_line_for(plate_w, plate_h, name="plate"):
-        """Return a Nuke format-knob line for the given dimensions."""
+    def _format_line_for(plate_w, plate_h, name=None):
+        """Return a Nuke format-knob line for the given dimensions.
+
+        Format `name` defaults to the matching Nuke built-in (e.g.
+        HD_1080, UHD_4K) when the dims are well-known, otherwise to
+        a dims-derived identifier (`plate_<w>x<h>`). Either way,
+        every node referencing the same (w, h) registers as the
+        same Nuke format. Reusing a single name like "plate" across
+        nodes with different dims (or even across multiple emissions
+        of the same dims) makes Nuke warn about a duplicate format
+        and silently rename later instances to plate1, plate2, etc.
+        """
+        w, h = int(plate_w), int(plate_h)
+        if name is None:
+            name = (Exporter._NK_BUILTIN_FORMAT_NAMES.get((w, h))
+                    or "plate_{}x{}".format(w, h))
         return (' format "{w} {h} 0 0 {w} {h} 1 {n}"'
-                .format(w=int(plate_w), h=int(plate_h), n=name))
+                .format(w=w, h=h, n=name))
 
     @staticmethod
     def _rewrite_nk_read_block(block, rel_path, is_sequence, is_movie,
                                start_frame, end_frame,
-                               plate_w=None, plate_h=None):
-        """Rewrite `file` (and optionally frame range) on a Read/
-        ReadGeo/Camera block.
+                               asset_dims=None):
+        """Rewrite `file` (and optionally frame range / format) on a
+        Read/ReadGeo/Camera block.
 
         For image sequences (is_sequence=True) the frame fields use
         the shot's timeline range. For movie files (is_movie=True)
@@ -7818,9 +7898,17 @@ class Exporter(object):
         stripped (see _NK_ALEMBIC_DYNAMIC_KNOBS) so Nuke recreates
         them from the live alembic state on load.
 
-        Hardcoded UHD_4K `format` knobs are rewritten to the
-        working resolution (plate_w x plate_h) so the .nk reflects
-        the actual plate dims, not the template's 4K assumption.
+        asset_dims, when provided as ``(w, h)``, replaces every
+        hardcoded ``format "..."`` line in the block with the
+        asset's actual exported dimensions, so each Read's format
+        matches the file Nuke will load.
+
+        The block's ``name`` knob is left as the template authored
+        it (e.g. ``rd_stmap``, ``ud_plate``). Nuke's DAG tile shows
+        the role-name on top and the file basename below, which
+        gives both the asset role and the actual clip in two
+        distinct lines; rewriting the name to the basename made
+        both lines display the same text and looked duplicated.
         """
         # Movie file-internal range. Frame count = (end-start+1).
         movie_last = None
@@ -7836,9 +7924,8 @@ class Exporter(object):
             knob_match = knob_re.match(ln)
             if knob_match and knob_match.group(1) in dyn_knobs:
                 continue  # strip alembic-dynamic knob
-            if (plate_w and plate_h
-                    and Exporter._is_uhd_4k_format_line(ln)):
-                out.append(Exporter._format_line_for(plate_w, plate_h))
+            if asset_dims and ln.startswith(' format "'):
+                out.append(Exporter._format_line_for(*asset_dims))
                 continue
             if ln.startswith(" file "):
                 if rel_path:
@@ -7874,22 +7961,34 @@ class Exporter(object):
         return out
 
     @staticmethod
-    def _rewrite_nk_reformat_block(block, plate_w, plate_h):
-        """Rewrite a Reformat block's hardcoded UHD_4K `format` knob
-        to the working resolution. HD_1080 (1920x1080) Reformats
-        are left alone -- those are intentional delivery downscales
-        in the comp branch and shouldn't follow the working res.
-        Dynamic format expressions (`format {{...}}`) are also
-        skipped since they already follow another node's format.
+    def _rewrite_nk_reformat_block(block, dims):
+        """Rewrite a `set_<element>_res` Reformat's `format` knob to
+        the named element's actual exported dimensions.
+
+        ``dims`` is a ``(w, h)`` tuple supplied by the caller for
+        Reformats whose name maps to a known asset (see
+        ``_NK_REFORMAT_TO_ASSET``). Reformats not in that map (e.g.
+        ``set_HD``, the 1920x1080 delivery downscale) are passed in
+        with ``dims=None`` and left untouched.
+
+        A Reformat that uses ``resize none, pbb true`` and has no
+        explicit ``format`` knob in the template is given one so the
+        artist can see exactly which resolution is in effect.
         """
-        if not (plate_w and plate_h):
+        if not dims:
             return block
+        # Replace existing format line, or insert one before the
+        # closing brace if the template didn't include one.
         out = []
+        seen_format = False
         for ln in block:
-            if Exporter._is_uhd_4k_format_line(ln):
-                out.append(Exporter._format_line_for(plate_w, plate_h))
+            if ln.startswith(' format "'):
+                out.append(Exporter._format_line_for(*dims))
+                seen_format = True
             else:
                 out.append(ln)
+        if not seen_format and out and out[-1].startswith("}"):
+            out.insert(len(out) - 1, Exporter._format_line_for(*dims))
         return out
 
     @staticmethod
@@ -8159,6 +8258,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_scale_spin = None
         self.pb_checker_opacity_spin = None
         self.pb_wireframe_opacity_spin = None
+        self.pb_wireframe_color_btn = None
         # Matchmove tab (mm_)
         self.mm_camera_entries = []
         self.mm_camera_layout = None
@@ -8892,7 +8992,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         wf_op_row.addWidget(QLabel("Wireframe Opacity:"))
         self.pb_wireframe_opacity_spin = QSpinBox()
         self.pb_wireframe_opacity_spin.setRange(10, 100)
-        self.pb_wireframe_opacity_spin.setValue(90)
+        self.pb_wireframe_opacity_spin.setValue(50)
         self.pb_wireframe_opacity_spin.setSuffix("%")
         self.pb_wireframe_opacity_spin.setFixedWidth(60)
         self.pb_wireframe_opacity_spin.setToolTip(
@@ -8902,13 +9002,23 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             "<opacity>/20% before screen-blending.")
         wf_op_slider = QSlider(Qt.Horizontal)
         wf_op_slider.setRange(10, 100)
-        wf_op_slider.setValue(90)
+        wf_op_slider.setValue(50)
         self.pb_wireframe_opacity_spin.valueChanged.connect(
             wf_op_slider.setValue)
         wf_op_slider.valueChanged.connect(
             self.pb_wireframe_opacity_spin.setValue)
         wf_op_row.addWidget(self.pb_wireframe_opacity_spin)
         wf_op_row.addWidget(wf_op_slider)
+        wf_op_row.addWidget(QLabel("Color:"))
+        self.pb_wireframe_color_btn = QPushButton()
+        self.pb_wireframe_color_btn._color = (0.6, 0.1, 0.1)
+        self._update_color_button(self.pb_wireframe_color_btn)
+        self.pb_wireframe_color_btn.setFixedWidth(100)
+        self.pb_wireframe_color_btn.setToolTip(
+            "Color of the wireframe overlay")
+        self.pb_wireframe_color_btn.clicked.connect(
+            lambda: self._pick_color(self.pb_wireframe_color_btn))
+        wf_op_row.addWidget(self.pb_wireframe_color_btn)
         mmft_layout.addLayout(wf_op_row)
 
         mmft_layout.addWidget(QLabel("QC Checker Overlay"))
@@ -10213,6 +10323,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             wf_overlay = self.pb_wireframe_overlay_cb.isChecked()
             wf_opacity = (
                 self.pb_wireframe_opacity_spin.value() / 100.0)
+            wf_color = self.pb_wireframe_color_btn._color
             if active_tab == TAB_MATCHMOVE:
                 geo_roots = [
                     p["geo_field"].text().strip()
@@ -10224,6 +10335,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     composite_wireframe_overlay=wf_overlay,
                     composite_wireframe_geo=geo_roots,
                     composite_wireframe_opacity=wf_opacity,
+                    composite_wireframe_color=wf_color,
                 )
             else:
                 face_meshes = [
@@ -10237,6 +10349,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     composite_wireframe_overlay=wf_overlay,
                     composite_wireframe_geo=face_meshes,
                     composite_wireframe_opacity=wf_opacity,
+                    composite_wireframe_color=wf_color,
                 )
             pb_kwargs.update(
                 checker_scale=chk_scale,
@@ -10773,21 +10886,38 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 else:
                     raw_for_nk = raw_plate or image_plane
                     ud_for_nk = ""
+                # Per-asset dims for the .nk Reads/Reformats:
+                #  - ud_plate (and ud_stmap) come from the camera's
+                #    image plane, where the matchmove pipeline
+                #    stores the undistorted plate.
+                #  - raw_plate (and rd_stmap) come from sniffing the
+                #    raw EXR header; if that fails, fall back by
+                #    size class against the ud dims (raw is either
+                #    HD or 4K UHD on this show).
                 # Working resolution for the .nk's project format:
-                # - STMap workflow -> raw plate dims (the undistorted
-                #   image plane may differ in resolution from the raw)
-                # - No-STMap workflow -> camera image plane dims
-                # Falls back to image-plane dims if the EXR header
-                # can't be read for whatever reason.
-                plate_w = plate_h = None
+                #  - STMap workflow -> raw plate dims
+                #  - No-STMap workflow -> ud_plate (image plane) dims
+                ud_dims = Exporter._get_image_plane_resolution(
+                    primary_camera)
+                raw_dims = None
                 if have_stmaps and raw_for_nk:
-                    dims = Exporter._read_exr_dimensions(raw_for_nk)
-                    if dims:
-                        plate_w, plate_h = dims
-                if plate_w is None:
-                    plate_w, plate_h = \
-                        Exporter._get_image_plane_resolution(
-                            primary_camera)
+                    raw_dims = Exporter._read_exr_dimensions(
+                        raw_for_nk)
+                if raw_dims is None and ud_dims:
+                    ud_w = int(ud_dims[0])
+                    if ud_w >= 3840:
+                        raw_dims = (3840, 2160)
+                    elif ud_w >= 1920:
+                        raw_dims = (1920, 1080)
+                    else:
+                        raw_dims = ud_dims
+                if have_stmaps:
+                    root_dims = raw_dims or ud_dims
+                else:
+                    root_dims = ud_dims or raw_dims
+                plate_w = plate_h = None
+                if root_dims:
+                    plate_w, plate_h = root_dims
                 FolderManager.ensure_directories({"nk": nk_path})
                 # Reference the standard playblast and alembic
                 # filenames whether or not they were exported this
@@ -10804,7 +10934,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     alembic=paths.get("abc", ""),
                     playblast=paths.get("mp4") or paths.get("mov") or "",
                     start_frame=start_frame, end_frame=end_frame,
-                    plate_width=plate_w, plate_height=plate_h)
+                    plate_width=plate_w, plate_height=plate_h,
+                    raw_plate_dims=raw_dims,
+                    ud_plate_dims=ud_dims)
                 if results["nk"]:
                     all_paths["nk"] = nk_path
                 self._log_result("Nuke", results["nk"])
@@ -11160,6 +11292,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         self.pb_wireframe_overlay_cb.isChecked())
                     wf_opacity = (
                         self.pb_wireframe_opacity_spin.value() / 100.0)
+                    wf_color = self.pb_wireframe_color_btn._color
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
@@ -11184,6 +11317,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_overlay=wf_overlay,
                         composite_wireframe_geo=geo_roots,
                         composite_wireframe_opacity=wf_opacity,
+                        composite_wireframe_color=wf_color,
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
@@ -11663,6 +11797,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         self.pb_wireframe_overlay_cb.isChecked())
                     wf_opacity = (
                         self.pb_wireframe_opacity_spin.value() / 100.0)
+                    wf_color = self.pb_wireframe_color_btn._color
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         face_track_mode=True,
@@ -11688,6 +11823,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_overlay=wf_overlay,
                         composite_wireframe_geo=face_meshes,
                         composite_wireframe_opacity=wf_opacity,
+                        composite_wireframe_color=wf_color,
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
