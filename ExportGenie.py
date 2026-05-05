@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-11"
+TOOL_VERSION = "v14-beta-12"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -7621,13 +7621,63 @@ class Exporter(object):
             return os.path.join(directory, base) if directory else base
         return path
 
+    @staticmethod
+    def _alembic_geo_paths_for_nk(geo_roots):
+        """Return Nuke-style alembic shape paths for a ReadGeo2's
+        ``scene_view`` knob.
+
+        For each Maya geo root, every mesh shape underneath is
+        captured as ``/root/<DAG-with-/-separators>``. This mirrors
+        what Nuke's ``createScenefileBrowser`` writes when an
+        artist loads the .abc by hand, so a generated .nk renders
+        the geometry without an extra reload step.
+        """
+        paths = []
+        seen = set()
+        for r in geo_roots or []:
+            if not r or not cmds.objExists(r):
+                continue
+            shapes = cmds.listRelatives(
+                r, allDescendents=True, type="mesh",
+                fullPath=True) or []
+            for s in shapes:
+                if s in seen:
+                    continue
+                seen.add(s)
+                paths.append("/root" + s.replace("|", "/"))
+        return paths
+
+    @staticmethod
+    def _build_nk_scene_view_lines(item_paths):
+        """Build the multi-line ``scene_view {...}`` knob lines for
+        a ReadGeo2, with every item pre-selected. Returns a list of
+        .nk text lines (no trailing newlines), or [] if there are
+        no items to write.
+        """
+        if not item_paths:
+            return []
+        n = len(item_paths)
+        lines = [" scene_view {", "  {0}", "  imported:"]
+        for i in range(n):
+            lines.append("  {}".format(i))
+        lines.append("  selected:")
+        lines.append("  {}".format(n))
+        for i in range(n):
+            lines.append("  {}".format(i))
+        lines.append("  items:")
+        for p in item_paths:
+            lines.append("  " + p)
+        lines.append(" }")
+        return lines
+
     def export_nk(self, file_path, template_path,
                   raw_plate=None, ud_plate=None,
                   stmap_undistort=None, stmap_redistort=None,
                   alembic=None, playblast=None,
                   start_frame=None, end_frame=None,
                   plate_width=None, plate_height=None,
-                  raw_plate_dims=None, ud_plate_dims=None):
+                  raw_plate_dims=None, ud_plate_dims=None,
+                  alembic_geo_paths=None):
         """Generate a Nuke .nk script from the bundled template.
 
         Rewrites Read/ReadGeo/Camera node `file` paths (relative to
@@ -7827,12 +7877,19 @@ class Exporter(object):
                     is_seq = block_name in self._NK_SEQUENCE_NODES
                     is_movie = block_name in self._NK_MOVIE_NODES
                     asset_dims = read_dims_by_block_name.get(block_name)
+                    sv_lines = (
+                        Exporter._build_nk_scene_view_lines(
+                            alembic_geo_paths)
+                        if (node_type == "ReadGeo2"
+                            and alembic_geo_paths)
+                        else None)
                     out_lines.extend(self._rewrite_nk_read_block(
                         block, rel_paths[asset_key],
                         is_seq, is_movie,
                         start_frame, end_frame,
                         asset_dims=asset_dims,
-                        node_type=node_type))
+                        node_type=node_type,
+                        scene_view_lines=sv_lines))
                 elif node_type == "Write":
                     # Substitute file knob if this Write has a
                     # default; either way strip OCIO knobs.
@@ -8032,7 +8089,8 @@ class Exporter(object):
     @staticmethod
     def _rewrite_nk_read_block(block, rel_path, is_sequence, is_movie,
                                start_frame, end_frame,
-                               asset_dims=None, node_type=None):
+                               asset_dims=None, node_type=None,
+                               scene_view_lines=None):
         """Rewrite `file` (and optionally frame range / format) on a
         Read/ReadGeo/Camera block.
 
@@ -8105,39 +8163,41 @@ class Exporter(object):
             elif is_sequence and ln.startswith(" origlast ") \
                     and end_frame is not None:
                 out.append(" origlast {}".format(int(end_frame)))
-            elif is_movie and ln.startswith(" first ") \
-                    and movie_last is not None:
-                out.append(" first 1")
-            elif is_movie and ln.startswith(" last ") \
-                    and movie_last is not None:
-                out.append(" last {}".format(movie_last))
-            elif is_movie and ln.startswith(" origfirst ") \
-                    and movie_last is not None:
-                out.append(" origfirst 1")
-            elif is_movie and ln.startswith(" origlast ") \
-                    and movie_last is not None:
-                out.append(" origlast {}".format(movie_last))
+            elif is_movie and (ln.startswith(" first ")
+                               or ln.startswith(" last ")
+                               or ln.startswith(" origfirst ")
+                               or ln.startswith(" origlast ")):
+                # ffmpeg can drop trailing frames during encode, so
+                # the .nk's calculated last/origlast (end-start+1)
+                # often exceeds the actual file frame count and Nuke
+                # errors when seeking past EOF. Drop these lines and
+                # let Nuke auto-detect the movie's real range from
+                # the file header.
+                continue
             elif is_alembic_block and ln.startswith(" range_first ") \
                     and start_frame is not None:
-                out.append(" range_first {}".format(int(start_frame)))
+                # Nuke's natural value for an alembic that contains
+                # the shot range is 0; matches what
+                # createScenefileBrowser writes.
+                out.append(" range_first 0")
             elif is_alembic_block and ln.startswith(" range_last ") \
                     and end_frame is not None:
                 out.append(" range_last {}".format(int(end_frame)))
             else:
                 out.append(ln)
-        # ReadGeo2 alembic: explicitly load all objects from the .abc
-        # and re-evaluate each frame. Nuke's defaults can leave
-        # scene_view empty (no geometry visible) or freeze geo on
-        # frame 1. range_first/range_last are also forced in case
-        # the template didn't author them, so the alembic plays the
-        # full shot range.
+        # ReadGeo2 alembic: render every object from the .abc and
+        # re-evaluate each frame. The forced knobs cover the case
+        # where the template didn't author them; scene_view (when
+        # provided by the caller) gives Nuke a fully populated item
+        # list so the geometry actually renders without the artist
+        # having to reload the alembic by hand.
         if node_type == "ReadGeo2":
             forced = [
                 ("all_objects", "true"),
                 ("read_on_each_frame", "true"),
             ]
             if start_frame is not None:
-                forced.append(("range_first", str(int(start_frame))))
+                forced.append(("range_first", "0"))
             if end_frame is not None:
                 forced.append(("range_last", str(int(end_frame))))
             existing = set()
@@ -8148,6 +8208,8 @@ class Exporter(object):
                     existing.add(km.group(1))
             inserts = [" {} {}".format(k, v)
                        for k, v in forced if k not in existing]
+            if scene_view_lines and "scene_view" not in existing:
+                inserts.extend(scene_view_lines)
             if inserts and out and out[-1].startswith("}"):
                 out = out[:-1] + inserts + out[-1:]
             elif inserts:
@@ -8201,13 +8263,24 @@ class Exporter(object):
         offset = int(start_frame) - 1
         new_name = "TimeOffset_ToStartAtFrame{}".format(int(start_frame))
         out = []
+        seen_offset = False
         for ln in block:
             if ln.startswith(" time_offset "):
                 out.append(" time_offset {}".format(offset))
+                seen_offset = True
             elif ln.startswith(" name "):
                 out.append(" name " + new_name)
             else:
                 out.append(ln)
+        # The bundled template only authors the `time` knob (input
+        # time, not the offset), so `time_offset` is missing and the
+        # node has no effect on the playblast position. Insert it
+        # explicitly when absent.
+        if not seen_offset and out and out[-1].startswith("}"):
+            out.insert(len(out) - 1,
+                       " time_offset {}".format(offset))
+        elif not seen_offset:
+            out.append(" time_offset {}".format(offset))
         return out
 
 
@@ -11160,6 +11233,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 # later (or one already exists in the folder), the
                 # .nk picks them up automatically via the relative
                 # path.
+                # Build the alembic ReadGeo2's scene_view items
+                # from the geo we just exported so the .nk renders
+                # the geometry without a manual reload.
+                abc_geo_paths = Exporter._alembic_geo_paths_for_nk(
+                    geo_roots + obj_tracks)
                 results["nk"] = exporter.export_nk(
                     nk_path, template_path,
                     raw_plate=raw_for_nk,
@@ -11171,7 +11249,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     start_frame=start_frame, end_frame=end_frame,
                     plate_width=plate_w, plate_height=plate_h,
                     raw_plate_dims=raw_dims,
-                    ud_plate_dims=ud_dims)
+                    ud_plate_dims=ud_dims,
+                    alembic_geo_paths=abc_geo_paths)
                 if results["nk"]:
                     all_paths["nk"] = nk_path
                 self._log_result("Nuke", results["nk"])
