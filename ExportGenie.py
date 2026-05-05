@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-10"
+TOOL_VERSION = "v14-beta-11"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -294,10 +294,10 @@ class FolderManager(object):
         )
         paths = {"jsx": os.path.join(ae_dir, jsx_name), "obj": {}}
         for geo_name in geo_names:
-            # Strip DAG path and Maya namespaces
-            # e.g. "|grp|ns:GeoName" → "GeoName"
-            short_geo = geo_name.rsplit("|", 1)[-1]
-            short_geo = short_geo.rsplit(":", 1)[-1]
+            # Strip DAG path; preserve namespace (with ':' → '_') so that
+            # geos with the same short name in different namespaces don't
+            # collide on the same OBJ filename.
+            short_geo = geo_name.rsplit("|", 1)[-1].replace(":", "_")
             obj_name = "{base}_{geo}_{ver}.obj".format(
                 base=scene_base_name, ver=version_str, geo=short_geo
             )
@@ -7564,8 +7564,6 @@ class Exporter(object):
         "use_frame_rate",
         "frame_offset",
         "lock_frame_offset",
-        "range_first",
-        "range_last",
         "read_on_each_frame",
         "use_geometry_colors",
         "scene_view",
@@ -7594,6 +7592,34 @@ class Exporter(object):
             return os.path.abspath(asset_path).replace("\\", "/")
         rel = rel.replace("\\", "/")
         return "[file dirname [knob root.name]]/" + rel
+
+    @staticmethod
+    def _to_nuke_seq_pattern(path):
+        """Normalize an image-sequence path to Nuke's ``####`` form.
+
+        - Existing ``####`` tokens are kept as-is.
+        - ``%04d``/``%0Nd`` printf tokens are rewritten to N hashes.
+        - A concrete trailing frame number (``name_1001.exr`` or
+          ``name.1001.exr``) is rewritten to ``name_####.exr``.
+        - Anything else (single-file assets, unrecognized layouts)
+          is returned unchanged.
+        """
+        if not path:
+            return path
+        directory, base = os.path.split(path)
+        if "#" in base:
+            return path
+        m = re.search(r"%0(\d+)d", base)
+        if m:
+            base = base[:m.start()] + ("#" * int(m.group(1))) + base[m.end():]
+            return os.path.join(directory, base) if directory else base
+        m = re.match(
+            r"^(.+?)([._])(\d+)(\.[A-Za-z0-9]+)$", base)
+        if m:
+            stem, sep, digits, ext = m.groups()
+            base = stem + sep + ("#" * len(digits)) + ext
+            return os.path.join(directory, base) if directory else base
+        return path
 
     def export_nk(self, file_path, template_path,
                   raw_plate=None, ud_plate=None,
@@ -7702,9 +7728,12 @@ class Exporter(object):
                 return False
 
             nk_dir = os.path.dirname(os.path.abspath(file_path))
+            # Normalize sequence-class assets to Nuke's `####` form so
+            # a concrete first-frame path doesn't make Nuke load just
+            # one frame.
             assets = {
-                "raw_plate": raw_plate,
-                "ud_plate": ud_plate,
+                "raw_plate": Exporter._to_nuke_seq_pattern(raw_plate),
+                "ud_plate": Exporter._to_nuke_seq_pattern(ud_plate),
                 "stmap_undistort": stmap_undistort,
                 "stmap_redistort": stmap_redistort,
                 "alembic": alembic,
@@ -7713,6 +7742,23 @@ class Exporter(object):
             rel_paths = {}
             for k, v in assets.items():
                 rel_paths[k] = self._nk_relpath(v, nk_dir) if v else ""
+            # The alembic asset (ReadGeo2 / Camera3) can't resolve
+            # the Tcl-wrapped relpath nor a plain relative path
+            # reliably -- Nuke's alembic reader evaluates the file
+            # knob before Tcl substitution and against the launch
+            # CWD, not the script dir. Use an absolute forward-
+            # slashed path so the .abc is always found.
+            if alembic:
+                rel_paths["alembic"] = os.path.abspath(
+                    alembic).replace("\\", "/")
+            # Same problem hits the playblast Read: Nuke's FFmpeg
+            # movie reader resolves the file knob before the Tcl
+            # `[file dirname [knob root.name]]` substitution runs,
+            # so the .mp4/.mov can't be found via the relative form.
+            # Write an absolute forward-slashed path instead.
+            if playblast:
+                rel_paths["playblast"] = os.path.abspath(
+                    playblast).replace("\\", "/")
 
             # Per-Read dims: rd_stmap shares raw_plate's domain;
             # ud_stmap shares ud_plate's domain. Movies and geo
@@ -7785,7 +7831,8 @@ class Exporter(object):
                         block, rel_paths[asset_key],
                         is_seq, is_movie,
                         start_frame, end_frame,
-                        asset_dims=asset_dims))
+                        asset_dims=asset_dims,
+                        node_type=node_type))
                 elif node_type == "Write":
                     # Substitute file knob if this Write has a
                     # default; either way strip OCIO knobs.
@@ -7838,9 +7885,63 @@ class Exporter(object):
     @staticmethod
     def _rewrite_nk_root(block, nk_path, start_frame, end_frame,
                          plate_w, plate_h):
-        """Rewrite Root node knobs: name, format, first/last_frame, frame."""
+        """Rewrite Root node knobs: name, format, first/last_frame, frame.
+
+        Also installs an onScriptLoad callback that forces every
+        alembic-bound ReadGeo2 / Camera3 to reload after the script
+        opens. A bare ReadGeo2 with just `file` set doesn't auto-
+        populate `scene_view` from the .abc, so even with
+        `all_objects true` no geometry shows. Nuke's normal alembic
+        import path goes through `nuke.createScenefileBrowser`; we
+        emulate that here by re-setting the file knob on load,
+        which triggers Nuke to enumerate the alembic and (because
+        `all_objects` is true) display every object in it.
+        """
+        # Curly braces keep Nuke/Tcl from interpreting the Python's
+        # square brackets as command substitutions, and let us write
+        # the body verbatim across multiple lines. The body forces
+        # each alembic-bound node to reload (which makes Nuke
+        # enumerate the .abc and create the `scene_view` /
+        # `all_objects` knobs that don't exist until the alembic
+        # has loaded), then sets `all_objects=True` and selects
+        # every item in `scene_view` as a belt-and-braces backup
+        # so the geometry actually displays.
+        on_load_py = (
+            "{import nuke\n"
+            "for _n in nuke.allNodes('ReadGeo2') + "
+            "nuke.allNodes('Camera3'):\n"
+            "  _fk = _n.knob('file')\n"
+            "  if not (_fk and _fk.value()): continue\n"
+            "  _rk = _n.knob('reload')\n"
+            "  if _rk:\n"
+            "    try: _rk.execute()\n"
+            "    except Exception: pass\n"
+            "  else:\n"
+            "    try:\n"
+            "      _v = _fk.value()\n"
+            "      _fk.setValue('')\n"
+            "      _fk.setValue(_v)\n"
+            "    except Exception: pass\n"
+            "  _ao = _n.knob('all_objects')\n"
+            "  if _ao:\n"
+            "    try: _ao.setValue(True)\n"
+            "    except Exception: pass\n"
+            "  _re = _n.knob('read_on_each_frame')\n"
+            "  if _re:\n"
+            "    try: _re.setValue(True)\n"
+            "    except Exception: pass\n"
+            "  _sv = _n.knob('scene_view')\n"
+            "  if _sv:\n"
+            "    try:\n"
+            "      _items = _sv.getAllItems() "
+            "if hasattr(_sv, 'getAllItems') else None\n"
+            "      if _items and hasattr(_sv, 'setSelectedItems'):\n"
+            "        _sv.setSelectedItems(_items)\n"
+            "    except Exception: pass}"
+        )
         out = []
         abs_nk = os.path.abspath(nk_path).replace("\\", "/")
+        seen_on_load = False
         for ln in block:
             if ln.startswith(" name "):
                 out.append(" name " + abs_nk)
@@ -7852,8 +7953,15 @@ class Exporter(object):
                 out.append(" last_frame {}".format(int(end_frame)))
             elif ln.startswith(" frame ") and start_frame is not None:
                 out.append(" frame {}".format(int(start_frame)))
+            elif ln.startswith(" onScriptLoad "):
+                out.append(" onScriptLoad " + on_load_py)
+                seen_on_load = True
             else:
                 out.append(ln)
+        if not seen_on_load and out and out[-1].startswith("}"):
+            out.insert(len(out) - 1, " onScriptLoad " + on_load_py)
+        elif not seen_on_load:
+            out.append(" onScriptLoad " + on_load_py)
         return out
 
     @staticmethod
@@ -7924,7 +8032,7 @@ class Exporter(object):
     @staticmethod
     def _rewrite_nk_read_block(block, rel_path, is_sequence, is_movie,
                                start_frame, end_frame,
-                               asset_dims=None):
+                               asset_dims=None, node_type=None):
         """Rewrite `file` (and optionally frame range / format) on a
         Read/ReadGeo/Camera block.
 
@@ -7960,6 +8068,19 @@ class Exporter(object):
         knob_re = re.compile(r"^ ([a-zA-Z_][a-zA-Z0-9_]*) ")
 
         out = []
+        # Alembic-bound nodes (ReadGeo2, Camera3) resolve their `file`
+        # knob inside the alembic reader before Nuke's Tcl evaluator
+        # gets to substitute `[file dirname [knob root.name]]`, so the
+        # reader ends up trying to open a path that still contains the
+        # literal Tcl expression and the geometry/camera never loads.
+        # Strip the Tcl prefix for these blocks so the reader sees a
+        # plain relative path it can resolve against the script's dir.
+        is_alembic_block = node_type in ("ReadGeo2", "Camera3")
+        tcl_prefix = "[file dirname [knob root.name]]/"
+        file_path_for_knob = rel_path
+        if (is_alembic_block and file_path_for_knob
+                and file_path_for_knob.startswith(tcl_prefix)):
+            file_path_for_knob = file_path_for_knob[len(tcl_prefix):]
         for ln in block:
             knob_match = knob_re.match(ln)
             if knob_match and knob_match.group(1) in dyn_knobs:
@@ -7968,8 +8089,8 @@ class Exporter(object):
                 out.append(Exporter._format_line_for(*asset_dims))
                 continue
             if ln.startswith(" file "):
-                if rel_path:
-                    out.append(' file "{}"'.format(rel_path))
+                if file_path_for_knob:
+                    out.append(' file "{}"'.format(file_path_for_knob))
                 else:
                     out.append(' file ""')
             elif is_sequence and ln.startswith(" first ") \
@@ -7996,8 +8117,41 @@ class Exporter(object):
             elif is_movie and ln.startswith(" origlast ") \
                     and movie_last is not None:
                 out.append(" origlast {}".format(movie_last))
+            elif is_alembic_block and ln.startswith(" range_first ") \
+                    and start_frame is not None:
+                out.append(" range_first {}".format(int(start_frame)))
+            elif is_alembic_block and ln.startswith(" range_last ") \
+                    and end_frame is not None:
+                out.append(" range_last {}".format(int(end_frame)))
             else:
                 out.append(ln)
+        # ReadGeo2 alembic: explicitly load all objects from the .abc
+        # and re-evaluate each frame. Nuke's defaults can leave
+        # scene_view empty (no geometry visible) or freeze geo on
+        # frame 1. range_first/range_last are also forced in case
+        # the template didn't author them, so the alembic plays the
+        # full shot range.
+        if node_type == "ReadGeo2":
+            forced = [
+                ("all_objects", "true"),
+                ("read_on_each_frame", "true"),
+            ]
+            if start_frame is not None:
+                forced.append(("range_first", str(int(start_frame))))
+            if end_frame is not None:
+                forced.append(("range_last", str(int(end_frame))))
+            existing = set()
+            knob_re2 = re.compile(r"^ ([a-zA-Z_][a-zA-Z0-9_]*) ")
+            for ln in out:
+                km = knob_re2.match(ln)
+                if km:
+                    existing.add(km.group(1))
+            inserts = [" {} {}".format(k, v)
+                       for k, v in forced if k not in existing]
+            if inserts and out and out[-1].startswith("}"):
+                out = out[:-1] + inserts + out[-1:]
+            elif inserts:
+                out.extend(inserts)
         return out
 
     @staticmethod
