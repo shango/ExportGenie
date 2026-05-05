@@ -9345,8 +9345,42 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         mmft.setLayout(mmft_layout)
         tab_layout.addWidget(mmft)
 
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setToolTip(
+            "Restore all Playblast Settings on this tab to their defaults")
+        reset_btn.clicked.connect(self._reset_playblast_defaults)
+        reset_row.addWidget(reset_btn)
+        tab_layout.addLayout(reset_row)
+
         tab_layout.addStretch()
         return tab
+
+    def _reset_playblast_defaults(self):
+        """Restore all Playblast Settings widgets to their build-time
+        defaults."""
+        if self._confirm_dialog(
+                "Reset Playblast Settings",
+                "Reset all Playblast Settings on this tab to their "
+                "defaults?",
+                buttons=["Reset", "Cancel"]) != "Reset":
+            return
+        self.pb_aa16_cb.setChecked(False)
+        self.pb_far_clip_spin.setValue(800000)
+        self.pb_raw_playblast_cb.setChecked(False)
+        self.pb_custom_vt_cb.setChecked(False)
+        self.pb_hud_overlay_cb.setChecked(True)
+        self.pb_wireframe_shader_cb.setChecked(True)
+        self.pb_motion_blur_cb.setChecked(True)
+        self.pb_wireframe_overlay_cb.setChecked(True)
+        self.pb_wireframe_opacity_spin.setValue(50)
+        self.pb_wireframe_color_btn._color = (0.6, 0.1, 0.1)
+        self._update_color_button(self.pb_wireframe_color_btn)
+        self.pb_checker_color_btn._color = (0.6, 0.1, 0.1)
+        self._update_color_button(self.pb_checker_color_btn)
+        self.pb_checker_scale_spin.setValue(15)
+        self.pb_checker_opacity_spin.setValue(30)
 
     def _build_frame_range(self):
         group = CollapsibleGroupBox("Frame Range")
