@@ -51,7 +51,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14-beta-12"
+TOOL_VERSION = "v14-beta-13"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -7648,6 +7648,67 @@ class Exporter(object):
         return paths
 
     @staticmethod
+    def _read_alembic_mesh_paths(abc_path):
+        """Walk an Alembic archive and return Nuke-style scene_view
+        paths (``/root/<archive path>``) for every IPolyMesh / ISubD.
+
+        Uses the Alembic Python module shipped with Maya/Nuke. This
+        is the authoritative source for scene_view items because it
+        sees exactly what Nuke's alembic reader will see — namespace
+        characters, shape vs transform layout, AbcExport root flags,
+        etc. — so the resulting items always match the file.
+
+        Returns [] if the module isn't importable, the file is
+        missing, or the archive can't be read.
+        """
+        if not abc_path or not os.path.isfile(abc_path):
+            return []
+        try:
+            from alembic import Abc, AbcGeom
+        except Exception:
+            return []
+        try:
+            archive = Abc.IArchive(str(abc_path))
+            top = archive.getTop()
+        except Exception:
+            return []
+        paths = []
+        seen = set()
+
+        def _is_mesh(meta):
+            try:
+                if AbcGeom.IPolyMesh.matches(meta):
+                    return True
+            except Exception:
+                pass
+            try:
+                if AbcGeom.ISubD.matches(meta):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _walk(obj, prefix):
+            try:
+                n = obj.getNumChildren()
+            except Exception:
+                return
+            for i in range(n):
+                try:
+                    child = obj.getChild(i)
+                    child_path = prefix + "/" + child.getName()
+                    meta = child.getMetaData()
+                except Exception:
+                    continue
+                if _is_mesh(meta) and child_path not in seen:
+                    seen.add(child_path)
+                    paths.append("/root" + child_path)
+                _walk(child, child_path)
+
+        _walk(top, "")
+        return paths
+
+    @staticmethod
     def _build_nk_scene_view_lines(item_paths):
         """Build the multi-line ``scene_view {...}`` knob lines for
         a ReadGeo2, with every item pre-selected. Returns a list of
@@ -7944,61 +8005,17 @@ class Exporter(object):
                          plate_w, plate_h):
         """Rewrite Root node knobs: name, format, first/last_frame, frame.
 
-        Also installs an onScriptLoad callback that forces every
-        alembic-bound ReadGeo2 / Camera3 to reload after the script
-        opens. A bare ReadGeo2 with just `file` set doesn't auto-
-        populate `scene_view` from the .abc, so even with
-        `all_objects true` no geometry shows. Nuke's normal alembic
-        import path goes through `nuke.createScenefileBrowser`; we
-        emulate that here by re-setting the file knob on load,
-        which triggers Nuke to enumerate the alembic and (because
-        `all_objects` is true) display every object in it.
+        Any pre-existing ``onScriptLoad`` line in the template is
+        stripped so an authored callback can't fight Nuke's natural
+        alembic loading path. The previous version installed a
+        reload+setSelectedItems callback to compensate for an empty
+        ``scene_view``; the ReadGeo2 block is now authored with a
+        fully populated ``scene_view`` (matching what
+        ``createScenefileBrowser`` writes), so the callback is no
+        longer needed and was implicated in script-load crashes.
         """
-        # Curly braces keep Nuke/Tcl from interpreting the Python's
-        # square brackets as command substitutions, and let us write
-        # the body verbatim across multiple lines. The body forces
-        # each alembic-bound node to reload (which makes Nuke
-        # enumerate the .abc and create the `scene_view` /
-        # `all_objects` knobs that don't exist until the alembic
-        # has loaded), then sets `all_objects=True` and selects
-        # every item in `scene_view` as a belt-and-braces backup
-        # so the geometry actually displays.
-        on_load_py = (
-            "{import nuke\n"
-            "for _n in nuke.allNodes('ReadGeo2') + "
-            "nuke.allNodes('Camera3'):\n"
-            "  _fk = _n.knob('file')\n"
-            "  if not (_fk and _fk.value()): continue\n"
-            "  _rk = _n.knob('reload')\n"
-            "  if _rk:\n"
-            "    try: _rk.execute()\n"
-            "    except Exception: pass\n"
-            "  else:\n"
-            "    try:\n"
-            "      _v = _fk.value()\n"
-            "      _fk.setValue('')\n"
-            "      _fk.setValue(_v)\n"
-            "    except Exception: pass\n"
-            "  _ao = _n.knob('all_objects')\n"
-            "  if _ao:\n"
-            "    try: _ao.setValue(True)\n"
-            "    except Exception: pass\n"
-            "  _re = _n.knob('read_on_each_frame')\n"
-            "  if _re:\n"
-            "    try: _re.setValue(True)\n"
-            "    except Exception: pass\n"
-            "  _sv = _n.knob('scene_view')\n"
-            "  if _sv:\n"
-            "    try:\n"
-            "      _items = _sv.getAllItems() "
-            "if hasattr(_sv, 'getAllItems') else None\n"
-            "      if _items and hasattr(_sv, 'setSelectedItems'):\n"
-            "        _sv.setSelectedItems(_items)\n"
-            "    except Exception: pass}"
-        )
         out = []
         abs_nk = os.path.abspath(nk_path).replace("\\", "/")
-        seen_on_load = False
         for ln in block:
             if ln.startswith(" name "):
                 out.append(" name " + abs_nk)
@@ -8011,14 +8028,9 @@ class Exporter(object):
             elif ln.startswith(" frame ") and start_frame is not None:
                 out.append(" frame {}".format(int(start_frame)))
             elif ln.startswith(" onScriptLoad "):
-                out.append(" onScriptLoad " + on_load_py)
-                seen_on_load = True
+                continue  # strip any template-authored callback
             else:
                 out.append(ln)
-        if not seen_on_load and out and out[-1].startswith("}"):
-            out.insert(len(out) - 1, " onScriptLoad " + on_load_py)
-        elif not seen_on_load:
-            out.append(" onScriptLoad " + on_load_py)
         return out
 
     @staticmethod
@@ -8139,6 +8151,16 @@ class Exporter(object):
         if (is_alembic_block and file_path_for_knob
                 and file_path_for_knob.startswith(tcl_prefix)):
             file_path_for_knob = file_path_for_knob[len(tcl_prefix):]
+        # ReadGeo2 alembic: author the block from scratch using the
+        # canonical knob set Nuke writes via createScenefileBrowser.
+        # Patching the templated knobs line-by-line has historically
+        # left the node in a half-loaded state where the viewport
+        # stayed empty even with `all_objects=true`; emitting the same
+        # text Nuke would write itself avoids that whole class of bug.
+        if node_type == "ReadGeo2":
+            return Exporter._author_nk_readgeo_block(
+                block, file_path_for_knob, start_frame, end_frame,
+                scene_view_lines)
         for ln in block:
             knob_match = knob_re.match(ln)
             if knob_match and knob_match.group(1) in dyn_knobs:
@@ -8185,35 +8207,62 @@ class Exporter(object):
                 out.append(" range_last {}".format(int(end_frame)))
             else:
                 out.append(ln)
-        # ReadGeo2 alembic: render every object from the .abc and
-        # re-evaluate each frame. The forced knobs cover the case
-        # where the template didn't author them; scene_view (when
-        # provided by the caller) gives Nuke a fully populated item
-        # list so the geometry actually renders without the artist
-        # having to reload the alembic by hand.
-        if node_type == "ReadGeo2":
-            forced = [
-                ("all_objects", "true"),
-                ("read_on_each_frame", "true"),
-            ]
-            if start_frame is not None:
-                forced.append(("range_first", "0"))
-            if end_frame is not None:
-                forced.append(("range_last", str(int(end_frame))))
-            existing = set()
-            knob_re2 = re.compile(r"^ ([a-zA-Z_][a-zA-Z0-9_]*) ")
-            for ln in out:
-                km = knob_re2.match(ln)
-                if km:
-                    existing.add(km.group(1))
-            inserts = [" {} {}".format(k, v)
-                       for k, v in forced if k not in existing]
-            if scene_view_lines and "scene_view" not in existing:
-                inserts.extend(scene_view_lines)
-            if inserts and out and out[-1].startswith("}"):
-                out = out[:-1] + inserts + out[-1:]
-            elif inserts:
-                out.extend(inserts)
+        return out
+
+    @staticmethod
+    def _author_nk_readgeo_block(template_block, file_path,
+                                 start_frame, end_frame,
+                                 scene_view_lines):
+        """Build a canonical ReadGeo2 block from scratch.
+
+        The bundled-template ReadGeo2 is consulted only for layout
+        knobs (``name``, ``xpos``, ``ypos``, ``inputs``, ``selected``);
+        every functional knob is overwritten with the values Nuke
+        writes when an artist drag-drops the .abc through
+        ``createScenefileBrowser``. ``scene_view_lines`` (when
+        provided) is the multi-line knob produced by
+        ``_build_nk_scene_view_lines``.
+
+        Knob order matches what Nuke writes itself: ``inputs`` first,
+        then functional knobs, then ``scene_view``, then the
+        node-identity / layout knobs (``name``, ``xpos``, ``ypos``,
+        ``selected``). The order isn't load-bearing for Nuke's
+        parser, but matching the canonical layout makes diffs
+        against a hand-imported .nk readable.
+        """
+        keep_match = lambda ln, key: (
+            ln == " " + key
+            or ln.startswith(" " + key + " "))
+        inputs_line = next(
+            (ln for ln in template_block if keep_match(ln, "inputs")),
+            None)
+        identity_keys = ("name", "xpos", "ypos", "selected")
+        identity_lines = [
+            ln for ln in template_block
+            if any(keep_match(ln, k) for k in identity_keys)
+        ]
+        out = ["ReadGeo2 {"]
+        # Only emit `inputs` when the template authored it. Forcing
+        # `inputs 0` here would break the .nk's stack-based wiring:
+        # ReadGeo2's default is 1 (it consumes the upstream Wireframe),
+        # and dropping that to 0 cascades into ScanlineRender / STMap
+        # picking up the wrong neighbours from the parse stack.
+        if inputs_line is not None:
+            out.append(inputs_line)
+        if file_path:
+            out.append(' file "{}"'.format(file_path))
+        else:
+            out.append(' file ""')
+        out.append(" read_on_each_frame true")
+        out.append(" use_geometry_colors false")
+        if start_frame is not None:
+            out.append(" range_first 0")
+        if end_frame is not None:
+            out.append(" range_last {}".format(int(end_frame)))
+        if scene_view_lines:
+            out.extend(scene_view_lines)
+        out.extend(identity_lines)
+        out.append("}")
         return out
 
     @staticmethod
@@ -11269,9 +11318,21 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 # path.
                 # Build the alembic ReadGeo2's scene_view items
                 # from the geo we just exported so the .nk renders
-                # the geometry without a manual reload.
-                abc_geo_paths = Exporter._alembic_geo_paths_for_nk(
-                    geo_roots + obj_tracks)
+                # the geometry without a manual reload. Prefer reading
+                # the .abc archive directly (matches what Nuke sees);
+                # fall back to the Maya DAG if the Alembic Python
+                # module isn't importable.
+                abc_geo_paths = []
+                abc_for_walk = paths.get("abc", "")
+                if abc_for_walk and os.path.isfile(abc_for_walk):
+                    abc_geo_paths = Exporter._read_alembic_mesh_paths(
+                        abc_for_walk)
+                if not abc_geo_paths:
+                    abc_geo_paths = Exporter._alembic_geo_paths_for_nk(
+                        geo_roots + obj_tracks)
+                self._log(
+                    "Nuke ReadGeo2 scene_view items: {}".format(
+                        len(abc_geo_paths)))
                 results["nk"] = exporter.export_nk(
                     nk_path, template_path,
                     raw_plate=raw_for_nk,
