@@ -7527,6 +7527,7 @@ class Exporter(object):
         "set_plate_res2":    "raw_plate",
         "set_ud_plate_res":  "ud_plate",
         "set_ud_stmap_res":  "ud_stmap",
+        "set_ud_stmap_res2": "ud_stmap",
     }
     # Image-sequence Reads: file frame numbers equal timeline frame
     # numbers (e.g. raw_plate_1001.exr -> raw_plate_1195.exr), so
@@ -7572,26 +7573,29 @@ class Exporter(object):
 
     @staticmethod
     def _nk_relpath(asset_path, nk_dir):
-        """Return a Nuke-portable relative path for asset_path,
-        anchored at the directory of the loaded .nk via the Tcl
-        expression ``[file dirname [knob root.name]]``.
+        """Return a forward-slashed path relative to the .nk's
+        directory.
 
-        Plain relative paths in a .nk are NOT reliably resolved
-        relative to the script -- Nuke can resolve them against
-        its CWD instead, depending on launch context. Using the
-        explicit Tcl expression always anchors at the script's
-        own directory, so relocating the export folder still
-        works.
+        Plain relative paths in a .nk resolve against the Root
+        node's ``project_directory``. ``_rewrite_nk_root`` sets
+        that knob to ``[python {nuke.script_directory()}]``, so
+        the plain relative form anchors at the script's own
+        directory and works for every node type -- including
+        readers that evaluate the ``file`` knob before any Tcl
+        substitution wrapped into the value itself (ReadGeo2
+        alembic, FFmpeg movie reader). Moving the export
+        folder, including across drives, keeps every reference
+        valid as long as the relative layout is preserved.
 
-        Falls back to a forward-slashed absolute path when relpath
-        isn't possible (e.g. different drives on Windows).
+        Falls back to a forward-slashed absolute path when
+        relpath isn't possible (e.g. different drives on
+        Windows at export time).
         """
         try:
             rel = os.path.relpath(asset_path, nk_dir)
         except ValueError:
             return os.path.abspath(asset_path).replace("\\", "/")
-        rel = rel.replace("\\", "/")
-        return "[file dirname [knob root.name]]/" + rel
+        return rel.replace("\\", "/")
 
     @staticmethod
     def _to_nuke_seq_pattern(path):
@@ -7853,23 +7857,6 @@ class Exporter(object):
             rel_paths = {}
             for k, v in assets.items():
                 rel_paths[k] = self._nk_relpath(v, nk_dir) if v else ""
-            # The alembic asset (ReadGeo2 / Camera3) can't resolve
-            # the Tcl-wrapped relpath nor a plain relative path
-            # reliably -- Nuke's alembic reader evaluates the file
-            # knob before Tcl substitution and against the launch
-            # CWD, not the script dir. Use an absolute forward-
-            # slashed path so the .abc is always found.
-            if alembic:
-                rel_paths["alembic"] = os.path.abspath(
-                    alembic).replace("\\", "/")
-            # Same problem hits the playblast Read: Nuke's FFmpeg
-            # movie reader resolves the file knob before the Tcl
-            # `[file dirname [knob root.name]]` substitution runs,
-            # so the .mp4/.mov can't be found via the relative form.
-            # Write an absolute forward-slashed path instead.
-            if playblast:
-                rel_paths["playblast"] = os.path.abspath(
-                    playblast).replace("\\", "/")
 
             # Per-Read dims: rd_stmap shares raw_plate's domain;
             # ud_stmap shares ud_plate's domain. Movies and geo
@@ -7953,13 +7940,16 @@ class Exporter(object):
                         scene_view_lines=sv_lines))
                 elif node_type == "Write":
                     # Substitute file knob if this Write has a
-                    # default; either way strip OCIO knobs.
+                    # default; either way strip OCIO knobs. The
+                    # plain relative form resolves against
+                    # Root.project_directory (set to the .nk's
+                    # own folder), so renders land next to the
+                    # .nk regardless of which drive it lives on.
                     if block_name in self._NK_WRITE_DEFAULTS:
                         suffix = self._NK_WRITE_DEFAULTS[block_name]
                         nk_stem = os.path.splitext(
                             os.path.basename(file_path))[0]
-                        rel = ("[file dirname [knob root.name]]/"
-                               + nk_stem + suffix)
+                        rel = nk_stem + suffix
                     else:
                         rel = None
                     out_lines.extend(self._rewrite_nk_write_block(
@@ -8003,22 +7993,43 @@ class Exporter(object):
     @staticmethod
     def _rewrite_nk_root(block, nk_path, start_frame, end_frame,
                          plate_w, plate_h):
-        """Rewrite Root node knobs: name, format, first/last_frame, frame.
+        """Rewrite Root node knobs: name, project_directory,
+        format, first/last_frame, frame.
 
-        Any pre-existing ``onScriptLoad`` line in the template is
-        stripped so an authored callback can't fight Nuke's natural
-        alembic loading path. The previous version installed a
-        reload+setSelectedItems callback to compensate for an empty
-        ``scene_view``; the ReadGeo2 block is now authored with a
-        fully populated ``scene_view`` (matching what
-        ``createScenefileBrowser`` writes), so the callback is no
-        longer needed and was implicated in script-load crashes.
+        ``project_directory`` is forced to
+        ``[python {nuke.script_directory()}]`` so every plain
+        relative path in the script resolves against the .nk's
+        own folder. This is what makes the export portable
+        across drives -- relocate the folder and Nuke still
+        finds the assets without any path edits.
+
+        Any pre-existing ``onScriptLoad`` line in the template
+        is stripped so an authored callback can't fight Nuke's
+        natural alembic loading path. The previous version
+        installed a reload+setSelectedItems callback to
+        compensate for an empty ``scene_view``; the ReadGeo2
+        block is now authored with a fully populated
+        ``scene_view`` (matching what ``createScenefileBrowser``
+        writes), so the callback is no longer needed and was
+        implicated in script-load crashes.
         """
+        # Backslash-escaped brackets/braces so Nuke stores the
+        # literal Tcl expression on the knob and re-evaluates it
+        # each load (rather than resolving once at parse time).
+        proj_dir_line = (
+            ' project_directory '
+            '"\\[python \\{nuke.script_directory()\\}\\]"')
         out = []
         abs_nk = os.path.abspath(nk_path).replace("\\", "/")
+        proj_dir_emitted = False
         for ln in block:
             if ln.startswith(" name "):
                 out.append(" name " + abs_nk)
+                out.append(proj_dir_line)
+                proj_dir_emitted = True
+            elif ln.startswith(" project_directory "):
+                # Drop any template-authored value -- we own this knob.
+                continue
             elif ln.startswith(" format ") and plate_w and plate_h:
                 out.append(Exporter._format_line_for(plate_w, plate_h))
             elif ln.startswith(" first_frame ") and start_frame is not None:
@@ -8031,6 +8042,13 @@ class Exporter(object):
                 continue  # strip any template-authored callback
             else:
                 out.append(ln)
+        if not proj_dir_emitted:
+            # Defensive: template lacked a `name` line. Insert
+            # before the closing brace, or append if absent.
+            if out and out[-1].startswith("}"):
+                out.insert(len(out) - 1, proj_dir_line)
+            else:
+                out.append(proj_dir_line)
         return out
 
     @staticmethod
@@ -8138,19 +8156,7 @@ class Exporter(object):
         knob_re = re.compile(r"^ ([a-zA-Z_][a-zA-Z0-9_]*) ")
 
         out = []
-        # Alembic-bound nodes (ReadGeo2, Camera3) resolve their `file`
-        # knob inside the alembic reader before Nuke's Tcl evaluator
-        # gets to substitute `[file dirname [knob root.name]]`, so the
-        # reader ends up trying to open a path that still contains the
-        # literal Tcl expression and the geometry/camera never loads.
-        # Strip the Tcl prefix for these blocks so the reader sees a
-        # plain relative path it can resolve against the script's dir.
-        is_alembic_block = node_type in ("ReadGeo2", "Camera3")
-        tcl_prefix = "[file dirname [knob root.name]]/"
         file_path_for_knob = rel_path
-        if (is_alembic_block and file_path_for_knob
-                and file_path_for_knob.startswith(tcl_prefix)):
-            file_path_for_knob = file_path_for_knob[len(tcl_prefix):]
         # ReadGeo2 alembic: author the block from scratch using the
         # canonical knob set Nuke writes via createScenefileBrowser.
         # Patching the templated knobs line-by-line has historically
