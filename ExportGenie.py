@@ -7584,8 +7584,9 @@ class Exporter(object):
         readers that evaluate the ``file`` knob before any Tcl
         substitution wrapped into the value itself (ReadGeo2
         alembic, FFmpeg movie reader). Moving the export
-        folder, including across drives, keeps every reference
-        valid as long as the relative layout is preserved.
+        folder, including across drives or platforms, keeps
+        every reference valid as long as the relative layout
+        is preserved.
 
         Falls back to a forward-slashed absolute path when
         relpath isn't possible (e.g. different drives on
@@ -7944,7 +7945,8 @@ class Exporter(object):
                     # plain relative form resolves against
                     # Root.project_directory (set to the .nk's
                     # own folder), so renders land next to the
-                    # .nk regardless of which drive it lives on.
+                    # .nk regardless of which drive or platform
+                    # it lives on.
                     if block_name in self._NK_WRITE_DEFAULTS:
                         suffix = self._NK_WRITE_DEFAULTS[block_name]
                         nk_stem = os.path.splitext(
@@ -8000,8 +8002,9 @@ class Exporter(object):
         ``[python {nuke.script_directory()}]`` so every plain
         relative path in the script resolves against the .nk's
         own folder. This is what makes the export portable
-        across drives -- relocate the folder and Nuke still
-        finds the assets without any path edits.
+        across drives and platforms -- relocate the folder and
+        Nuke still finds the assets without any path edits,
+        whether the script is opened on Windows or Mac.
 
         Any pre-existing ``onScriptLoad`` line in the template
         is stripped so an authored callback can't fight Nuke's
@@ -8156,7 +8159,6 @@ class Exporter(object):
         knob_re = re.compile(r"^ ([a-zA-Z_][a-zA-Z0-9_]*) ")
 
         out = []
-        file_path_for_knob = rel_path
         # ReadGeo2 alembic: author the block from scratch using the
         # canonical knob set Nuke writes via createScenefileBrowser.
         # Patching the templated knobs line-by-line has historically
@@ -8165,8 +8167,14 @@ class Exporter(object):
         # text Nuke would write itself avoids that whole class of bug.
         if node_type == "ReadGeo2":
             return Exporter._author_nk_readgeo_block(
-                block, file_path_for_knob, start_frame, end_frame,
+                block, rel_path, start_frame, end_frame,
                 scene_view_lines)
+        # Camera3 is the only remaining alembic-bound block (ReadGeo2
+        # returned above). Its range_first/range_last knobs follow the
+        # same convention Nuke writes when the alembic contains the
+        # shot range.
+        is_alembic_block = node_type == "Camera3"
+        file_path_for_knob = rel_path
         for ln in block:
             knob_match = knob_re.match(ln)
             if knob_match and knob_match.group(1) in dyn_knobs:
