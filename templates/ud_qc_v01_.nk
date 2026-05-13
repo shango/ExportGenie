@@ -3,19 +3,19 @@
 version 16.0 v8
 define_window_layout_xml {<?xml version="1.0" encoding="UTF-8"?>
 <layout version="1.0">
-    <window x="-3840" y="-7" w="2560" h="1369" maximized="1" screen="1">
+    <window x="-2" y="-5" w="1538" h="890" screen="0">
         <splitter orientation="1">
             <split size="40"/>
             <dock id="" hideTitles="1" activePageId="Toolbar.1">
                 <page id="Toolbar.1"/>
             </dock>
-            <split size="1897" stretch="1"/>
+            <split size="875" stretch="1"/>
             <splitter orientation="2">
-                <split size="778"/>
+                <split size="312"/>
                 <dock id="" activePageId="Viewer.1">
                     <page id="Viewer.1"/>
                 </dock>
-                <split size="548"/>
+                <split size="535"/>
                 <dock id="" activePageId="DAG.1" focus="true">
                     <page id="DAG.1"/>
                     <page id="Curve Editor.1"/>
@@ -150,13 +150,13 @@ Dot {
  xpos -1122
  ypos 635
 }
-set N32010c00 [stack 0]
+set N76610c00 [stack 0]
 Dot {
  name Dot2
  xpos -1122
  ypos 977
 }
-set N32011000 [stack 0]
+set N76611000 [stack 0]
 Read {
  inputs 0
  file_type exr
@@ -176,7 +176,13 @@ Dot {
  xpos -1452
  ypos 234
 }
-set N32011400 [stack 0]
+set N76611400 [stack 0]
+Dot {
+ name Dot21
+ xpos -1451
+ ypos 706
+}
+set N2359e400 [stack 0]
 Reformat {
  resize none
  pbb true
@@ -189,10 +195,11 @@ STMap {
  channels rgb
  uv rgb
  name stmap_rd
+ selected true
  xpos -1486
  ypos 973
 }
-set N32020f00 [stack 0]
+set N76620f00 [stack 0]
 Read {
  inputs 0
  file_type exr
@@ -209,9 +216,15 @@ Read {
  ypos -175
 }
 Dot {
+ name Dot19
+ xpos -1653
+ ypos 326
+}
+set N76611c00 [stack 0]
+Dot {
  name Dot3
  xpos -1653
- ypos 1353
+ ypos 973
 }
 Merge2 {
  inputs 2
@@ -219,16 +232,6 @@ Merge2 {
  name Merge1
  xpos -1486
  ypos 1349
-}
-Read {
- inputs 0
- file_type exr
- file ud_stmap
- format "3840 2160 0 0 3840 2160 1 UHD_4K"
- origset true
- name ud_stmap
- xpos -1311
- ypos -166
 }
 Dot {
  inputs 0
@@ -267,20 +270,11 @@ Dot {
  ypos 508
  hide_input true
 }
-Dot {
- inputs 0
- name Dot11
- label "<--if black Stmaps are working"
- xpos -1366
- ypos 1352
- hide_input true
-}
-push $N32020f00
-push $N32011000
+push $N76620f00
+push $N76611000
 Camera3 {
  inputs 0
  name Camera1
- selected true
  xpos -566
  ypos 482
 }
@@ -291,7 +285,7 @@ Wireframe {
  ypos 389
 }
 ReadGeo2 {
- name ReadGeo2
+ name alembic
  xpos -694
  ypos 496
 }
@@ -300,7 +294,7 @@ ScanlineRender {
  inputs 3
  conservative_shader_sampling false
  motion_vectors_type distance
- name ScanlineRender1
+ name scanline
  xpos -694
  ypos 598
 }
@@ -316,7 +310,7 @@ Reformat {
  xpos -694
  ypos 782
 }
-push $N32011400
+push $N76611400
 Dot {
  name Dot5
  xpos -416
@@ -353,7 +347,25 @@ Viewer {
  xpos -523
  ypos -171
 }
-push $N32010c00
+Dot {
+ inputs 0
+ name Dot8
+ label A
+ note_font_size 81
+ xpos -1479
+ ypos 1441
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot9
+ label B
+ note_font_size 81
+ xpos -1300
+ ypos 1440
+ hide_input true
+}
+push $N76610c00
 Read {
  inputs 0
  file_type mov
@@ -430,28 +442,59 @@ Write {
 }
 Dot {
  inputs 0
- name Dot8
- label A
- note_font_size 81
- xpos -1477
- ypos 1469
- hide_input true
-}
-Dot {
- inputs 0
  name Dot10
  label C
  note_font_size 81
- xpos -439
- ypos 1452
+ xpos -989
+ ypos 1442
  hide_input true
 }
 Dot {
  inputs 0
- name Dot9
- label B
+ name Dot1
+ label D
  note_font_size 81
- xpos -1002
- ypos 1472
+ xpos -439
+ ypos 1426
  hide_input true
+}
+Dot {
+ inputs 0
+ name Dot11
+ label "<--if black Stmaps are working"
+ xpos -1415
+ ypos 1525
+ hide_input true
+}
+push $N2359e400
+Read {
+ inputs 0
+ file_type exr
+ file ud_stmap
+ format "3840 2160 0 0 3840 2160 1 UHD_4K"
+ origset true
+ name ud_stmap
+ xpos -1311
+ ypos -176
+}
+push $N76611c00
+STMap {
+ inputs 2
+ channels rgb
+ uv rgb
+ name STMap1
+ xpos -1311
+ ypos 322
+}
+Merge2 {
+ inputs 2
+ operation difference
+ name Merge3
+ xpos -1311
+ ypos 1354
+}
+Dot {
+ name Dot20
+ xpos -1277
+ ypos 1380
 }
