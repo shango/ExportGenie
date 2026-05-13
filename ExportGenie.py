@@ -27,7 +27,8 @@ import maya.mel as mel
 try:
     from PySide6.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QGroupBox, QScrollArea,
-        QCheckBox, QPushButton, QLineEdit, QComboBox, QSpinBox, QSlider,
+        QCheckBox, QPushButton, QLineEdit, QComboBox, QSpinBox,
+        QDoubleSpinBox, QSlider,
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
         QColorDialog, QSizePolicy, QFrame, QApplication,
     )
@@ -37,7 +38,8 @@ try:
 except ImportError:
     from PySide2.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QGroupBox, QScrollArea,
-        QCheckBox, QPushButton, QLineEdit, QComboBox, QSpinBox, QSlider,
+        QCheckBox, QPushButton, QLineEdit, QComboBox, QSpinBox,
+        QDoubleSpinBox, QSlider,
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
         QColorDialog, QSizePolicy, QFrame, QApplication,
     )
@@ -51,7 +53,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v14"
+TOOL_VERSION = "v14.5"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -494,7 +496,8 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
                                color_index=17, line_width=2.0,
                                template=False, add_crosshair=True,
                                add_vertical_prongs=True,
-                               y_fraction=2.5 / 3.0):
+                               y_fraction=2.5 / 3.0,
+                               forward_offset=3.0):
     """Create a QC crown sized and constrained to the selected mesh.
 
     Select the KeenTools-tracked head mesh TRANSFORM (the animated
@@ -520,6 +523,14 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
     spike_len = max(0.05, radius * float(spike_len_ratio))
     y_fraction = max(0.0, min(1.0, float(y_fraction)))
     crown_pos = [center[0], ymin + head_h * y_fraction, center[2]]
+
+    # Bias the crown along the head's local +Z basis (out of the
+    # face) so it sits over the forehead instead of mid-skull.
+    if forward_offset:
+        wm = cmds.xform(head, q=True, matrix=True, worldSpace=True)
+        crown_pos[0] += wm[8] * float(forward_offset)
+        crown_pos[1] += wm[9] * float(forward_offset)
+        crown_pos[2] += wm[10] * float(forward_offset)
 
     grp = create_qc_crown(
         name=name, radius=radius, height=0.0,
@@ -2194,6 +2205,78 @@ class Exporter(object):
 
     # --- USD Export ---
 
+    def _bypass_postskin_blendshapes(self, root_nodes):
+        """Temporarily reroute meshes whose deformer chain ends with a
+        blendShape downstream of a skinCluster.
+
+        UsdSkel applies blendshapes in rest space *before* skinning, so
+        a Maya chain of `skinCluster -> blendShape -> shape` is not
+        representable. mayaUSDExport hits this configuration on the v02
+        GenHuman rig (body-morph blendshape) and silently emits the
+        skin binding without points/faceVertexCounts/faceVertexIndices.
+
+        Bypassing connects `skinCluster.outputGeometry -> shape.inMesh`
+        directly for the duration of the export, so the writer sees a
+        plain skinned mesh and writes topology correctly. Restore is
+        the caller's responsibility via _restore_postskin_blendshapes.
+
+        Returns a list of (shape, blendshape_out_plug, skin_out_plug)
+        tuples describing each rerouting performed.
+        """
+        bypassed = []
+        seen = set()
+        for root in root_nodes or []:
+            if not root or not cmds.objExists(root):
+                continue
+            meshes = cmds.listRelatives(
+                root, allDescendents=True, type="mesh",
+                fullPath=True) or []
+            for shp in meshes:
+                if shp in seen:
+                    continue
+                seen.add(shp)
+                bs_src = cmds.listConnections(
+                    shp + ".inMesh", source=True, destination=False,
+                    plugs=True, type="blendShape") or []
+                if not bs_src:
+                    continue
+                bs_plug = bs_src[0]
+                bs_node = bs_plug.split(".")[0]
+                sc_src = cmds.listConnections(
+                    bs_node + ".input[0].inputGeometry",
+                    source=True, destination=False,
+                    plugs=True, type="skinCluster") or []
+                if not sc_src:
+                    continue
+                sc_plug = sc_src[0]
+                try:
+                    cmds.disconnectAttr(bs_plug, shp + ".inMesh")
+                    cmds.connectAttr(
+                        sc_plug, shp + ".inMesh", force=True)
+                    bypassed.append((shp, bs_plug, sc_plug))
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD bypass post-skin "
+                        "blendShape on {}\n".format(shp))
+                except Exception as e:
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD bypass failed on "
+                        "{}: {}\n".format(shp, e))
+        return bypassed
+
+    def _restore_postskin_blendshapes(self, bypassed):
+        """Undo _bypass_postskin_blendshapes by reconnecting each
+        blendShape output back to its mesh's .inMesh."""
+        for shp, bs_plug, sc_plug in bypassed or []:
+            try:
+                if cmds.isConnected(sc_plug, shp + ".inMesh"):
+                    cmds.disconnectAttr(sc_plug, shp + ".inMesh")
+                cmds.connectAttr(
+                    bs_plug, shp + ".inMesh", force=True)
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " USD restore failed on "
+                    "{}: {}\n".format(shp, e))
+
     def export_usd(self, file_path, camera, geo_roots, proxy_geos,
                    start_frame, end_frame, rig_roots=None):
         """Export camera + geo roots + rig roots + proxy geo as USD.
@@ -2296,6 +2379,14 @@ class Exporter(object):
             sys.stderr.write(
                 LOG_PREFIX + " USD export: {}\n".format(usd_path))
 
+            # Bypass any blendShape sitting downstream of a skinCluster
+            # before computing has_blendshapes -- UsdSkel can't
+            # represent post-skin blendshapes (v02 GenHuman rig's
+            # body-morph F_BLN), and mayaUSDExport silently drops
+            # topology when it sees that chain.
+            bypassed_blendshapes = self._bypass_postskin_blendshapes(
+                select_nodes)
+
             # Only request blendshape export when there are
             # actual blendShape nodes in the selection  -- avoids
             # thousands of harmless but noisy USD plugin warnings.
@@ -2332,6 +2423,8 @@ class Exporter(object):
                     filterTypes=["nurbsCurve"],
                 )
             finally:
+                self._restore_postskin_blendshapes(
+                    bypassed_blendshapes)
                 if usd_wrapper and cmds.objExists(usd_wrapper):
                     try:
                         cmds.delete(usd_wrapper)
@@ -3754,7 +3847,8 @@ class Exporter(object):
                          composite_wireframe_opacity=0.9,
                          composite_wireframe_color=(0.6, 0.1, 0.1),
                          resolution=None,
-                         shot_name=None):
+                         shot_name=None,
+                         crown_forward_offset=3.0):
         """Export a QC playblast.
 
         Supports H.264 .mov (via QuickTime), PNG image sequence, or
@@ -4299,7 +4393,8 @@ class Exporter(object):
                         try:
                             cmds.select(crown_target, replace=True)
                             grp, _, _ = create_qc_crown_from_mesh(
-                                name="QC_head")
+                                name="QC_head",
+                                forward_offset=crown_forward_offset)
                             auto_qc_crown = grp
                             cmds.select(clear=True)
                             sys.stderr.write(
@@ -5980,16 +6075,20 @@ class Exporter(object):
 
     @staticmethod
     def apply_camera_far_for_scene(camera, far_value, log_fn=None):
-        """Set camera.farClipPlane and all attached imagePlane.depth
-        to `far_value` in the live scene. No-op on empty inputs.
+        """Set each attached imagePlane.depth to `far_value` (just
+        beyond the farthest object) and camera.farClipPlane to
+        `far_value + 1.0` (2 units beyond the farthest object, given
+        the +1 padding baked into `far_value`). No-op on empty inputs.
         """
         if not camera or far_value is None or not cmds.objExists(camera):
             return
+        depth_value = float(far_value)
+        clip_value = depth_value + 1.0
         cam_shapes = cmds.listRelatives(
             camera, shapes=True, type="camera") or []
         for cs in cam_shapes:
             try:
-                cmds.setAttr(cs + ".farClipPlane", float(far_value))
+                cmds.setAttr(cs + ".farClipPlane", clip_value)
             except Exception:
                 pass
             try:
@@ -5999,13 +6098,13 @@ class Exporter(object):
                 ips = []
             for ip in ips:
                 try:
-                    cmds.setAttr(ip + ".depth", float(far_value))
+                    cmds.setAttr(ip + ".depth", depth_value)
                 except Exception:
                     pass
         if log_fn:
             log_fn(
-                "{}: far clip + image plane depth set to {:.1f}".format(
-                    camera, float(far_value)))
+                "{}: image plane depth {:.1f}, far clip {:.1f}".format(
+                    camera, depth_value, clip_value))
 
     @staticmethod
     def _plate_name_from_path(path):
@@ -7921,8 +8020,17 @@ class Exporter(object):
                     out_lines.extend(self._rewrite_nk_root(
                         block, file_path, start_frame, end_frame,
                         plate_width, plate_height))
-                elif block_name in self._NK_NODE_TO_ASSET:
-                    asset_key = self._NK_NODE_TO_ASSET[block_name]
+                elif (node_type in ("Camera3", "ReadGeo2")
+                      or block_name in self._NK_NODE_TO_ASSET):
+                    # Alembic-bound nodes route by node type so a
+                    # renamed Camera3 / ReadGeo2 in the template still
+                    # resolves to the alembic asset; everything else
+                    # (raw_plate, ud_plate, rd_stmap, ud_stmap,
+                    # playblast) routes by the `name` knob.
+                    if node_type in ("Camera3", "ReadGeo2"):
+                        asset_key = "alembic"
+                    else:
+                        asset_key = self._NK_NODE_TO_ASSET[block_name]
                     is_seq = block_name in self._NK_SEQUENCE_NODES
                     is_movie = block_name in self._NK_MOVIE_NODES
                     asset_dims = read_dims_by_block_name.get(block_name)
@@ -8169,11 +8277,9 @@ class Exporter(object):
             return Exporter._author_nk_readgeo_block(
                 block, rel_path, start_frame, end_frame,
                 scene_view_lines)
-        # Camera3 is the only remaining alembic-bound block (ReadGeo2
-        # returned above). Its range_first/range_last knobs follow the
-        # same convention Nuke writes when the alembic contains the
-        # shot range.
-        is_alembic_block = node_type == "Camera3"
+        if node_type == "Camera3":
+            return Exporter._author_nk_camera3_block(
+                block, rel_path, start_frame, end_frame)
         file_path_for_knob = rel_path
         for ln in block:
             knob_match = knob_re.match(ln)
@@ -8210,15 +8316,6 @@ class Exporter(object):
                 # let Nuke auto-detect the movie's real range from
                 # the file header.
                 continue
-            elif is_alembic_block and ln.startswith(" range_first ") \
-                    and start_frame is not None:
-                # Nuke's natural value for an alembic that contains
-                # the shot range is 0; matches what
-                # createScenefileBrowser writes.
-                out.append(" range_first 0")
-            elif is_alembic_block and ln.startswith(" range_last ") \
-                    and end_frame is not None:
-                out.append(" range_last {}".format(int(end_frame)))
             else:
                 out.append(ln)
         return out
@@ -8275,6 +8372,48 @@ class Exporter(object):
             out.append(" range_last {}".format(int(end_frame)))
         if scene_view_lines:
             out.extend(scene_view_lines)
+        out.extend(identity_lines)
+        out.append("}")
+        return out
+
+    @staticmethod
+    def _author_nk_camera3_block(template_block, file_path,
+                                 start_frame, end_frame):
+        """Build a canonical Camera3 block from scratch.
+
+        The bundled-template Camera3 is consulted only for layout
+        knobs (``name``, ``xpos``, ``ypos``, ``inputs``, ``selected``);
+        every functional knob is emitted from a fixed canonical set
+        so a hand-edited or Nuke-saved template can't carry stale
+        animation curves, baked focal/aperture values, or fbx-look
+        rig knobs into the export. Mac and Windows both load the
+        alembic cleanly because the .nk only contains what Nuke
+        itself would write for a fresh alembic-bound Camera3.
+
+        Frame range is intentionally NOT emitted: Camera3 has no
+        ``range_first`` / ``range_last`` knobs (those live on
+        ReadGeo2). With ``read_from_file true`` Nuke takes the
+        camera animation range straight from the alembic.
+        """
+        keep_match = lambda ln, key: (
+            ln == " " + key
+            or ln.startswith(" " + key + " "))
+        inputs_line = next(
+            (ln for ln in template_block if keep_match(ln, "inputs")),
+            None)
+        identity_keys = ("name", "xpos", "ypos", "selected")
+        identity_lines = [
+            ln for ln in template_block
+            if any(keep_match(ln, k) for k in identity_keys)
+        ]
+        out = ["Camera3 {"]
+        if inputs_line is not None:
+            out.append(inputs_line)
+        out.append(" read_from_file true")
+        if file_path:
+            out.append(' file "{}"'.format(file_path))
+        else:
+            out.append(' file ""')
         out.extend(identity_lines)
         out.append("}")
         return out
@@ -8589,6 +8728,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_opacity_spin = None
         self.pb_wireframe_opacity_spin = None
         self.pb_wireframe_color_btn = None
+        self.pb_crown_forward_offset_spin = None
         # Matchmove tab (mm_)
         self.mm_camera_entries = []
         self.mm_camera_layout = None
@@ -9324,7 +9464,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_wireframe_opacity_spin.setRange(10, 100)
         self.pb_wireframe_opacity_spin.setValue(50)
         self.pb_wireframe_opacity_spin.setSuffix("%")
-        self.pb_wireframe_opacity_spin.setFixedWidth(60)
+        self.pb_wireframe_opacity_spin.setFixedWidth(80)
         self.pb_wireframe_opacity_spin.setToolTip(
             "Effective opacity of the wireframe edges over dark "
             "areas of the composite. Maya wireframes are dark "
@@ -9375,7 +9515,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_scale_spin = QSpinBox()
         self.pb_checker_scale_spin.setRange(1, 32)
         self.pb_checker_scale_spin.setValue(15)
-        self.pb_checker_scale_spin.setFixedWidth(50)
+        self.pb_checker_scale_spin.setFixedWidth(70)
         self.pb_checker_scale_spin.setToolTip("Scale of the UV checker pattern")
         sc_slider = QSlider(Qt.Horizontal)
         sc_slider.setRange(1, 32)
@@ -9393,7 +9533,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_opacity_spin = QSpinBox()
         self.pb_checker_opacity_spin.setRange(0, 100)
         self.pb_checker_opacity_spin.setValue(30)
-        self.pb_checker_opacity_spin.setFixedWidth(50)
+        self.pb_checker_opacity_spin.setFixedWidth(70)
         self.pb_checker_opacity_spin.setToolTip(
             "Overlay blend opacity (0=plate only, 100=full mesh overlay)")
         op_slider = QSlider(Qt.Horizontal)
@@ -9404,6 +9544,25 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         op_row.addWidget(self.pb_checker_opacity_spin)
         op_row.addWidget(op_slider)
         mmft_layout.addLayout(op_row)
+
+        # Crown Forward Offset (Face Track only) -- pushes the QC crown
+        # along the head's local +Z so it sits over the forehead.
+        cf_row = QHBoxLayout()
+        cf_row.setSpacing(8)
+        cf_row.addWidget(QLabel("Crown Forward Offset:"))
+        self.pb_crown_forward_offset_spin = QDoubleSpinBox()
+        self.pb_crown_forward_offset_spin.setRange(-50.0, 50.0)
+        self.pb_crown_forward_offset_spin.setSingleStep(0.5)
+        self.pb_crown_forward_offset_spin.setDecimals(2)
+        self.pb_crown_forward_offset_spin.setValue(3.0)
+        self.pb_crown_forward_offset_spin.setFixedWidth(80)
+        self.pb_crown_forward_offset_spin.setToolTip(
+            "Distance (Maya units) to push the QC crown along the "
+            "head's local +Z axis so it sits over the forehead "
+            "instead of mid-skull. Face Track only.")
+        cf_row.addWidget(self.pb_crown_forward_offset_spin)
+        cf_row.addStretch()
+        mmft_layout.addLayout(cf_row)
 
         mmft.setLayout(mmft_layout)
         tab_layout.addWidget(mmft)
@@ -9444,6 +9603,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self._update_color_button(self.pb_checker_color_btn)
         self.pb_checker_scale_spin.setValue(15)
         self.pb_checker_opacity_spin.setValue(30)
+        self.pb_crown_forward_offset_spin.setValue(3.0)
 
     def _build_frame_range(self):
         group = CollapsibleGroupBox("Frame Range")
@@ -10714,6 +10874,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     composite_wireframe_geo=face_meshes,
                     composite_wireframe_opacity=wf_opacity,
                     composite_wireframe_color=wf_color,
+                    crown_forward_offset=(
+                        self.pb_crown_forward_offset_spin.value()),
                 )
             pb_kwargs.update(
                 checker_scale=chk_scale,
@@ -12247,6 +12409,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_geo=face_meshes,
                         composite_wireframe_opacity=wf_opacity,
                         composite_wireframe_color=wf_color,
+                        crown_forward_offset=(
+                            self.pb_crown_forward_offset_spin.value()),
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
