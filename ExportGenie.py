@@ -386,21 +386,30 @@ def _qc_make_closed_curve(points, name):
 
 
 def _qc_local_bbox(node):
-    """Return ``(xmin, ymin, zmin, xmax, ymax, zmax)`` in *node*'s local space.
+    """Return ``(xmin, ymin, zmin, xmax, ymax, zmax)`` in object space.
 
-    Pose-invariant: head rotation/translation does not affect this. The
-    world AABB centroid drifts as the head rotates (the AABB grows on
-    whichever side the head tilts toward), so reading
-    ``exactWorldBoundingBox`` at a non-neutral frame biases crown
-    placement off-center -- using the local bbox eliminates that.
+    Pose-invariant: the parent transform's TRS animation does not
+    affect this. The world AABB centroid drifts as the head rotates
+    (the AABB grows on whichever side the head tilts toward), so
+    reading ``exactWorldBoundingBox`` at a non-neutral frame biases
+    crown placement off-center -- the object-space bbox eliminates
+    that.
     """
-    import maya.api.OpenMaya as om2
-    sel = om2.MSelectionList()
-    sel.add(node)
-    dag = sel.getDagPath(0)
-    bb = om2.MFnDagNode(dag).boundingBox
-    return (bb.min.x, bb.min.y, bb.min.z,
-            bb.max.x, bb.max.y, bb.max.z)
+    if cmds.nodeType(node) == "mesh":
+        shape = node
+    else:
+        shapes = cmds.listRelatives(
+            node, shapes=True, type="mesh", noIntermediate=True,
+            fullPath=True) or []
+        if not shapes:
+            raise RuntimeError(
+                "No mesh shape under {} for crown bbox.".format(node))
+        shape = shapes[0]
+    # polyEvaluate -boundingBox returns ((xmin, xmax), (ymin, ymax),
+    # (zmin, zmax)) in the mesh's object-space coordinates.
+    (xmin, xmax), (ymin, ymax), (zmin, zmax) = cmds.polyEvaluate(
+        shape, boundingBox=True)
+    return (xmin, ymin, zmin, xmax, ymax, zmax)
 
 
 def create_qc_crown(name="QC_head", radius=14.0, height=0.0,
@@ -4417,9 +4426,17 @@ class Exporter(object):
                                 "QC_head_GRP constrained to "
                                 "{}\n".format(crown_target))
                         except Exception as e:
+                            import traceback as _tb
                             sys.stderr.write(
                                 LOG_PREFIX + " QC crown "
-                                "creation failed: {}\n".format(e))
+                                "creation failed: {}\n{}\n".format(
+                                    e, _tb.format_exc()))
+                    else:
+                        sys.stderr.write(
+                            LOG_PREFIX + " QC crown skipped: no "
+                            "mesh transform found under "
+                            "matchmove_geo[0]={}\n".format(
+                                first_mesh))
                 if (cmds.objExists("QC_head_GRP")
                         and cmds.listRelatives(
                             "QC_head_GRP", allDescendents=True,
@@ -4812,13 +4829,28 @@ class Exporter(object):
 
                         # --- Pass 4: Crown curves (Face Track only) ---
                         has_crown_pass = False
-                        if (face_track_mode
-                                and cmds.objExists("QC_head_GRP")
-                                and cmds.listRelatives(
-                                    "QC_head_GRP",
-                                    allDescendents=True,
-                                    type="nurbsCurve")
-                                and composite_tmp_dir):
+                        crown_pass_skip_reason = None
+                        if not face_track_mode:
+                            crown_pass_skip_reason = (
+                                "not face_track_mode")
+                        elif not cmds.objExists("QC_head_GRP"):
+                            crown_pass_skip_reason = (
+                                "QC_head_GRP missing in scene")
+                        elif not cmds.listRelatives(
+                                "QC_head_GRP",
+                                allDescendents=True,
+                                type="nurbsCurve"):
+                            crown_pass_skip_reason = (
+                                "QC_head_GRP has no nurbsCurve "
+                                "descendants")
+                        elif not composite_tmp_dir:
+                            crown_pass_skip_reason = (
+                                "composite_tmp_dir not provided")
+                        if crown_pass_skip_reason:
+                            sys.stderr.write(
+                                LOG_PREFIX + " Crown pass skipped: "
+                                "{}\n".format(crown_pass_skip_reason))
+                        if crown_pass_skip_reason is None:
                             crown_path = os.path.join(
                                 composite_tmp_dir, "crown",
                                 os.path.basename(
