@@ -385,17 +385,22 @@ def _qc_make_closed_curve(points, name):
     return crv
 
 
-def _qc_bbox_radius_and_center(node, pad=1.25):
-    """Return *(radius, centerXYZ, yMin, yMax)* from the world bbox."""
-    bb = cmds.exactWorldBoundingBox(node)
-    xmin, ymin, zmin, xmax, ymax, zmax = bb
-    cx = (xmin + xmax) * 0.5
-    cy = (ymin + ymax) * 0.5
-    cz = (zmin + zmax) * 0.5
-    dx = xmax - xmin
-    dz = zmax - zmin
-    radius = (max(dx, dz) * 0.5) * float(pad)
-    return radius, (cx, cy, cz), ymin, ymax
+def _qc_local_bbox(node):
+    """Return ``(xmin, ymin, zmin, xmax, ymax, zmax)`` in *node*'s local space.
+
+    Pose-invariant: head rotation/translation does not affect this. The
+    world AABB centroid drifts as the head rotates (the AABB grows on
+    whichever side the head tilts toward), so reading
+    ``exactWorldBoundingBox`` at a non-neutral frame biases crown
+    placement off-center -- using the local bbox eliminates that.
+    """
+    import maya.api.OpenMaya as om2
+    sel = om2.MSelectionList()
+    sel.add(node)
+    dag = sel.getDagPath(0)
+    bb = om2.MFnDagNode(dag).boundingBox
+    return (bb.min.x, bb.min.y, bb.min.z,
+            bb.max.x, bb.max.y, bb.max.z)
 
 
 def create_qc_crown(name="QC_head", radius=14.0, height=0.0,
@@ -496,17 +501,18 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
                                color_index=17, line_width=2.0,
                                template=False, add_crosshair=True,
                                add_vertical_prongs=True,
-                               y_fraction=2.5 / 3.0,
-                               forward_offset=3.0):
+                               y_fraction=2.5 / 3.0):
     """Create a QC crown sized and constrained to the selected mesh.
 
     Select the KeenTools-tracked head mesh TRANSFORM (the animated
-    mesh) first, then call this.  The crown is positioned at the
-    upper portion of the bounding box, then point + orient
-    constrained to the mesh with maintainOffset.
+    mesh) first, then call this. Placement is computed in the head's
+    LOCAL space (pose-invariant) and the crown is parent-constrained
+    to the head with maintainOffset, so the crown stays welded to the
+    same point on the head regardless of which frame the script runs
+    on or how the head is rotated.
 
     Returns:
-        tuple: (group, pointConstraint, orientConstraint)
+        tuple: (group, parentConstraint)
     """
     sel = cmds.ls(sl=True, long=True) or []
     if not sel:
@@ -517,20 +523,31 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
             "Select only ONE node: the tracked head mesh transform.")
 
     head = sel[0]
-    radius, center, ymin, ymax = _qc_bbox_radius_and_center(
-        head, pad=pad)
+    xmin, ymin, zmin, xmax, ymax, zmax = _qc_local_bbox(head)
+    cx = (xmin + xmax) * 0.5
+    cz = (zmin + zmax) * 0.5
     head_h = max(1e-6, ymax - ymin)
+    dx = xmax - xmin
+    dz = zmax - zmin
+    radius = (max(dx, dz) * 0.5) * float(pad)
     spike_len = max(0.05, radius * float(spike_len_ratio))
     y_fraction = max(0.0, min(1.0, float(y_fraction)))
-    crown_pos = [center[0], ymin + head_h * y_fraction, center[2]]
 
-    # Bias the crown along the head's local +Z basis (out of the
-    # face) so it sits over the forehead instead of mid-skull.
-    if forward_offset:
-        wm = cmds.xform(head, q=True, matrix=True, worldSpace=True)
-        crown_pos[0] += wm[8] * float(forward_offset)
-        crown_pos[1] += wm[9] * float(forward_offset)
-        crown_pos[2] += wm[10] * float(forward_offset)
+    # Position in head's LOCAL frame: centered in X/Z, raised to the
+    # upper portion in Y so the crown sits like a halo on top of the
+    # head rather than at face level.
+    lx, ly, lz = cx, ymin + head_h * y_fraction, cz
+
+    # Transform the local position through the head's world matrix to
+    # get the world-space placement at the current frame. Maya's
+    # matrix is row-major / row-vector: translation at [12..14], local
+    # axis basis rows at [0..2], [4..6], [8..10].
+    wm = cmds.xform(head, q=True, matrix=True, worldSpace=True)
+    world_pos = (
+        lx * wm[0] + ly * wm[4] + lz * wm[8]  + wm[12],
+        lx * wm[1] + ly * wm[5] + lz * wm[9]  + wm[13],
+        lx * wm[2] + ly * wm[6] + lz * wm[10] + wm[14],
+    )
 
     grp = create_qc_crown(
         name=name, radius=radius, height=0.0,
@@ -541,15 +558,15 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
         color_index=color_index, line_width=line_width,
         template=template)
 
-    # Position then constrain to the mesh transform.
-    # The mesh transform has animCurves on TRS from the face
-    # tracking solve  -- the constraints follow this animation.
-    cmds.xform(grp, ws=True, t=crown_pos)
-    pc = cmds.pointConstraint(head, grp, mo=True)[0]
-    oc = cmds.orientConstraint(head, grp, mo=True)[0]
+    cmds.xform(grp, ws=True, t=world_pos)
+    # parentConstraint (NOT pointConstraint+orientConstraint): stores
+    # the offset in the head's LOCAL space, so the crown orbits with
+    # head rotation. point+orient stored a world-space delta and
+    # caused the crown to drift off-center as the head pivoted.
+    pc = cmds.parentConstraint(head, grp, mo=True)[0]
 
     cmds.select(grp)
-    return grp, pc, oc
+    return grp, pc
 
 
 # Exporter
@@ -3847,8 +3864,7 @@ class Exporter(object):
                          composite_wireframe_opacity=0.9,
                          composite_wireframe_color=(0.6, 0.1, 0.1),
                          resolution=None,
-                         shot_name=None,
-                         crown_forward_offset=3.0):
+                         shot_name=None):
         """Export a QC playblast.
 
         Supports H.264 .mov (via QuickTime), PNG image sequence, or
@@ -4392,9 +4408,8 @@ class Exporter(object):
                     if crown_target:
                         try:
                             cmds.select(crown_target, replace=True)
-                            grp, _, _ = create_qc_crown_from_mesh(
-                                name="QC_head",
-                                forward_offset=crown_forward_offset)
+                            grp, _ = create_qc_crown_from_mesh(
+                                name="QC_head")
                             auto_qc_crown = grp
                             cmds.select(clear=True)
                             sys.stderr.write(
@@ -8728,7 +8743,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_opacity_spin = None
         self.pb_wireframe_opacity_spin = None
         self.pb_wireframe_color_btn = None
-        self.pb_crown_forward_offset_spin = None
         # Matchmove tab (mm_)
         self.mm_camera_entries = []
         self.mm_camera_layout = None
@@ -9545,25 +9559,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         op_row.addWidget(op_slider)
         mmft_layout.addLayout(op_row)
 
-        # Crown Forward Offset (Face Track only) -- pushes the QC crown
-        # along the head's local +Z so it sits over the forehead.
-        cf_row = QHBoxLayout()
-        cf_row.setSpacing(8)
-        cf_row.addWidget(QLabel("Crown Forward Offset:"))
-        self.pb_crown_forward_offset_spin = QDoubleSpinBox()
-        self.pb_crown_forward_offset_spin.setRange(-50.0, 50.0)
-        self.pb_crown_forward_offset_spin.setSingleStep(0.5)
-        self.pb_crown_forward_offset_spin.setDecimals(2)
-        self.pb_crown_forward_offset_spin.setValue(3.0)
-        self.pb_crown_forward_offset_spin.setFixedWidth(80)
-        self.pb_crown_forward_offset_spin.setToolTip(
-            "Distance (Maya units) to push the QC crown along the "
-            "head's local +Z axis so it sits over the forehead "
-            "instead of mid-skull. Face Track only.")
-        cf_row.addWidget(self.pb_crown_forward_offset_spin)
-        cf_row.addStretch()
-        mmft_layout.addLayout(cf_row)
-
         mmft.setLayout(mmft_layout)
         tab_layout.addWidget(mmft)
 
@@ -9603,7 +9598,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self._update_color_button(self.pb_checker_color_btn)
         self.pb_checker_scale_spin.setValue(15)
         self.pb_checker_opacity_spin.setValue(30)
-        self.pb_crown_forward_offset_spin.setValue(3.0)
 
     def _build_frame_range(self):
         group = CollapsibleGroupBox("Frame Range")
@@ -10874,8 +10868,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     composite_wireframe_geo=face_meshes,
                     composite_wireframe_opacity=wf_opacity,
                     composite_wireframe_color=wf_color,
-                    crown_forward_offset=(
-                        self.pb_crown_forward_offset_spin.value()),
                 )
             pb_kwargs.update(
                 checker_scale=chk_scale,
@@ -12409,8 +12401,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_geo=face_meshes,
                         composite_wireframe_opacity=wf_opacity,
                         composite_wireframe_color=wf_color,
-                        crown_forward_offset=(
-                            self.pb_crown_forward_offset_spin.value()),
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
                 self._advance_progress()
