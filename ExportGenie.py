@@ -385,31 +385,61 @@ def _qc_make_closed_curve(points, name):
     return crv
 
 
-def _qc_local_bbox(node):
-    """Return ``(xmin, ymin, zmin, xmax, ymax, zmax)`` in object space.
+def _qc_bbox_radius_and_center(node, pad=1.25):
+    """Return *(radius, centerXYZ, yMin, yMax)* in WORLD space.
 
-    Pose-invariant: the parent transform's TRS animation does not
-    affect this. The world AABB centroid drifts as the head rotates
-    (the AABB grows on whichever side the head tilts toward), so
-    reading ``exactWorldBoundingBox`` at a non-neutral frame biases
-    crown placement off-center -- the object-space bbox eliminates
-    that.
+    The previous implementation read ``exactWorldBoundingBox``, which
+    returns an axis-aligned bbox of the deformed/transformed mesh in
+    world space. As the head rotates that AABB grows on whichever
+    side the head tilts toward, shifting the centroid away from the
+    head's geometric center -- so running the playblast on a non-
+    neutral pose biased the crown off-center for the whole shot.
+
+    Read the bbox from the mesh's object-space vertices (pose-
+    invariant) and transform the centroid + vertical extents through
+    the head's current world matrix to recover the same world-space
+    outputs the rest of the pipeline already expects.
     """
-    if cmds.nodeType(node) == "mesh":
-        shape = node
-    else:
-        shapes = cmds.listRelatives(
-            node, shapes=True, type="mesh", noIntermediate=True,
-            fullPath=True) or []
-        if not shapes:
-            raise RuntimeError(
-                "No mesh shape under {} for crown bbox.".format(node))
-        shape = shapes[0]
-    # polyEvaluate -boundingBox returns ((xmin, xmax), (ymin, ymax),
-    # (zmin, zmax)) in the mesh's object-space coordinates.
-    (xmin, xmax), (ymin, ymax), (zmin, zmax) = cmds.polyEvaluate(
-        shape, boundingBox=True)
-    return (xmin, ymin, zmin, xmax, ymax, zmax)
+    shapes = cmds.listRelatives(
+        node, shapes=True, type="mesh", noIntermediate=True,
+        fullPath=True) or []
+    if not shapes:
+        # Non-mesh fallback (curves, surfaces, empty groups): use the
+        # world AABB so callers still get something usable.
+        xmin, ymin, zmin, xmax, ymax, zmax = (
+            cmds.exactWorldBoundingBox(node))
+        cx = (xmin + xmax) * 0.5
+        cy = (ymin + ymax) * 0.5
+        cz = (zmin + zmax) * 0.5
+        radius = (max(xmax - xmin, zmax - zmin) * 0.5) * float(pad)
+        return radius, (cx, cy, cz), ymin, ymax
+
+    (lxmin, lxmax), (lymin, lymax), (lzmin, lzmax) = cmds.polyEvaluate(
+        shapes[0], boundingBox=True)
+    lcx = (lxmin + lxmax) * 0.5
+    lcy = (lymin + lymax) * 0.5
+    lcz = (lzmin + lzmax) * 0.5
+
+    wm = cmds.xform(node, q=True, matrix=True, worldSpace=True)
+
+    def _xform(lx, ly, lz):
+        return (
+            lx * wm[0] + ly * wm[4] + lz * wm[8]  + wm[12],
+            lx * wm[1] + ly * wm[5] + lz * wm[9]  + wm[13],
+            lx * wm[2] + ly * wm[6] + lz * wm[10] + wm[14],
+        )
+
+    cx, cy, cz = _xform(lcx, lcy, lcz)
+    # World Y of the bbox top/bottom: transform the center column at
+    # local ymin/ymax through wm and take the actual min/max so the
+    # head's rotation doesn't flip them.
+    _, p_min_y, _ = _xform(lcx, lymin, lcz)
+    _, p_max_y, _ = _xform(lcx, lymax, lcz)
+    ymin_w = min(p_min_y, p_max_y)
+    ymax_w = max(p_min_y, p_max_y)
+
+    radius = (max(lxmax - lxmin, lzmax - lzmin) * 0.5) * float(pad)
+    return radius, (cx, cy, cz), ymin_w, ymax_w
 
 
 def create_qc_crown(name="QC_head", radius=14.0, height=0.0,
@@ -514,14 +544,12 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
     """Create a QC crown sized and constrained to the selected mesh.
 
     Select the KeenTools-tracked head mesh TRANSFORM (the animated
-    mesh) first, then call this. Placement is computed in the head's
-    LOCAL space (pose-invariant) and the crown is parent-constrained
-    to the head with maintainOffset, so the crown stays welded to the
-    same point on the head regardless of which frame the script runs
-    on or how the head is rotated.
+    mesh) first, then call this.  The crown is positioned at the
+    upper portion of the bounding box, then point + orient
+    constrained to the mesh with maintainOffset.
 
     Returns:
-        tuple: (group, parentConstraint)
+        tuple: (group, pointConstraint, orientConstraint)
     """
     sel = cmds.ls(sl=True, long=True) or []
     if not sel:
@@ -532,31 +560,12 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
             "Select only ONE node: the tracked head mesh transform.")
 
     head = sel[0]
-    xmin, ymin, zmin, xmax, ymax, zmax = _qc_local_bbox(head)
-    cx = (xmin + xmax) * 0.5
-    cz = (zmin + zmax) * 0.5
+    radius, center, ymin, ymax = _qc_bbox_radius_and_center(
+        head, pad=pad)
     head_h = max(1e-6, ymax - ymin)
-    dx = xmax - xmin
-    dz = zmax - zmin
-    radius = (max(dx, dz) * 0.5) * float(pad)
     spike_len = max(0.05, radius * float(spike_len_ratio))
     y_fraction = max(0.0, min(1.0, float(y_fraction)))
-
-    # Position in head's LOCAL frame: centered in X/Z, raised to the
-    # upper portion in Y so the crown sits like a halo on top of the
-    # head rather than at face level.
-    lx, ly, lz = cx, ymin + head_h * y_fraction, cz
-
-    # Transform the local position through the head's world matrix to
-    # get the world-space placement at the current frame. Maya's
-    # matrix is row-major / row-vector: translation at [12..14], local
-    # axis basis rows at [0..2], [4..6], [8..10].
-    wm = cmds.xform(head, q=True, matrix=True, worldSpace=True)
-    world_pos = (
-        lx * wm[0] + ly * wm[4] + lz * wm[8]  + wm[12],
-        lx * wm[1] + ly * wm[5] + lz * wm[9]  + wm[13],
-        lx * wm[2] + ly * wm[6] + lz * wm[10] + wm[14],
-    )
+    crown_pos = [center[0], ymin + head_h * y_fraction, center[2]]
 
     grp = create_qc_crown(
         name=name, radius=radius, height=0.0,
@@ -567,24 +576,15 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
         color_index=color_index, line_width=line_width,
         template=template)
 
-    cmds.xform(grp, ws=True, t=world_pos)
-    # parentConstraint (NOT pointConstraint+orientConstraint): stores
-    # the offset in the head's LOCAL space, so the crown orbits with
-    # head rotation. point+orient stored a world-space delta and
-    # caused the crown to drift off-center as the head pivoted.
-    pc = cmds.parentConstraint(head, grp, mo=True)[0]
-
-    sys.stderr.write(
-        "{} Crown placement: head={} local_bbox=({:.3f},{:.3f},{:.3f})"
-        "->({:.3f},{:.3f},{:.3f}) local_pos=({:.3f},{:.3f},{:.3f}) "
-        "radius={:.3f} world_pos=({:.3f},{:.3f},{:.3f})\n".format(
-            LOG_PREFIX, head,
-            xmin, ymin, zmin, xmax, ymax, zmax,
-            lx, ly, lz, radius,
-            world_pos[0], world_pos[1], world_pos[2]))
+    # Position then constrain to the mesh transform.
+    # The mesh transform has animCurves on TRS from the face
+    # tracking solve  -- the constraints follow this animation.
+    cmds.xform(grp, ws=True, t=crown_pos)
+    pc = cmds.pointConstraint(head, grp, mo=True)[0]
+    oc = cmds.orientConstraint(head, grp, mo=True)[0]
 
     cmds.select(grp)
-    return grp, pc
+    return grp, pc, oc
 
 
 # Exporter
@@ -1378,14 +1378,22 @@ class Exporter(object):
         if wireframe_idx is not None:
             # Alpha-keyed overlay of the wireframe pass.
             #
-            # Maya playblast PNGs carry alpha=1 everywhere regardless
-            # of what's drawn, so we cannot rely on the file's alpha
-            # channel -- doing so washes the whole frame out at the
-            # configured opacity and erases anything composited
-            # underneath (e.g. the QC crown). Instead we boost the
-            # RGB to the requested color and derive alpha from the
-            # boosted luma: bright wireframe edges become opaque, the
-            # black background becomes fully transparent.
+            # Assumes the wireframe playblast PNG carries a useful
+            # alpha channel from the useBackground shader (alpha=1
+            # at the front-facing edges, 0 elsewhere). The wireframe
+            # RGB is boosted via lutrgb so Maya's dark default
+            # wireframe color (~0.2 luma) lands near-white at the
+            # edges, then the alpha is scaled by `wireframe_opacity`
+            # so the artist controls transparency directly. Final
+            # composite is a true alpha-over `overlay`, so edges
+            # remain visible even over bright areas of the comp
+            # (screen-blend would wash out there).
+            #
+            # If the playblast turns out NOT to carry meaningful
+            # alpha, this will white-wash the whole frame at the
+            # configured opacity -- in that case revert to the
+            # screen-blend approach (boost RGB, blend=all_mode=
+            # screen) which works on RGB-only data.
             wf_op = max(0.1, min(1.0, float(wireframe_opacity)))
             # Maya wireframe luma ~0.2; multiply per channel to land
             # on the requested color (0.2 * 5 = 1.0).
@@ -1396,11 +1404,8 @@ class Exporter(object):
             filter_complex += (
                 ";{prev}format=rgba[wf_bg];"
                 "[{idx}:v]format=rgba,"
-                "lutrgb=r=val*{r}:g=val*{g}:b=val*{b}[wf_boosted];"
-                "[wf_boosted]split[wf_color][wf_luma_src];"
-                "[wf_luma_src]format=gray[wf_alpha];"
-                "[wf_color][wf_alpha]alphamerge,"
-                "format=rgba,colorchannelmixer=aa={op}[wf_fg];"
+                "lutrgb=r=val*{r}:g=val*{g}:b=val*{b},"
+                "colorchannelmixer=aa={op}[wf_fg];"
                 "[wf_bg][wf_fg]overlay=format=auto[out]"
             ).format(idx=wireframe_idx, prev=prev_stage,
                      r="{:.3f}".format(wf_r),
@@ -4421,7 +4426,7 @@ class Exporter(object):
                     if crown_target:
                         try:
                             cmds.select(crown_target, replace=True)
-                            grp, _ = create_qc_crown_from_mesh(
+                            grp, _, _ = create_qc_crown_from_mesh(
                                 name="QC_head")
                             auto_qc_crown = grp
                             cmds.select(clear=True)
@@ -4430,17 +4435,9 @@ class Exporter(object):
                                 "QC_head_GRP constrained to "
                                 "{}\n".format(crown_target))
                         except Exception as e:
-                            import traceback as _tb
                             sys.stderr.write(
                                 LOG_PREFIX + " QC crown "
-                                "creation failed: {}\n{}\n".format(
-                                    e, _tb.format_exc()))
-                    else:
-                        sys.stderr.write(
-                            LOG_PREFIX + " QC crown skipped: no "
-                            "mesh transform found under "
-                            "matchmove_geo[0]={}\n".format(
-                                first_mesh))
+                                "creation failed: {}\n".format(e))
                 if (cmds.objExists("QC_head_GRP")
                         and cmds.listRelatives(
                             "QC_head_GRP", allDescendents=True,
@@ -4833,28 +4830,13 @@ class Exporter(object):
 
                         # --- Pass 4: Crown curves (Face Track only) ---
                         has_crown_pass = False
-                        crown_pass_skip_reason = None
-                        if not face_track_mode:
-                            crown_pass_skip_reason = (
-                                "not face_track_mode")
-                        elif not cmds.objExists("QC_head_GRP"):
-                            crown_pass_skip_reason = (
-                                "QC_head_GRP missing in scene")
-                        elif not cmds.listRelatives(
-                                "QC_head_GRP",
-                                allDescendents=True,
-                                type="nurbsCurve"):
-                            crown_pass_skip_reason = (
-                                "QC_head_GRP has no nurbsCurve "
-                                "descendants")
-                        elif not composite_tmp_dir:
-                            crown_pass_skip_reason = (
-                                "composite_tmp_dir not provided")
-                        if crown_pass_skip_reason:
-                            sys.stderr.write(
-                                LOG_PREFIX + " Crown pass skipped: "
-                                "{}\n".format(crown_pass_skip_reason))
-                        if crown_pass_skip_reason is None:
+                        if (face_track_mode
+                                and cmds.objExists("QC_head_GRP")
+                                and cmds.listRelatives(
+                                    "QC_head_GRP",
+                                    allDescendents=True,
+                                    type="nurbsCurve")
+                                and composite_tmp_dir):
                             crown_path = os.path.join(
                                 composite_tmp_dir, "crown",
                                 os.path.basename(
@@ -4929,50 +4911,6 @@ class Exporter(object):
                                 int(start_frame), edit=True)
                             cmds.ogs(reset=True)
                             cmds.refresh(force=True)
-                            crown_iso_dump = []
-                            try:
-                                crown_iso_dump = cmds.isolateSelect(
-                                    model_panel,
-                                    query=True,
-                                    viewObjects=True) or []
-                            except Exception:
-                                pass
-                            crown_iso_set = []
-                            try:
-                                iso_set_node = (
-                                    cmds.modelEditor(
-                                        model_panel, query=True,
-                                        viewObjects=True))
-                                if iso_set_node:
-                                    crown_iso_set = (
-                                        cmds.sets(
-                                            iso_set_node, query=True)
-                                        or [])
-                            except Exception:
-                                pass
-                            crown_curves_dbg = (
-                                cmds.listRelatives(
-                                    "QC_head_GRP",
-                                    allDescendents=True,
-                                    type="nurbsCurve",
-                                    fullPath=True) or [])
-                            sys.stderr.write(
-                                LOG_PREFIX + " Crown pass DBG: panel="
-                                "{} nurbsCurves={} qc_curves={} "
-                                "iso_state={} iso_set_size={}\n".format(
-                                    model_panel,
-                                    cmds.modelEditor(
-                                        model_panel, query=True,
-                                        nurbsCurves=True),
-                                    len(crown_curves_dbg),
-                                    cmds.isolateSelect(
-                                        model_panel, query=True,
-                                        state=True),
-                                    len(crown_iso_set)))
-                            sys.stderr.write(
-                                LOG_PREFIX + " Crown pass DBG: "
-                                "iso_set sample={}\n".format(
-                                    crown_iso_set[:8]))
                             cmds.playblast(
                                 filename=crown_path,
                                 format="image",
@@ -4990,36 +4928,6 @@ class Exporter(object):
                                 widthHeight=[pb_width, pb_height],
                             )
                             has_crown_pass = True
-
-                            # DEBUG: report crown PNG sizes + copy
-                            # the first frame to a stable inspection
-                            # path so the artist can look at what was
-                            # actually written before cleanup.
-                            try:
-                                import glob as _glob
-                                crown_pngs = sorted(_glob.glob(
-                                    crown_path + ".*.png"))
-                                sizes = [
-                                    os.path.getsize(p)
-                                    for p in crown_pngs[:3]]
-                                sys.stderr.write(
-                                    LOG_PREFIX + " Crown pass wrote "
-                                    "{} PNGs, first sizes={} bytes\n"
-                                    .format(len(crown_pngs), sizes))
-                                if crown_pngs:
-                                    debug_dst = os.path.join(
-                                        os.path.dirname(
-                                            composite_tmp_dir),
-                                        "DEBUG_crown_first.png")
-                                    shutil.copy2(
-                                        crown_pngs[0], debug_dst)
-                                    sys.stderr.write(
-                                        LOG_PREFIX + " DEBUG copy: "
-                                        "{}\n".format(debug_dst))
-                            except Exception as _e:
-                                sys.stderr.write(
-                                    LOG_PREFIX + " Crown PNG size "
-                                    "check failed: {}\n".format(_e))
 
                             # Restore original shading and cleanup
                             for mt, sg in crown_orig_shading.items():
