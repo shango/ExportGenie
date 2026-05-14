@@ -4929,6 +4929,50 @@ class Exporter(object):
                                 int(start_frame), edit=True)
                             cmds.ogs(reset=True)
                             cmds.refresh(force=True)
+                            crown_iso_dump = []
+                            try:
+                                crown_iso_dump = cmds.isolateSelect(
+                                    model_panel,
+                                    query=True,
+                                    viewObjects=True) or []
+                            except Exception:
+                                pass
+                            crown_iso_set = []
+                            try:
+                                iso_set_node = (
+                                    cmds.modelEditor(
+                                        model_panel, query=True,
+                                        viewObjects=True))
+                                if iso_set_node:
+                                    crown_iso_set = (
+                                        cmds.sets(
+                                            iso_set_node, query=True)
+                                        or [])
+                            except Exception:
+                                pass
+                            crown_curves_dbg = (
+                                cmds.listRelatives(
+                                    "QC_head_GRP",
+                                    allDescendents=True,
+                                    type="nurbsCurve",
+                                    fullPath=True) or [])
+                            sys.stderr.write(
+                                LOG_PREFIX + " Crown pass DBG: panel="
+                                "{} nurbsCurves={} qc_curves={} "
+                                "iso_state={} iso_set_size={}\n".format(
+                                    model_panel,
+                                    cmds.modelEditor(
+                                        model_panel, query=True,
+                                        nurbsCurves=True),
+                                    len(crown_curves_dbg),
+                                    cmds.isolateSelect(
+                                        model_panel, query=True,
+                                        state=True),
+                                    len(crown_iso_set)))
+                            sys.stderr.write(
+                                LOG_PREFIX + " Crown pass DBG: "
+                                "iso_set sample={}\n".format(
+                                    crown_iso_set[:8]))
                             cmds.playblast(
                                 filename=crown_path,
                                 format="image",
@@ -4946,6 +4990,36 @@ class Exporter(object):
                                 widthHeight=[pb_width, pb_height],
                             )
                             has_crown_pass = True
+
+                            # DEBUG: report crown PNG sizes + copy
+                            # the first frame to a stable inspection
+                            # path so the artist can look at what was
+                            # actually written before cleanup.
+                            try:
+                                import glob as _glob
+                                crown_pngs = sorted(_glob.glob(
+                                    crown_path + ".*.png"))
+                                sizes = [
+                                    os.path.getsize(p)
+                                    for p in crown_pngs[:3]]
+                                sys.stderr.write(
+                                    LOG_PREFIX + " Crown pass wrote "
+                                    "{} PNGs, first sizes={} bytes\n"
+                                    .format(len(crown_pngs), sizes))
+                                if crown_pngs:
+                                    debug_dst = os.path.join(
+                                        os.path.dirname(
+                                            composite_tmp_dir),
+                                        "DEBUG_crown_first.png")
+                                    shutil.copy2(
+                                        crown_pngs[0], debug_dst)
+                                    sys.stderr.write(
+                                        LOG_PREFIX + " DEBUG copy: "
+                                        "{}\n".format(debug_dst))
+                            except Exception as _e:
+                                sys.stderr.write(
+                                    LOG_PREFIX + " Crown PNG size "
+                                    "check failed: {}\n".format(_e))
 
                             # Restore original shading and cleanup
                             for mt, sg in crown_orig_shading.items():
