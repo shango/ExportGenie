@@ -386,15 +386,39 @@ def _qc_make_closed_curve(points, name):
 
 
 def _qc_bbox_radius_and_center(node, pad=1.25):
-    """Return *(radius, centerXYZ, yMin, yMax)* from the world bbox."""
-    bb = cmds.exactWorldBoundingBox(node)
-    xmin, ymin, zmin, xmax, ymax, zmax = bb
-    cx = (xmin + xmax) * 0.5
+    """Return *(radius, centerXYZ, yMin, yMax)* in WORLD space.
+
+    Radius and Y extents come from the world AABB so they reflect the
+    head's actual world-space size (preserves any non-unit scale on
+    the head transform). The XZ centroid comes from the mesh's
+    object-space bbox center transformed through the head's world
+    matrix: pose-invariant, so the crown isn't biased backward when
+    the playblast is started on a frame where the head is tilted
+    forward (the world AABB grows on whichever side the head tilts
+    toward, dragging the centroid away from the geometric center).
+    """
+    xmin, ymin, zmin, xmax, ymax, zmax = cmds.exactWorldBoundingBox(
+        node)
     cy = (ymin + ymax) * 0.5
-    cz = (zmin + zmax) * 0.5
-    dx = xmax - xmin
-    dz = zmax - zmin
-    radius = (max(dx, dz) * 0.5) * float(pad)
+    radius = (max(xmax - xmin, zmax - zmin) * 0.5) * float(pad)
+
+    shapes = cmds.listRelatives(
+        node, shapes=True, type="mesh", noIntermediate=True,
+        fullPath=True) or []
+    if shapes:
+        (lxmin, lxmax), (lymin, lymax), (lzmin, lzmax) = (
+            cmds.polyEvaluate(shapes[0], boundingBox=True))
+        lcx = (lxmin + lxmax) * 0.5
+        lcy = (lymin + lymax) * 0.5
+        lcz = (lzmin + lzmax) * 0.5
+        wm = cmds.xform(
+            node, q=True, matrix=True, worldSpace=True)
+        cx = lcx * wm[0] + lcy * wm[4] + lcz * wm[8] + wm[12]
+        cz = lcx * wm[2] + lcy * wm[6] + lcz * wm[10] + wm[14]
+    else:
+        cx = (xmin + xmax) * 0.5
+        cz = (zmin + zmax) * 0.5
+
     return radius, (cx, cy, cz), ymin, ymax
 
 
