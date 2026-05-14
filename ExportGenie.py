@@ -1378,22 +1378,14 @@ class Exporter(object):
         if wireframe_idx is not None:
             # Alpha-keyed overlay of the wireframe pass.
             #
-            # Assumes the wireframe playblast PNG carries a useful
-            # alpha channel from the useBackground shader (alpha=1
-            # at the front-facing edges, 0 elsewhere). The wireframe
-            # RGB is boosted via lutrgb so Maya's dark default
-            # wireframe color (~0.2 luma) lands near-white at the
-            # edges, then the alpha is scaled by `wireframe_opacity`
-            # so the artist controls transparency directly. Final
-            # composite is a true alpha-over `overlay`, so edges
-            # remain visible even over bright areas of the comp
-            # (screen-blend would wash out there).
-            #
-            # If the playblast turns out NOT to carry meaningful
-            # alpha, this will white-wash the whole frame at the
-            # configured opacity -- in that case revert to the
-            # screen-blend approach (boost RGB, blend=all_mode=
-            # screen) which works on RGB-only data.
+            # Maya playblast PNGs carry alpha=1 everywhere regardless
+            # of what's drawn, so we cannot rely on the file's alpha
+            # channel -- doing so washes the whole frame out at the
+            # configured opacity and erases anything composited
+            # underneath (e.g. the QC crown). Instead we boost the
+            # RGB to the requested color and derive alpha from the
+            # boosted luma: bright wireframe edges become opaque, the
+            # black background becomes fully transparent.
             wf_op = max(0.1, min(1.0, float(wireframe_opacity)))
             # Maya wireframe luma ~0.2; multiply per channel to land
             # on the requested color (0.2 * 5 = 1.0).
@@ -1404,8 +1396,11 @@ class Exporter(object):
             filter_complex += (
                 ";{prev}format=rgba[wf_bg];"
                 "[{idx}:v]format=rgba,"
-                "lutrgb=r=val*{r}:g=val*{g}:b=val*{b},"
-                "colorchannelmixer=aa={op}[wf_fg];"
+                "lutrgb=r=val*{r}:g=val*{g}:b=val*{b}[wf_boosted];"
+                "[wf_boosted]split[wf_color][wf_luma_src];"
+                "[wf_luma_src]format=gray[wf_alpha];"
+                "[wf_color][wf_alpha]alphamerge,"
+                "format=rgba,colorchannelmixer=aa={op}[wf_fg];"
                 "[wf_bg][wf_fg]overlay=format=auto[out]"
             ).format(idx=wireframe_idx, prev=prev_stage,
                      r="{:.3f}".format(wf_r),
