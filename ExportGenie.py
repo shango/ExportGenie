@@ -386,60 +386,16 @@ def _qc_make_closed_curve(points, name):
 
 
 def _qc_bbox_radius_and_center(node, pad=1.25):
-    """Return *(radius, centerXYZ, yMin, yMax)* in WORLD space.
-
-    The previous implementation read ``exactWorldBoundingBox``, which
-    returns an axis-aligned bbox of the deformed/transformed mesh in
-    world space. As the head rotates that AABB grows on whichever
-    side the head tilts toward, shifting the centroid away from the
-    head's geometric center -- so running the playblast on a non-
-    neutral pose biased the crown off-center for the whole shot.
-
-    Read the bbox from the mesh's object-space vertices (pose-
-    invariant) and transform the centroid + vertical extents through
-    the head's current world matrix to recover the same world-space
-    outputs the rest of the pipeline already expects.
-    """
-    shapes = cmds.listRelatives(
-        node, shapes=True, type="mesh", noIntermediate=True,
-        fullPath=True) or []
-    if not shapes:
-        # Non-mesh fallback (curves, surfaces, empty groups): use the
-        # world AABB so callers still get something usable.
-        xmin, ymin, zmin, xmax, ymax, zmax = (
-            cmds.exactWorldBoundingBox(node))
-        cx = (xmin + xmax) * 0.5
-        cy = (ymin + ymax) * 0.5
-        cz = (zmin + zmax) * 0.5
-        radius = (max(xmax - xmin, zmax - zmin) * 0.5) * float(pad)
-        return radius, (cx, cy, cz), ymin, ymax
-
-    (lxmin, lxmax), (lymin, lymax), (lzmin, lzmax) = cmds.polyEvaluate(
-        shapes[0], boundingBox=True)
-    lcx = (lxmin + lxmax) * 0.5
-    lcy = (lymin + lymax) * 0.5
-    lcz = (lzmin + lzmax) * 0.5
-
-    wm = cmds.xform(node, q=True, matrix=True, worldSpace=True)
-
-    def _xform(lx, ly, lz):
-        return (
-            lx * wm[0] + ly * wm[4] + lz * wm[8]  + wm[12],
-            lx * wm[1] + ly * wm[5] + lz * wm[9]  + wm[13],
-            lx * wm[2] + ly * wm[6] + lz * wm[10] + wm[14],
-        )
-
-    cx, cy, cz = _xform(lcx, lcy, lcz)
-    # World Y of the bbox top/bottom: transform the center column at
-    # local ymin/ymax through wm and take the actual min/max so the
-    # head's rotation doesn't flip them.
-    _, p_min_y, _ = _xform(lcx, lymin, lcz)
-    _, p_max_y, _ = _xform(lcx, lymax, lcz)
-    ymin_w = min(p_min_y, p_max_y)
-    ymax_w = max(p_min_y, p_max_y)
-
-    radius = (max(lxmax - lxmin, lzmax - lzmin) * 0.5) * float(pad)
-    return radius, (cx, cy, cz), ymin_w, ymax_w
+    """Return *(radius, centerXYZ, yMin, yMax)* from the world bbox."""
+    bb = cmds.exactWorldBoundingBox(node)
+    xmin, ymin, zmin, xmax, ymax, zmax = bb
+    cx = (xmin + xmax) * 0.5
+    cy = (ymin + ymax) * 0.5
+    cz = (zmin + zmax) * 0.5
+    dx = xmax - xmin
+    dz = zmax - zmin
+    radius = (max(dx, dz) * 0.5) * float(pad)
+    return radius, (cx, cy, cz), ymin, ymax
 
 
 def create_qc_crown(name="QC_head", radius=14.0, height=0.0,
