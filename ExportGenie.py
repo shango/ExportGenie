@@ -574,6 +574,15 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
     # caused the crown to drift off-center as the head pivoted.
     pc = cmds.parentConstraint(head, grp, mo=True)[0]
 
+    sys.stderr.write(
+        "{} Crown placement: head={} local_bbox=({:.3f},{:.3f},{:.3f})"
+        "->({:.3f},{:.3f},{:.3f}) local_pos=({:.3f},{:.3f},{:.3f}) "
+        "radius={:.3f} world_pos=({:.3f},{:.3f},{:.3f})\n".format(
+            LOG_PREFIX, head,
+            xmin, ymin, zmin, xmax, ymax, zmax,
+            lx, ly, lz, radius,
+            world_pos[0], world_pos[1], world_pos[2]))
+
     cmds.select(grp)
     return grp, pc
 
