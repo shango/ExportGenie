@@ -1305,7 +1305,7 @@ class Exporter(object):
             next_input_idx += 1
 
         # Base composite: matte -> alpha on color -> overlay on plate.
-        # Screen-blend crown (if any) then wireframe (if any) on top.
+        # Wireframe (if any) goes on first so crown sits ON TOP.
         base_out = (
             "[out]" if (crown_idx is None
                         and wireframe_idx is None)
@@ -1318,19 +1318,6 @@ class Exporter(object):
         ).format(opacity=opacity_val, base_out=base_out)
 
         prev_stage = "[base]"
-        if crown_idx is not None:
-            # Final stage is [out] only if wireframe won't follow
-            crown_out = (
-                "[out]" if wireframe_idx is None else "[stage1]")
-            filter_complex += (
-                ";[{idx}:v]split[crown_color][crown_luma];"
-                "[crown_luma]format=gray[crown_alpha];"
-                "[crown_color][crown_alpha]alphamerge,"
-                "format=rgba[crown_rgba];"
-                "{prev}[crown_rgba]overlay=format=auto{out}"
-            ).format(
-                idx=crown_idx, prev=prev_stage, out=crown_out)
-            prev_stage = crown_out
         if wireframe_idx is not None:
             # Alpha-keyed overlay of the wireframe pass.
             #
@@ -1357,17 +1344,33 @@ class Exporter(object):
             wf_r = max(0.0, float(wireframe_color[0])) * wf_boost
             wf_g = max(0.0, float(wireframe_color[1])) * wf_boost
             wf_b = max(0.0, float(wireframe_color[2])) * wf_boost
+            # Final stage is [out] only if crown won't follow.
+            wf_out = (
+                "[out]" if crown_idx is None else "[stage1]")
             filter_complex += (
                 ";{prev}format=rgba[wf_bg];"
                 "[{idx}:v]format=rgba,"
                 "lutrgb=r=val*{r}:g=val*{g}:b=val*{b},"
                 "colorchannelmixer=aa={op}[wf_fg];"
-                "[wf_bg][wf_fg]overlay=format=auto[out]"
+                "[wf_bg][wf_fg]overlay=format=auto{out}"
             ).format(idx=wireframe_idx, prev=prev_stage,
                      r="{:.3f}".format(wf_r),
                      g="{:.3f}".format(wf_g),
                      b="{:.3f}".format(wf_b),
-                     op="{:.3f}".format(wf_op))
+                     op="{:.3f}".format(wf_op),
+                     out=wf_out)
+            prev_stage = wf_out
+        if crown_idx is not None:
+            # Crown overlay -- alpha derived from luma so only the
+            # bright curve pixels show through. Always last so it
+            # sits ON TOP of the wireframe (and everything else).
+            filter_complex += (
+                ";[{idx}:v]split[crown_color][crown_luma];"
+                "[crown_luma]format=gray[crown_alpha];"
+                "[crown_color][crown_alpha]alphamerge,"
+                "format=rgba[crown_rgba];"
+                "{prev}[crown_rgba]overlay=format=auto[out]"
+            ).format(idx=crown_idx, prev=prev_stage)
 
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
