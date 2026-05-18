@@ -53,7 +53,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v15-beta-2"
+TOOL_VERSION = "v15-beta-3"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -2379,24 +2379,39 @@ class Exporter(object):
                             "(ambiguous outputs) on {}\n".format(bs))
                         continue
                     src_plug, dst_plug = pairs[0]
-                    tmp_x = None
+                    frozen = None
+                    sc_env = None
+                    sc_env_prev = None
                     try:
-                        tmp_x = cmds.createNode(
-                            "transform", name="_eg_bsfreeze_tmp#")
-                        tmp_s = cmds.createNode(
-                            "mesh", parent=tmp_x)
-                        cmds.connectAttr(
-                            src_plug, tmp_s + ".inMesh", force=True)
-                        # Force the morphed output to evaluate, then
-                        # bake it into a static duplicate.
+                        shp_xform = cmds.listRelatives(
+                            shp, parent=True, fullPath=True)[0]
+                        # Snapshot the morphed-but-not-skinned shape by
+                        # the proven freeze idiom (see export_obj):
+                        # zero the skinCluster so the live shape shows
+                        # exactly the blendShape output, duplicate the
+                        # transform, then delete construction history
+                        # to bake the current points into a plain
+                        # static mesh.  This is reliable across Maya
+                        # versions, unlike duplicating a mesh fed only
+                        # by a live .inMesh connection.
+                        sc_env = sc + ".envelope"
+                        sc_env_prev = cmds.getAttr(sc_env)
+                        cmds.setAttr(sc_env, 0)
                         cmds.refresh(force=True)
-                        cmds.dgeval(tmp_s + ".outMesh")
                         frozen = cmds.duplicate(
-                            tmp_x, name="_eg_bsbaked#",
+                            shp_xform, name="_eg_bsbaked#",
                             returnRootsOnly=True)[0]
-                        cmds.delete(tmp_x)
+                        cmds.setAttr(sc_env, sc_env_prev)
+                        sc_env = None
+                        # Strip the duplicated deformer chain -> a
+                        # static mesh holding the morphed base.
+                        cmds.delete(frozen, constructionHistory=True)
+                        try:
+                            cmds.parent(frozen, world=True)
+                        except Exception:
+                            pass
                         frozen_s = cmds.listRelatives(
-                            frozen, shapes=True,
+                            frozen, shapes=True, noIntermediate=True,
                             fullPath=True)[0]
                         cmds.disconnectAttr(src_plug, dst_plug)
                         cmds.connectAttr(
@@ -2412,8 +2427,14 @@ class Exporter(object):
                             LOG_PREFIX + " USD bake failed on "
                             "{}: {}\n".format(bs, e))
                         try:
-                            if tmp_x and cmds.objExists(tmp_x):
-                                cmds.delete(tmp_x)
+                            if sc_env is not None \
+                                    and sc_env_prev is not None:
+                                cmds.setAttr(sc_env, sc_env_prev)
+                        except Exception:
+                            pass
+                        try:
+                            if frozen and cmds.objExists(frozen):
+                                cmds.delete(frozen)
                         except Exception:
                             pass
         return baked
