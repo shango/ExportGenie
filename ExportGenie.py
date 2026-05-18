@@ -53,7 +53,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v15-beta-1"
+TOOL_VERSION = "v15-beta-2"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -2271,6 +2271,175 @@ class Exporter(object):
                     LOG_PREFIX + " USD restore failed on "
                     "{}: {}\n".format(shp, e))
 
+    def _blendshape_is_static_on(self, bs):
+        """True if every weight that drives blendShape *bs* is a plain
+        static value (no incoming animation / connection), the envelope
+        is static and non-zero, and at least one target weight is
+        non-zero.
+
+        Such a blendShape is an always-on shape correction (e.g. the
+        GenHuman body-morph): its deformed output never changes over
+        the frame range, so a single baked snapshot is exact.  An
+        animated weight or envelope fails this test and is left for the
+        live UsdSkel blendShape path.
+        """
+        try:
+            env = bs + ".envelope"
+            if cmds.listConnections(
+                    env, source=True, destination=False,
+                    skipConversionNodes=True):
+                return False
+            if abs(cmds.getAttr(env)) <= 1e-6:
+                return False
+            idxs = cmds.getAttr(
+                bs + ".weight", multiIndices=True) or []
+            if not idxs:
+                return False
+            any_nonzero = False
+            for i in idxs:
+                wp = "{}.weight[{}]".format(bs, i)
+                if cmds.listConnections(
+                        wp, source=True, destination=False,
+                        skipConversionNodes=True):
+                    return False
+                if abs(cmds.getAttr(wp)) > 1e-6:
+                    any_nonzero = True
+            return any_nonzero
+        except Exception:
+            return False
+
+    def _bake_static_preskin_blendshapes(self, root_nodes):
+        """Freeze always-on blendshapes that sit *upstream* of a
+        skinCluster into the skin's input geometry, for the duration of
+        the export.
+
+        UsdSkel can represent a pre-skin blendShape, but mayaUSDExport
+        collapses a *sculpted delta* target (`.ipt`/`.ict`) whose weight
+        is statically on -- it writes the rest mesh and a zero-offset
+        blendShape, so the re-imported character loses the morph and
+        comes back as the un-morphed base.  (The GenHuman body-morph
+        `GH_Body_morph` is exactly this: a static 1.0 driving a 3213-pt
+        sculpted target.)
+
+        Because such a morph never animates, its deformed output is
+        constant.  We snapshot that output once and splice the frozen
+        mesh in where the blendShape fed its consumer, so the exporter
+        sees a plain skinned mesh whose rest pose already includes the
+        morph.  No blendShape is written; the silhouette is correct.
+
+        Detection is generic -- a blendShape in a non-intermediate
+        deforming mesh's history, upstream of that mesh's skinCluster,
+        passing _blendshape_is_static_on -- so it survives rig
+        revisions and never hardcodes node names.  Ambiguous topology
+        (a blendShape output feeding more than one geometry consumer)
+        is skipped rather than risk mis-rewiring the rig.
+
+        Returns a list of (frozen_xform, frozen_shape, src_plug,
+        dst_plug) tuples for _restore_baked_preskin_blendshapes.
+        """
+        baked = []
+        seen_bs = set()
+        for root in root_nodes or []:
+            if not root or not cmds.objExists(root):
+                continue
+            meshes = cmds.listRelatives(
+                root, allDescendents=True, type="mesh",
+                fullPath=True) or []
+            for shp in meshes:
+                try:
+                    if cmds.getAttr(shp + ".intermediateObject"):
+                        continue
+                except Exception:
+                    continue
+                hist = cmds.listHistory(shp) or []
+                skins = [h for h in hist
+                         if cmds.objectType(h) == "skinCluster"]
+                if not skins:
+                    continue
+                sc = skins[0]
+                sc_hist = cmds.listHistory(sc) or []
+                for bs in sc_hist:
+                    if cmds.objectType(bs) != "blendShape":
+                        continue
+                    if bs in seen_bs:
+                        continue
+                    seen_bs.add(bs)
+                    if not self._blendshape_is_static_on(bs):
+                        continue
+                    conns = cmds.listConnections(
+                        bs + ".outputGeometry", source=False,
+                        destination=True, plugs=True,
+                        connections=True) or []
+                    # connections=True -> [srcPlug, dstPlug, ...]
+                    pairs = [(conns[k], conns[k + 1])
+                             for k in range(0, len(conns), 2)]
+                    if len(pairs) != 1:
+                        sys.stderr.write(
+                            LOG_PREFIX + " USD bake skipped "
+                            "(ambiguous outputs) on {}\n".format(bs))
+                        continue
+                    src_plug, dst_plug = pairs[0]
+                    tmp_x = None
+                    try:
+                        tmp_x = cmds.createNode(
+                            "transform", name="_eg_bsfreeze_tmp#")
+                        tmp_s = cmds.createNode(
+                            "mesh", parent=tmp_x)
+                        cmds.connectAttr(
+                            src_plug, tmp_s + ".inMesh", force=True)
+                        # Force the morphed output to evaluate, then
+                        # bake it into a static duplicate.
+                        cmds.refresh(force=True)
+                        cmds.dgeval(tmp_s + ".outMesh")
+                        frozen = cmds.duplicate(
+                            tmp_x, name="_eg_bsbaked#",
+                            returnRootsOnly=True)[0]
+                        cmds.delete(tmp_x)
+                        frozen_s = cmds.listRelatives(
+                            frozen, shapes=True,
+                            fullPath=True)[0]
+                        cmds.disconnectAttr(src_plug, dst_plug)
+                        cmds.connectAttr(
+                            frozen_s + ".outMesh", dst_plug,
+                            force=True)
+                        baked.append(
+                            (frozen, frozen_s, src_plug, dst_plug))
+                        sys.stderr.write(
+                            LOG_PREFIX + " USD bake static pre-skin "
+                            "blendShape {}\n".format(bs))
+                    except Exception as e:
+                        sys.stderr.write(
+                            LOG_PREFIX + " USD bake failed on "
+                            "{}: {}\n".format(bs, e))
+                        try:
+                            if tmp_x and cmds.objExists(tmp_x):
+                                cmds.delete(tmp_x)
+                        except Exception:
+                            pass
+        return baked
+
+    def _restore_baked_preskin_blendshapes(self, baked):
+        """Undo _bake_static_preskin_blendshapes: reconnect each
+        blendShape output to its original consumer and delete the
+        frozen snapshot."""
+        for frozen, frozen_s, src_plug, dst_plug in baked or []:
+            try:
+                if cmds.isConnected(frozen_s + ".outMesh", dst_plug):
+                    cmds.disconnectAttr(
+                        frozen_s + ".outMesh", dst_plug)
+                cmds.connectAttr(src_plug, dst_plug, force=True)
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " USD bake-restore reconnect "
+                    "failed on {}: {}\n".format(dst_plug, e))
+            try:
+                if frozen and cmds.objExists(frozen):
+                    cmds.delete(frozen)
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " USD bake-restore cleanup "
+                    "failed on {}: {}\n".format(frozen, e))
+
     def _is_deforming_mesh(self, shp):
         """True if the mesh shape has a skinCluster or blendShape in
         its deformation history (i.e. its points move at runtime)."""
@@ -2476,6 +2645,18 @@ class Exporter(object):
             bypassed_blendshapes = self._bypass_postskin_blendshapes(
                 select_nodes)
 
+            # Bake always-on pre-skin blendshapes (e.g. the GenHuman
+            # body-morph) into the skin's input geometry.  mayaUSDExport
+            # collapses a statically-on sculpted delta target to a
+            # zero-offset blendShape, so the morph is lost and the
+            # character re-imports as the un-morphed base.  Freezing it
+            # in -- before has_blendshapes is computed, so the now
+            # disconnected blendShape is not counted -- makes the
+            # exporter see a plain skinned mesh whose rest pose already
+            # carries the morph.  See _bake_static_preskin_blendshapes.
+            baked_blendshapes = self._bake_static_preskin_blendshapes(
+                select_nodes)
+
             # Suppress baked normals on deforming meshes -- otherwise
             # the exporter freezes rest-pose faceVarying normals that
             # UsdSkel never deforms, and the re-imported character
@@ -2522,6 +2703,8 @@ class Exporter(object):
             finally:
                 self._restore_deforming_mesh_normals(
                     suppressed_normals)
+                self._restore_baked_preskin_blendshapes(
+                    baked_blendshapes)
                 self._restore_postskin_blendshapes(
                     bypassed_blendshapes)
                 if usd_wrapper and cmds.objExists(usd_wrapper):
