@@ -2271,6 +2271,101 @@ class Exporter(object):
                     LOG_PREFIX + " USD restore failed on "
                     "{}: {}\n".format(shp, e))
 
+    def _is_deforming_mesh(self, shp):
+        """True if the mesh shape has a skinCluster or blendShape in
+        its deformation history (i.e. its points move at runtime)."""
+        try:
+            hist = cmds.listHistory(
+                shp, pruneDagObjects=True, interestLevel=2) or []
+        except Exception:
+            hist = cmds.listHistory(shp) or []
+        for h in hist:
+            if cmds.objectType(h) in ("skinCluster", "blendShape"):
+                return True
+        return False
+
+    def _disable_deforming_mesh_normals(self, root_nodes):
+        """Stop mayaUSDExport from baking frozen normals on deforming
+        meshes.
+
+        With defaultMeshScheme="none" the exporter writes the mesh's
+        normals as faceVarying, sampled once at the export pose. For a
+        skinned / blendshaped mesh UsdSkel skins the points but not
+        those normals, so on re-import they come back as *locked*
+        explicit normals that no longer follow the deformation -- the
+        character shades as if frozen in the rest pose and all hard
+        edges collapse to soft. (This is the studio standard human
+        mesh, so the rig mesh hits this on every shot.)
+
+        Setting USD_EmitNormals=0 on each deforming shape makes the
+        exporter omit normals entirely; the consuming import then
+        recomputes them from the deformed geometry every frame, which
+        is correct. Detection is by deformer history only -- no rig /
+        mesh names -- so it survives rig revisions.
+
+        Static / proxy geo is left untouched: with no deformation its
+        baked normals (and hard edges) round-trip fine and are worth
+        keeping.
+
+        Returns a list of (shape, existed, prev_value) tuples for
+        _restore_deforming_mesh_normals.
+        """
+        ATTR = "USD_EmitNormals"
+        saved = []
+        seen = set()
+        for root in root_nodes or []:
+            if not root or not cmds.objExists(root):
+                continue
+            meshes = cmds.listRelatives(
+                root, allDescendents=True, type="mesh",
+                fullPath=True) or []
+            for shp in meshes:
+                if shp in seen:
+                    continue
+                seen.add(shp)
+                if cmds.getAttr(shp + ".intermediateObject"):
+                    continue
+                if not self._is_deforming_mesh(shp):
+                    continue
+                attr = shp + "." + ATTR
+                try:
+                    existed = cmds.attributeQuery(
+                        ATTR, node=shp, exists=True)
+                    prev = cmds.getAttr(attr) if existed else None
+                    if not existed:
+                        cmds.addAttr(
+                            shp, longName=ATTR,
+                            attributeType="bool",
+                            minValue=0, maxValue=1)
+                    cmds.setAttr(attr, 0)
+                    saved.append((shp, existed, prev))
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD suppress baked normals "
+                        "on deforming mesh {}\n".format(shp))
+                except Exception as e:
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD normal-suppress failed "
+                        "on {}: {}\n".format(shp, e))
+        return saved
+
+    def _restore_deforming_mesh_normals(self, saved):
+        """Undo _disable_deforming_mesh_normals: delete the attribute
+        if we added it, otherwise restore its previous value."""
+        ATTR = "USD_EmitNormals"
+        for shp, existed, prev in saved or []:
+            attr = shp + "." + ATTR
+            try:
+                if not cmds.objExists(shp):
+                    continue
+                if existed:
+                    cmds.setAttr(attr, prev)
+                elif cmds.attributeQuery(ATTR, node=shp, exists=True):
+                    cmds.deleteAttr(attr)
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " USD normal-restore failed on "
+                    "{}: {}\n".format(shp, e))
+
     def export_usd(self, file_path, camera, geo_roots, proxy_geos,
                    start_frame, end_frame, rig_roots=None):
         """Export camera + geo roots + rig roots + proxy geo as USD.
@@ -2381,6 +2476,14 @@ class Exporter(object):
             bypassed_blendshapes = self._bypass_postskin_blendshapes(
                 select_nodes)
 
+            # Suppress baked normals on deforming meshes -- otherwise
+            # the exporter freezes rest-pose faceVarying normals that
+            # UsdSkel never deforms, and the re-imported character
+            # shades as if locked in bind pose. See
+            # _disable_deforming_mesh_normals.
+            suppressed_normals = self._disable_deforming_mesh_normals(
+                select_nodes)
+
             # Only request blendshape export when there are
             # actual blendShape nodes in the selection  -- avoids
             # thousands of harmless but noisy USD plugin warnings.
@@ -2417,6 +2520,8 @@ class Exporter(object):
                     filterTypes=["nurbsCurve"],
                 )
             finally:
+                self._restore_deforming_mesh_normals(
+                    suppressed_normals)
                 self._restore_postskin_blendshapes(
                     bypassed_blendshapes)
                 if usd_wrapper and cmds.objExists(usd_wrapper):
