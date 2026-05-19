@@ -2271,23 +2271,59 @@ class Exporter(object):
                     LOG_PREFIX + " USD restore failed on "
                     "{}: {}\n".format(shp, e))
 
+    def _plug_is_effectively_static(self, plug, _seen=None, _depth=0):
+        """True if *plug*'s value cannot vary over the frame range:
+        either no incoming connection (a plain static value), or an
+        upstream driver chain containing no animation / time-dependent
+        nodes.
+
+        The GenHuman body-morph weight is *connected* -- to the static
+        rig control god_m_godnode_anim.GH_Body_morph (a keyable 1.0,
+        no animCurve) -- so the old "any connection => animated" test
+        wrongly rejected it, leaving the morph to export as a live
+        UsdSkel blendShape (double-morph on round-trip).  Resolving the
+        chain lets the freeze path recognise it as the always-on
+        correction it is.
+        """
+        if _seen is None:
+            _seen = set()
+        if plug in _seen:
+            return True
+        if _depth > 64:
+            return False
+        _seen.add(plug)
+        srcs = cmds.listConnections(
+            plug, source=True, destination=False, plugs=True,
+            skipConversionNodes=True) or []
+        if not srcs:
+            return True
+        for sp in srcs:
+            ntype = cmds.nodeType(sp.split(".")[0])
+            if (ntype.startswith("animCurve")
+                    or ntype in ("expression", "time", "motionPath",
+                                 "pairBlend", "clip", "clipLibrary",
+                                 "character")):
+                return False
+            if not self._plug_is_effectively_static(
+                    sp, _seen, _depth + 1):
+                return False
+        return True
+
     def _blendshape_is_static_on(self, bs):
-        """True if every weight that drives blendShape *bs* is a plain
-        static value (no incoming animation / connection), the envelope
-        is static and non-zero, and at least one target weight is
-        non-zero.
+        """True if every weight that drives blendShape *bs* resolves to
+        a constant value over the frame range, the envelope is static
+        and non-zero, and at least one target weight is non-zero.
 
         Such a blendShape is an always-on shape correction (e.g. the
         GenHuman body-morph): its deformed output never changes over
-        the frame range, so a single baked snapshot is exact.  An
-        animated weight or envelope fails this test and is left for the
-        live UsdSkel blendShape path.
+        the frame range, so a single baked snapshot is exact.  A
+        weight or envelope driven by an animCurve/expression/time --
+        directly or through a static rig-control chain -- fails this
+        test and is left for the live UsdSkel blendShape path.
         """
         try:
             env = bs + ".envelope"
-            if cmds.listConnections(
-                    env, source=True, destination=False,
-                    skipConversionNodes=True):
+            if not self._plug_is_effectively_static(env):
                 return False
             if abs(cmds.getAttr(env)) <= 1e-6:
                 return False
@@ -2298,9 +2334,7 @@ class Exporter(object):
             any_nonzero = False
             for i in idxs:
                 wp = "{}.weight[{}]".format(bs, i)
-                if cmds.listConnections(
-                        wp, source=True, destination=False,
-                        skipConversionNodes=True):
+                if not self._plug_is_effectively_static(wp):
                     return False
                 if abs(cmds.getAttr(wp)) > 1e-6:
                     any_nonzero = True
@@ -2708,6 +2742,14 @@ class Exporter(object):
                 # Selected nodes whose parents are outside the
                 # selection appear at the USD stage root with their
                 # world-space transform baked by the exporter.
+                #
+                # Re-assert the export selection: the pre-steps above
+                # (bypass / bake / normal-suppress) can run
+                # cmds.duplicate / parent / delete, each of which
+                # mutates the active selection.  mayaUSDExport reads
+                # selection=True, so without this the export would
+                # silently omit the rig / camera.
+                cmds.select(select_nodes, replace=True)
                 cmds.mayaUSDExport(
                     file=usd_path,
                     selection=True,
