@@ -53,7 +53,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v15"
+TOOL_VERSION = "v16-beta-2"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -4572,6 +4572,15 @@ class Exporter(object):
                         cmds.select(ct_transforms, replace=True)
                         cmds.hyperShade(assign=bg_shader)
                         cmds.select(clear=True)
+                        # Force VP2/OGS to apply the swap before
+                        # playblast starts; otherwise frame 1 can
+                        # render with the original shader still
+                        # bound, producing a bright shaded pop.
+                        try:
+                            cmds.ogs(reset=True)
+                            cmds.refresh(force=True)
+                        except Exception:
+                            pass
                 else:
                     # Default camera track mode: pure wireframe display
                     original_display = cmds.modelEditor(
@@ -5667,6 +5676,40 @@ class Exporter(object):
                     ct_tmp = _tf.mkdtemp(prefix="ExportGenie_ct_")
                     ct_tmp_base = "ct_tmp_frame"
                     ct_tmp_file = os.path.join(ct_tmp, ct_tmp_base)
+                    # VP2 allocates its offscreen MSAA buffer at the
+                    # playblast resolution lazily, on the first frame
+                    # of the first playblast at that size. Wireframe
+                    # edges on that uninitialised frame come back
+                    # aliased and visibly heavier (the "frame 1 is
+                    # brighter" report). Run a one-frame throwaway
+                    # playblast at the same widthHeight first so the
+                    # real capture inherits a warmed buffer.
+                    warmup_dir = _tf.mkdtemp(
+                        prefix="ExportGenie_ct_warmup_")
+                    try:
+                        cmds.playblast(
+                            filename=os.path.join(
+                                warmup_dir, "warmup"),
+                            format="image",
+                            compression="png",
+                            startTime=start_frame,
+                            endTime=start_frame,
+                            forceOverwrite=True,
+                            sequenceTime=False,
+                            clearCache=True,
+                            viewer=False,
+                            showOrnaments=False,
+                            framePadding=4,
+                            percent=100,
+                            quality=100,
+                            widthHeight=[pb_width, pb_height],
+                        )
+                    except Exception as exc:
+                        sys.stderr.write(
+                            LOG_PREFIX + " CT warmup playblast "
+                            "failed: {}\n".format(exc))
+                    finally:
+                        self._cleanup_temp_pngs(warmup_dir)
                     self.log("Rendering...")
                     cmds.playblast(
                         filename=ct_tmp_file,
@@ -6369,24 +6412,190 @@ class Exporter(object):
             return None
 
     @staticmethod
-    def compute_far_distance(camera, geo_nodes,
-                             frames=None, padding=1.0):
-        """Return camera-to-farthest-geo-corner distance + padding,
-        sampled across the given frames. Returns None if no usable
-        camera+geo or zero distance.
+    def _expand_to_renderable_shapes(nodes, log_fn=None):
+        """Return a deduped list of non-intermediate mesh /
+        nurbsSurface / subdiv shapes under ``nodes``.
 
-        Walks the world bounding box of `geo_nodes` at each frame
-        and measures the camera world position against all 8 BB
-        corners, taking the overall max. Restores currentTime.
+        Necessary because ``cmds.exactWorldBoundingBox`` on a top-level
+        group does not reliably traverse deep / referenced descendants
+        (it has been observed to skip grandchild shapes under nested
+        transforms, silently truncating the world bbox to whatever
+        shapes sit one or two levels down). Enumerating explicitly
+        and passing the shape list directly to
+        ``exactWorldBoundingBox`` guarantees every renderable
+        descendant contributes.
+
+        When ``log_fn`` is supplied, each input is annotated with
+        whether it resolved uniquely, its node type, how many descendant
+        shapes were located, and how many survived the
+        ``intermediateObject`` filter -- exposing the silent failure
+        modes (DAG ambiguity, empty groups, all-intermediate shapes).
         """
-        nodes = [g for g in (geo_nodes or [])
-                 if g and cmds.objExists(g)]
-        if not nodes or not camera or not cmds.objExists(camera):
+        SHAPE_TYPES = ("mesh", "nurbsSurface", "subdiv")
+        out = []
+        seen = set()
+        for n in nodes or []:
+            if not n:
+                if log_fn:
+                    log_fn(
+                        "Auto-fit walk: blank entry; skipping.")
+                continue
+            # Resolve all DAG matches for the user's short name so we
+            # log ambiguity and can still walk every match instead of
+            # tripping on listRelatives' "more than one object matches"
+            # behavior.
+            try:
+                matches = cmds.ls(n, long=True) or []
+            except Exception as exc:
+                matches = []
+                if log_fn:
+                    log_fn(
+                        "Auto-fit walk '{}': ls() failed: {}".format(
+                            n, exc))
+            if not matches:
+                if log_fn:
+                    log_fn(
+                        "Auto-fit walk '{}': not found in scene "
+                        "(cmds.ls returned nothing).".format(n))
+                continue
+            if log_fn and len(matches) > 1:
+                log_fn(
+                    "Auto-fit walk '{}': AMBIGUOUS - matched {} DAG "
+                    "paths: {}".format(n, len(matches), matches))
+            for path in matches:
+                try:
+                    ntype = cmds.nodeType(path)
+                except Exception:
+                    ntype = "<unknown>"
+                candidates = []
+                if ntype in SHAPE_TYPES:
+                    candidates.append(path)
+                # Walk every descendant (transform AND shape) without
+                # the shape filter. Combining ``shapes=True`` with
+                # ``allDescendents=True`` has been observed to return
+                # nothing under certain hierarchies / Maya versions
+                # (notably groups containing referenced rigs), so we
+                # do the type filter ourselves via ``cmds.ls``.
+                try:
+                    all_descs = cmds.listRelatives(
+                        path, allDescendents=True,
+                        fullPath=True) or []
+                except Exception as exc:
+                    all_descs = []
+                    if log_fn:
+                        log_fn(
+                            "Auto-fit walk '{}': listRelatives failed: "
+                            "{}".format(path, exc))
+                shape_descs = []
+                if all_descs:
+                    try:
+                        shape_descs = cmds.ls(
+                            all_descs, long=True,
+                            type=list(SHAPE_TYPES)) or []
+                    except Exception as exc:
+                        if log_fn:
+                            log_fn(
+                                "Auto-fit walk '{}': cmds.ls type-filter "
+                                "failed: {}".format(path, exc))
+                if log_fn:
+                    log_fn(
+                        "Auto-fit walk '{}' ({}): {} total descendant "
+                        "node(s), {} of type {}.".format(
+                            path, ntype, len(all_descs),
+                            len(shape_descs), SHAPE_TYPES))
+                candidates.extend(shape_descs)
+                kept_paths = []
+                dropped_intermediate = []
+                for s in candidates:
+                    try:
+                        if cmds.getAttr(s + ".intermediateObject"):
+                            dropped_intermediate.append(s)
+                            continue
+                    except Exception:
+                        pass
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    out.append(s)
+                    kept_paths.append(s)
+                if log_fn:
+                    log_fn(
+                        "Auto-fit walk '{}': {} shape(s) kept after "
+                        "intermediate/dedup filter; {} intermediate "
+                        "dropped.".format(
+                            path, len(kept_paths),
+                            len(dropped_intermediate)))
+                    for s in kept_paths:
+                        try:
+                            bb = cmds.exactWorldBoundingBox(s)
+                            log_fn(
+                                "  KEEP {}  bbox x[{:.1f},{:.1f}] "
+                                "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}]"
+                                .format(
+                                    s, bb[0], bb[3], bb[1], bb[4],
+                                    bb[2], bb[5]))
+                        except Exception as exc:
+                            log_fn(
+                                "  KEEP {}  bbox query failed: "
+                                "{}".format(s, exc))
+                    for s in dropped_intermediate:
+                        log_fn("  DROP-INTERMEDIATE {}".format(s))
+        return out
+
+    @staticmethod
+    def compute_far_distance(camera, geo_nodes,
+                             frames=None, padding=1.0,
+                             log_fn=None):
+        """Return the maximum forward-axis depth of `geo_nodes` from
+        `camera`, expressed in the camera's LOCAL space (matching the
+        units of ``imagePlane.depth`` and ``camera.farClipPlane``).
+
+        The image plane is parented under the camera shape, so its
+        ``.depth`` attribute is evaluated in the camera transform's
+        own local space. If the camera (or any of its parents) is
+        scaled -- typical for SynthEyes-tracked plates, where the
+        root group is often scaled by 0.05 -- a depth computed in
+        world units lands at the wrong place by exactly that scale
+        factor. Same for ``farClipPlane``.
+
+        Implementation: build the camera's world-to-local matrix and
+        transform every shape bbox corner into camera-relative
+        coordinates, then take the largest ``-Z`` component (Maya
+        cameras look down their local ``-Z``). This is correct under
+        any combination of parent translate/rotate/scale/pivots.
+
+        Returns ``None`` if there are no usable inputs or the farthest
+        corner sits behind the camera at every sampled frame.
+        """
+        if not camera or not cmds.objExists(camera):
             return None
+        shapes = Exporter._expand_to_renderable_shapes(
+            geo_nodes, log_fn=log_fn)
+        if not shapes:
+            if log_fn:
+                log_fn(
+                    "Auto-fit: no renderable shapes under {}; "
+                    "skipping depth update.".format(
+                        list(geo_nodes or [])))
+            return None
+        if log_fn:
+            log_fn(
+                "Auto-fit: measuring {} shape(s) under {} input "
+                "node(s).".format(len(shapes), len(geo_nodes or [])))
+
+        try:
+            import maya.api.OpenMaya as om
+        except Exception as exc:
+            if log_fn:
+                log_fn(
+                    "Auto-fit: OpenMaya import failed ({}); cannot "
+                    "compute local-space depth.".format(exc))
+            return None
+
         if not frames:
             frames = [cmds.currentTime(query=True)]
         saved = cmds.currentTime(query=True)
-        max_d = 0.0
+        max_fwd = 0.0
         try:
             for f in frames:
                 try:
@@ -6394,27 +6603,65 @@ class Exporter(object):
                 except Exception:
                     continue
                 try:
-                    bb = cmds.exactWorldBoundingBox(nodes)
-                    cam_pos = cmds.xform(
-                        camera, query=True, worldSpace=True,
-                        translation=True)
-                except Exception:
+                    cam_mat = om.MMatrix(
+                        cmds.xform(
+                            camera, query=True, worldSpace=True,
+                            matrix=True))
+                    cam_inv = cam_mat.inverse()
+                except Exception as exc:
+                    if log_fn:
+                        log_fn(
+                            "Auto-fit f{}: camera matrix query "
+                            "failed: {}".format(int(f), exc))
                     continue
-                x0, y0, z0, x1, y1, z1 = bb
-                cx, cy, cz = cam_pos
-                for gx in (x0, x1):
-                    for gy in (y0, y1):
-                        for gz in (z0, z1):
-                            dx, dy, dz = gx - cx, gy - cy, gz - cz
-                            d2 = dx * dx + dy * dy + dz * dz
-                            if d2 > max_d * max_d:
-                                max_d = d2 ** 0.5
+                # Track max -Z (forward) across every corner of every
+                # shape after world->camera-local transform.
+                frame_max = 0.0
+                world_bb_min = [float("inf")] * 3
+                world_bb_max = [float("-inf")] * 3
+                for s in shapes:
+                    try:
+                        bb = cmds.exactWorldBoundingBox(s)
+                    except Exception:
+                        continue
+                    for i in range(3):
+                        if bb[i] < world_bb_min[i]:
+                            world_bb_min[i] = bb[i]
+                        if bb[i + 3] > world_bb_max[i]:
+                            world_bb_max[i] = bb[i + 3]
+                    for gx in (bb[0], bb[3]):
+                        for gy in (bb[1], bb[4]):
+                            for gz in (bb[2], bb[5]):
+                                p = om.MPoint(gx, gy, gz, 1.0)
+                                pl = p * cam_inv
+                                fwd = -pl.z
+                                if fwd > frame_max:
+                                    frame_max = fwd
+                if frame_max > max_fwd:
+                    max_fwd = frame_max
+                if log_fn:
+                    # Also surface the per-axis scale of the camera's
+                    # world matrix so the user can see how local
+                    # units relate to world units (e.g. 0.05 means
+                    # 1 local unit == 0.05 world units).
+                    sx = (cam_mat[0] ** 2 + cam_mat[1] ** 2
+                          + cam_mat[2] ** 2) ** 0.5
+                    log_fn(
+                        "Auto-fit f{}: world bbox x[{:.1f},{:.1f}] "
+                        "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}], camera "
+                        "world scale~{:.4f}, max forward depth "
+                        "(local) {:.2f}".format(
+                            int(f),
+                            world_bb_min[0], world_bb_max[0],
+                            world_bb_min[1], world_bb_max[1],
+                            world_bb_min[2], world_bb_max[2],
+                            sx, frame_max))
         finally:
             try:
                 cmds.currentTime(saved, edit=True)
             except Exception:
                 pass
-        return (max_d + padding) if max_d > 0 else None
+        return (max_fwd + padding) if max_fwd > 0 else None
 
     @staticmethod
     def apply_camera_far_for_scene(camera, far_value, log_fn=None):
@@ -6422,6 +6669,13 @@ class Exporter(object):
         beyond the farthest object) and camera.farClipPlane to
         `far_value + 1.0` (2 units beyond the farthest object, given
         the +1 padding baked into `far_value`). No-op on empty inputs.
+
+        When ``log_fn`` is provided, logs:
+        - the number of camera shapes / image planes located
+        - any locked attributes (which silently block writes)
+        - any setAttr exceptions (network/reference locks, etc.)
+        - the actual final values of depth + farClipPlane (so the
+          user can confirm the change took effect)
         """
         if not camera or far_value is None or not cmds.objExists(camera):
             return
@@ -6429,25 +6683,100 @@ class Exporter(object):
         clip_value = depth_value + 1.0
         cam_shapes = cmds.listRelatives(
             camera, shapes=True, type="camera") or []
+        if not cam_shapes and log_fn:
+            log_fn(
+                "Auto-fit apply {}: no camera shape under transform; "
+                "skipping.".format(camera))
         for cs in cam_shapes:
+            # ---- farClipPlane ----
+            fcp_attr = cs + ".farClipPlane"
             try:
-                cmds.setAttr(cs + ".farClipPlane", clip_value)
+                fcp_locked = cmds.getAttr(fcp_attr, lock=True)
             except Exception:
-                pass
+                fcp_locked = False
+            # Temporarily unlock far clip so SynthEyes-exported locks
+            # don't prevent the auto-fit from pushing the frustum
+            # behind the geo. We re-lock to the original state once
+            # the write lands.
+            if fcp_locked:
+                try:
+                    cmds.setAttr(fcp_attr, lock=False)
+                    if log_fn:
+                        log_fn(
+                            "Auto-fit apply {}: {} was LOCKED; "
+                            "temporarily unlocking to update.".format(
+                                camera, fcp_attr))
+                except Exception as exc:
+                    if log_fn:
+                        log_fn(
+                            "Auto-fit apply {}: failed to unlock {}: "
+                            "{}".format(camera, fcp_attr, exc))
+            try:
+                cmds.setAttr(fcp_attr, clip_value)
+            except Exception as exc:
+                if log_fn:
+                    log_fn(
+                        "Auto-fit apply {}: setAttr {} failed: "
+                        "{}".format(camera, fcp_attr, exc))
+            if fcp_locked:
+                try:
+                    cmds.setAttr(fcp_attr, lock=True)
+                except Exception:
+                    pass
+
+            # ---- image planes ----
             try:
                 ips = cmds.listConnections(
                     cs + ".imagePlane", type="imagePlane") or []
-            except Exception:
+            except Exception as exc:
                 ips = []
+                if log_fn:
+                    log_fn(
+                        "Auto-fit apply {}: listConnections .imagePlane "
+                        "failed: {}".format(camera, exc))
+            if log_fn:
+                log_fn(
+                    "Auto-fit apply {}: camera shape {} -> {} image "
+                    "plane(s).".format(camera, cs, len(ips)))
             for ip in ips:
+                depth_attr = ip + ".depth"
                 try:
-                    cmds.setAttr(ip + ".depth", depth_value)
+                    ip_locked = cmds.getAttr(depth_attr, lock=True)
                 except Exception:
-                    pass
-        if log_fn:
-            log_fn(
-                "{}: image plane depth {:.1f}, far clip {:.1f}".format(
-                    camera, depth_value, clip_value))
+                    ip_locked = False
+                if ip_locked and log_fn:
+                    log_fn(
+                        "Auto-fit apply {}: {} is LOCKED; cannot set "
+                        "depth to {:.1f}.".format(
+                            camera, depth_attr, depth_value))
+                    continue
+                try:
+                    cmds.setAttr(depth_attr, depth_value)
+                except Exception as exc:
+                    if log_fn:
+                        log_fn(
+                            "Auto-fit apply {}: setAttr {} failed: "
+                            "{}".format(camera, depth_attr, exc))
+
+            # ---- read-back so the log shows real values ----
+            if log_fn:
+                try:
+                    actual_fcp = cmds.getAttr(fcp_attr)
+                except Exception:
+                    actual_fcp = float("nan")
+                ip_depths = []
+                for ip in ips:
+                    try:
+                        ip_depths.append(cmds.getAttr(ip + ".depth"))
+                    except Exception:
+                        ip_depths.append(float("nan"))
+                log_fn(
+                    "Auto-fit apply {}: post-write farClipPlane={:.1f} "
+                    "(target {:.1f}), image plane depth(s)={} "
+                    "(target {:.1f})".format(
+                        camera, actual_fcp, clip_value,
+                        ["{:.1f}".format(d) for d in ip_depths],
+                        depth_value))
 
     @staticmethod
     def _plate_name_from_path(path):
@@ -9551,8 +9880,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_fbx_checkbox.setChecked(True)
         self.mm_abc_checkbox = QCheckBox("  Alembic (.abc)")
         self.mm_abc_checkbox.setChecked(True)
-        self.mm_usd_checkbox = QCheckBox("  USD (.usd)")
-        self.mm_usd_checkbox.setChecked(True)
+        # USD export temporarily disabled for matchmove pending further
+        # testing of the GenHuman rig body-morph issue. Checkbox removed
+        # from the UI; mm_usd_checkbox stays None and do_usd is forced
+        # False in the matchmove paths.
 
         self.mm_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.mm_mov_checkbox.setChecked(True)
@@ -9560,7 +9891,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         fmt_layout.addWidget(self.mm_ma_checkbox)
         fmt_layout.addWidget(self.mm_fbx_checkbox)
         fmt_layout.addWidget(self.mm_abc_checkbox)
-        fmt_layout.addWidget(self.mm_usd_checkbox)
         fmt_layout.addWidget(self.mm_mov_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
@@ -10650,7 +10980,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         max_far = 0.0
         for cam in cams:
             far = Exporter.compute_far_distance(
-                cam, geo_nodes, frames=frames, padding=1.0)
+                cam, geo_nodes, frames=frames, padding=1.0,
+                log_fn=self._log)
             if far is None:
                 continue
             Exporter.apply_camera_far_for_scene(
@@ -10863,7 +11194,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_ma = self.mm_ma_checkbox.isChecked()
         do_fbx = self.mm_fbx_checkbox.isChecked()
         do_abc = self.mm_abc_checkbox.isChecked()
-        do_usd = self.mm_usd_checkbox.isChecked()
+        do_usd = False  # USD temporarily disabled for matchmove
         do_mov = self.mm_mov_checkbox.isChecked()
         if not (do_ma or do_fbx or do_abc or do_usd or do_mov):
             errors.append("No export format selected.")
@@ -11149,12 +11480,23 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             shot_name=folder_name,
         )
 
+        # Geo nodes the preview should consider for image-plane
+        # depth + camera far clip auto-fit. Populated per tab below
+        # so the preview matches the export handlers, which always
+        # call _auto_fit_camera_far before playblasting.
+        autofit_geo = []
+
         if active_tab == TAB_CAMERA_TRACK:
             wf_shader = self.pb_wireframe_shader_cb.isChecked()
             geo_roots = [
                 e["field"].text().strip()
                 for e in self.ct_geo_fields
                 if e["field"].text().strip()]
+            obj_tracks = [
+                e["field"].text().strip()
+                for e in self.ct_obj_track_entries
+                if e["field"].text().strip()]
+            autofit_geo = geo_roots + obj_tracks
             pb_kwargs.update(
                 camera_track_mode=True,
                 wireframe_shader=wf_shader,
@@ -11175,6 +11517,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     p["geo_field"].text().strip()
                     for p in self.mm_rig_geo_pairs
                     if p["geo_field"].text().strip()]
+                autofit_geo = list(geo_roots)
                 pb_kwargs.update(
                     matchmove_geo=geo_roots,
                     motion_blur=mb,
@@ -11188,6 +11531,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     e["field"].text().strip()
                     for e in self.ft_face_mesh_entries
                     if e["field"].text().strip()]
+                autofit_geo = list(face_meshes)
                 pb_kwargs.update(
                     face_track_mode=True,
                     matchmove_geo=face_meshes,
@@ -11236,6 +11580,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             btn.setText("Rendering\u2026")
             btn.setEnabled(False)
         QApplication.processEvents()
+
+        # Match the export handlers: push the image plane behind the
+        # farthest geo (and bump the camera far clip) so the preview
+        # frame doesn't get occluded by the plate. Skipped if the
+        # user hasn't configured any geo.
+        if autofit_geo:
+            preview_far = self._auto_fit_camera_far(
+                [camera], autofit_geo, frame, frame)
+            if preview_far is not None:
+                pb_kwargs["far_clip"] = max(
+                    pb_kwargs.get("far_clip", 0),
+                    int(preview_far) + 1)
 
         try:
             exporter = Exporter(self._log)
@@ -11928,7 +12284,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_ma = self.mm_ma_checkbox.isChecked()
         do_fbx = self.mm_fbx_checkbox.isChecked()
         do_abc = self.mm_abc_checkbox.isChecked()
-        do_usd = self.mm_usd_checkbox.isChecked()
+        do_usd = False  # USD temporarily disabled for matchmove
         do_mov = self.mm_mov_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
