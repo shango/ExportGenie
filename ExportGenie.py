@@ -53,7 +53,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v16-beta-2"
+TOOL_VERSION = "v16-beta-3"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -1028,6 +1028,48 @@ class Exporter(object):
                 return f
         return None
 
+    @staticmethod
+    def _username_file_path():
+        """Absolute path to ``username.txt`` beside this source file.
+
+        The artist-entered username is persisted here so it survives
+        across sessions and scene files, and is read at render time.
+
+        Returns:
+            str: Path to ``username.txt`` in the scripts folder.
+        """
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if os.path.basename(scripts_dir) == "__pycache__":
+            scripts_dir = os.path.dirname(scripts_dir)
+        return os.path.join(scripts_dir, "username.txt")
+
+    @classmethod
+    def _get_username(cls):
+        """Read the saved username, or ``""`` if none is set.
+
+        Returns:
+            str: The stripped username, empty if the file is missing,
+                unreadable, or blank.
+        """
+        try:
+            with open(cls._username_file_path(), "r") as fh:
+                return fh.read().strip()
+        except (IOError, OSError):
+            return ""
+
+    @classmethod
+    def _set_username(cls, name):
+        """Persist ``name`` to ``username.txt`` (best effort).
+
+        Args:
+            name: Username string; surrounding whitespace is stripped.
+        """
+        try:
+            with open(cls._username_file_path(), "w") as fh:
+                fh.write((name or "").strip())
+        except (IOError, OSError) as exc:
+            sys.stderr.write("Could not save username: {}\n".format(exc))
+
     def _build_hud_drawtext(self, start_frame, focal_length=None,
                             resolution=None, plate_name=None):
         """Build ffmpeg drawtext filter chain for metadata overlay.
@@ -1087,10 +1129,19 @@ class Exporter(object):
             ":x=w-tw-30:y=h-th-30"
         ).format(opts=font_opts, text=right_text)
 
-        # Top-left: plate name (escape ffmpeg drawtext metachars).
+        # Top-left: plate name + artist username (escape ffmpeg
+        # drawtext metachars). The username is read from username.txt
+        # at render time so it reflects the latest saved value.
         plate_dt = None
-        if plate_name:
-            safe = plate_name.replace("\\", "\\\\").replace(
+        username = self._get_username()
+        top_left = plate_name or ""
+        if username:
+            top_left = (
+                "{}   |   {}".format(top_left, username)
+                if top_left else username
+            )
+        if top_left:
+            safe = top_left.replace("\\", "\\\\").replace(
                 ":", "\\:").replace("'", "\\'").replace("%", "\\%")
             plate_dt = (
                 "drawtext={opts}:text='{text}':x=30:y=30"
@@ -10037,6 +10088,14 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         tab_layout.addStretch()
         return tab
 
+    def _on_username_edited(self):
+        """Persist the username field's value to ``username.txt``."""
+        name = self.pb_username_edit.text().strip()
+        Exporter._set_username(name)
+        # Normalize the field to the saved (stripped) value.
+        if name != self.pb_username_edit.text():
+            self.pb_username_edit.setText(name)
+
     def _build_playblast_tab(self):
         tab = QWidget()
         tab_layout = QVBoxLayout(tab)
@@ -10090,6 +10149,26 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_hud_overlay_cb.setToolTip(
             "Burn frame number and focal length into the playblast")
         gen_layout.addWidget(self.pb_hud_overlay_cb)
+
+        # Username -- burned in next to the shot name on every tab's
+        # playblast. Persisted to username.txt beside the script and
+        # read at render time.
+        user_row = QHBoxLayout()
+        user_row.setSpacing(8)
+        user_row.addWidget(QLabel("Username:"))
+        self.pb_username_edit = QLineEdit()
+        self.pb_username_edit.setText(Exporter._get_username())
+        self.pb_username_edit.setPlaceholderText(
+            "e.g. your name or email -- shown next to the shot name")
+        self.pb_username_edit.setToolTip(
+            "Saved to username.txt and burned into the top-left of "
+            "every playblast next to the shot name. Leave blank to "
+            "show only the shot name.")
+        self.pb_username_edit.editingFinished.connect(
+            self._on_username_edited)
+        user_row.addWidget(self.pb_username_edit)
+        gen_layout.addLayout(user_row)
+
         gen.setLayout(gen_layout)
         tab_layout.addWidget(gen)
 
