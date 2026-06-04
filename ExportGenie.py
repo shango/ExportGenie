@@ -53,7 +53,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v16-beta-3"
+TOOL_VERSION = "v16"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -4764,50 +4764,121 @@ class Exporter(object):
                     except Exception:
                         pass
                 if face_track_mode:
-                    # Create crown from the first face mesh.
-                    # The picker may hold a group  -- find the
-                    # actual animated mesh transform inside it.
-                    crown_target = None
-                    first_mesh = (matchmove_geo[0]
-                                  if matchmove_geo else None)
-                    if first_mesh and cmds.objExists(first_mesh):
-                        # Check if the node itself has mesh shapes
-                        shapes = cmds.listRelatives(
-                            first_mesh, shapes=True,
-                            type="mesh") or []
-                        if shapes:
-                            crown_target = first_mesh
+                    # Create one crown per face mesh.  Each picker
+                    # slot may hold a group  -- find the actual
+                    # animated mesh transform inside it.  All crowns
+                    # are parented under a single QC_head_GRP
+                    # container so the downstream render-pass and
+                    # visibility logic (which keys off QC_head_GRP)
+                    # picks up every crown.
+                    #
+                    # Evaluate geometry at the frame we are about to
+                    # render BEFORE measuring bounding boxes.  A head
+                    # whose face-track solve doesn't cover the scene's
+                    # current frame reports an empty (inverted) bbox,
+                    # which would silently drop its crown.
+                    try:
+                        cmds.currentTime(int(start_frame), edit=True)
+                    except Exception:
+                        pass
+                    # Resolve the best crown target per face mesh: a
+                    # non-intermediate mesh transform with a valid
+                    # (non-empty) world bounding box.  A head can carry
+                    # more than one mesh, so pick the largest rather
+                    # than the first one found.
+                    crown_targets = []
+                    for face_mesh in matchmove_geo:
+                        if not (face_mesh and cmds.objExists(face_mesh)):
+                            continue
+                        # Resolve to a unique long name so the
+                        # per-crown selection below is never ambiguous
+                        # (a short/duplicate name would select more
+                        # than one node and abort crown creation).
+                        long_names = cmds.ls(
+                            face_mesh, long=True) or [face_mesh]
+                        node = long_names[0]
+                        # Gather candidate transforms that carry a
+                        # renderable (non-intermediate) mesh shape.
+                        candidates = []
+                        direct = cmds.listRelatives(
+                            node, shapes=True, type="mesh",
+                            fullPath=True) or []
+                        if any(not cmds.getAttr(s + ".intermediateObject")
+                               for s in direct):
+                            candidates.append(node)
                         else:
-                            # Search all descendants for the first
-                            # transform with mesh shapes (may be
-                            # nested several levels deep).
                             descendants = cmds.listRelatives(
-                                first_mesh,
-                                allDescendents=True,
+                                node, allDescendents=True,
                                 type="transform",
                                 fullPath=True) or []
                             for desc in descendants:
-                                desc_shapes = cmds.listRelatives(
-                                    desc, shapes=True,
-                                    type="mesh") or []
-                                if desc_shapes:
-                                    crown_target = desc
-                                    break
-                    if crown_target:
-                        try:
-                            cmds.select(crown_target, replace=True)
-                            grp, _, _ = create_qc_crown_from_mesh(
-                                name="QC_head")
-                            auto_qc_crown = grp
-                            cmds.select(clear=True)
+                                dshapes = cmds.listRelatives(
+                                    desc, shapes=True, type="mesh",
+                                    fullPath=True) or []
+                                if any(not cmds.getAttr(
+                                        s + ".intermediateObject")
+                                       for s in dshapes):
+                                    candidates.append(desc)
+                        # Pick the candidate with the largest valid
+                        # world bbox (skips empty/inverted boxes).
+                        best = None
+                        best_span = 1e-4
+                        for cand in candidates:
+                            try:
+                                bb = cmds.exactWorldBoundingBox(cand)
+                                span = max(bb[3] - bb[0],
+                                           bb[5] - bb[2])
+                            except Exception:
+                                continue
+                            if span > best_span:
+                                best_span = span
+                                best = cand
+                        if best:
+                            crown_targets.append(best)
                             sys.stderr.write(
-                                LOG_PREFIX + " Auto-created "
-                                "QC_head_GRP constrained to "
-                                "{}\n".format(crown_target))
-                        except Exception as e:
+                                LOG_PREFIX + " QC crown target for "
+                                "{} -> {} (bbox span {:.4f})\n".format(
+                                    node, best, best_span))
+                        else:
                             sys.stderr.write(
-                                LOG_PREFIX + " QC crown "
-                                "creation failed: {}\n".format(e))
+                                LOG_PREFIX + " No valid crown target "
+                                "under {} -- all candidate meshes have "
+                                "an empty bounding box at frame {}\n"
+                                .format(node, int(start_frame)))
+                    if crown_targets:
+                        # Build each crown in its own try/except so one
+                        # bad head can't prevent crowns on the others.
+                        container = None
+                        made = 0
+                        for idx, tgt in enumerate(crown_targets):
+                            try:
+                                if container is None:
+                                    container = cmds.group(
+                                        em=True, name="QC_head_GRP")
+                                cmds.select(tgt, replace=True)
+                                grp, _, _ = create_qc_crown_from_mesh(
+                                    name="QC_headCrown{}".format(
+                                        idx + 1))
+                                # Reparent under the container; it
+                                # sits at the world origin (identity),
+                                # so the point/orient constraints keep
+                                # the crown locked to its mesh.
+                                cmds.parent(grp, container)
+                                made += 1
+                                sys.stderr.write(
+                                    LOG_PREFIX + " QC crown {} created "
+                                    "for {}\n".format(idx + 1, tgt))
+                            except Exception as e:
+                                sys.stderr.write(
+                                    LOG_PREFIX + " QC crown for {} "
+                                    "FAILED: {}\n".format(tgt, e))
+                        if container and cmds.objExists(container):
+                            auto_qc_crown = container
+                        cmds.select(clear=True)
+                        sys.stderr.write(
+                            LOG_PREFIX + " Auto-created QC_head_GRP "
+                            "with {}/{} crown(s)\n".format(
+                                made, len(crown_targets)))
                 if (cmds.objExists("QC_head_GRP")
                         and cmds.listRelatives(
                             "QC_head_GRP", allDescendents=True,
@@ -5223,9 +5294,11 @@ class Exporter(object):
                             cmds.displayRGBColor(
                                 "backgroundBottom", 0, 0, 0)
                             cmds.displayPref(displayGradient=False)
-                            # Re-apply display overrides for curves
+                            # Re-apply display overrides for curves.
+                            # allDescendents so per-mesh crown
+                            # sub-groups under QC_head_GRP are reached.
                             kids = cmds.listRelatives(
-                                "QC_head_GRP", c=True,
+                                "QC_head_GRP", allDescendents=True,
                                 type="transform", f=True) or []
                             for k in kids:
                                 _qc_set_curve_display(
@@ -10807,6 +10880,34 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 return label
         return buttons[0]
 
+    def _require_username(self):
+        """Gate a playblast on a saved username being present.
+
+        Returns True when ``username.txt`` holds a name.  When it is
+        missing, shows a friendly, bold reminder (deliberately not
+        styled as an error  -- no warning/critical icon) and returns
+        False so the caller can abort the playblast.
+        """
+        if Exporter._get_username():
+            return True
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Username Required")
+        msg.setIcon(QMessageBox.NoIcon)
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(
+            "<div style='font-size:14px; font-weight:bold;'>"
+            "Add your username in the Playblast Settings tab before "
+            "creating a playblast.</div>"
+            "<div style='margin-top:10px; font-weight:normal;'>"
+            "Your username is burned into the top-left of every "
+            "playblast so each shot can be traced back to you  -- "
+            "it's required before a playblast can run.</div>"
+        )
+        ok = msg.addButton("Got it", QMessageBox.AcceptRole)
+        msg.setDefaultButton(ok)
+        msg.exec_()
+        return False
+
     # ------------------------------------------------------------------
     # Tab Helpers
     # ------------------------------------------------------------------
@@ -11478,6 +11579,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 "export on their own. Switch to the Camera Track, "
                 "Matchmove, or Face Track tab and click Export there.")
             return
+        # Block playblast exports until the artist has saved a
+        # username  -- it's burned into the top-left of every movie.
+        mov_cb = {
+            TAB_CAMERA_TRACK: self.ct_mov_checkbox,
+            TAB_MATCHMOVE: self.mm_mov_checkbox,
+            TAB_FACE_TRACK: self.ft_mov_checkbox,
+        }.get(active_tab)
+        if mov_cb and mov_cb.isChecked() and not self._require_username():
+            return
+
         if active_tab == TAB_CAMERA_TRACK:
             self._export_camera_track()
         elif active_tab == TAB_MATCHMOVE:
