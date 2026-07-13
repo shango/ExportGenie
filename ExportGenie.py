@@ -1071,7 +1071,7 @@ class Exporter(object):
         except (IOError, OSError) as exc:
             sys.stderr.write("Could not save username: {}\n".format(exc))
 
-    def _build_hud_drawtext(self, start_frame, focal_length=None,
+    def _build_hud_drawtext(self, start_frame, focal_lengths=None,
                             resolution=None, plate_name=None):
         """Build ffmpeg drawtext filter chain for metadata overlay.
 
@@ -1080,7 +1080,13 @@ class Exporter(object):
 
         Args:
             start_frame: First frame number (int).
-            focal_length: Camera focal length in mm, or None.
+            focal_lengths: Per-frame camera focal lengths in mm, one
+                entry per rendered frame starting at start_frame, or
+                None when no camera focal length is available.  A zoom
+                yields a changing list, so the burned-in FL is emitted
+                as one drawtext per run of equal values, each gated
+                with ``enable=between(n,...)``.  A static lens collapses
+                to a single ungated drawtext.
             plate_name: Plate identifier (e.g. SHOT_pl01_raw_v01) to
                 burn at the top-left. Empty/None -> no plate HUD.
 
@@ -1115,20 +1121,46 @@ class Exporter(object):
         # Bottom-right: FL | resolution | version | datetime
         now_str = datetime.datetime.now().strftime(
             "%Y-%m-%d %H:%M")
-        parts = []
-        if focal_length is not None:
-            parts.append("FL {:.1f}mm".format(focal_length))
-        res = resolution or (1920, 1080)
-        parts.append("{}x{}".format(res[0], res[1]))
-        parts.append("{} {}".format(TOOL_NAME, TOOL_VERSION))
-        parts.append(now_str)
-        # Escape colons for ffmpeg drawtext syntax
-        right_text = "   ".join(parts).replace(":", "\\:")
 
-        meta_dt = (
-            "drawtext={opts}:text='{text}'"
-            ":x=w-tw-30:y=h-th-30"
-        ).format(opts=font_opts, text=right_text)
+        def meta_text(focal_length):
+            parts = []
+            if focal_length is not None:
+                parts.append("FL {:.1f}mm".format(focal_length))
+            res = resolution or (1920, 1080)
+            parts.append("{}x{}".format(res[0], res[1]))
+            parts.append("{} {}".format(TOOL_NAME, TOOL_VERSION))
+            parts.append(now_str)
+            # Escape colons for ffmpeg drawtext syntax
+            return "   ".join(parts).replace(":", "\\:")
+
+        # Group the per-frame focal lengths into runs of equal value
+        # (rounded to the burned-in 0.1mm precision) so a static lens
+        # costs one drawtext and a zoom costs one per distinct value.
+        # Each run is (focal_length, first_index, last_index) where the
+        # indices are 0-based offsets into the rendered frames, matching
+        # ffmpeg's frame counter `n`.
+        runs = []
+        rounded = [round(f, 1) for f in (focal_lengths or [])]
+        i = 0
+        while i < len(rounded):
+            j = i
+            while j + 1 < len(rounded) and rounded[j + 1] == rounded[i]:
+                j += 1
+            runs.append((rounded[i], i, j))
+            i = j + 1
+        if not runs:
+            runs = [(None, None, None)]
+
+        meta_dts = []
+        for focal_length, first, last in runs:
+            meta_dt = (
+                "drawtext={opts}:text='{text}'"
+                ":x=w-tw-30:y=h-th-30"
+            ).format(opts=font_opts, text=meta_text(focal_length))
+            if len(runs) > 1:
+                meta_dt += ":enable='between(n,{},{})'".format(first, last)
+            meta_dts.append(meta_dt)
+        meta_dt = ",".join(meta_dts)
 
         # Top-left: plate name + artist username (escape ffmpeg
         # drawtext metachars). The username is read from username.txt
@@ -1154,7 +1186,7 @@ class Exporter(object):
         return "[pre_hud]{}[out]".format(chain)
 
     def _encode_mp4(self, png_dir, png_base, start_frame, output_mp4,
-                    show_hud=False, focal_length=None,
+                    show_hud=False, focal_lengths=None,
                     resolution=None, plate_name=None):
         """Encode a PNG image sequence to H.264 .mp4 via bundled ffmpeg.
 
@@ -1164,7 +1196,8 @@ class Exporter(object):
             start_frame: First frame number in the sequence.
             output_mp4: Full path to the output .mp4 file.
             show_hud: If True, burn metadata text overlay via drawtext.
-            focal_length: Camera focal length in mm (for HUD).
+            focal_lengths: Per-frame camera focal lengths in mm (for
+                the HUD), one entry per rendered frame.
 
         Returns:
             bool: True if encoding succeeded.
@@ -1194,7 +1227,7 @@ class Exporter(object):
         vf_script = None
         if show_hud and self._has_drawtext():
             hud_filters = self._build_hud_drawtext(
-                start_frame, focal_length, resolution=resolution,
+                start_frame, focal_lengths, resolution=resolution,
                 plate_name=plate_name)
             # Strip stream labels  -- single-input uses plain vf
             vf_script = pad_filter + "," + hud_filters.replace(
@@ -1282,7 +1315,7 @@ class Exporter(object):
                           matte_dir, matte_base,
                           start_frame, output_path,
                           opacity=1.0, png_output=False,
-                          show_hud=False, focal_length=None,
+                          show_hud=False, focal_lengths=None,
                           resolution=None,
                           crown_dir=None, crown_base=None,
                           wireframe_dir=None, wireframe_base=None,
@@ -1426,7 +1459,7 @@ class Exporter(object):
 
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
-                start_frame, focal_length, resolution=resolution,
+                start_frame, focal_lengths, resolution=resolution,
                 plate_name=plate_name)
             filter_complex = filter_complex.replace(
                 "[out]", "[pre_hud]")
@@ -4446,15 +4479,23 @@ class Exporter(object):
             original_sel = cmds.ls(selection=True)
             cmds.select(clear=True)
 
-            # Resolve focal length for metadata overlay
-            hud_focal_length = None
+            # Resolve per-frame focal length for the metadata overlay.
+            # Sampled at every rendered frame so a lens animated over
+            # the shot burns in the right value on each frame instead
+            # of one value for the whole clip.  getAttr(time=) reads
+            # the attribute at that time without scrubbing the scene.
+            hud_focal_lengths = None
             if camera:
                 cam_shapes = cmds.listRelatives(
                     camera, shapes=True, type="camera") or []
                 if cam_shapes:
+                    fl_attr = cam_shapes[0] + ".focalLength"
                     try:
-                        hud_focal_length = cmds.getAttr(
-                            cam_shapes[0] + ".focalLength")
+                        hud_focal_lengths = [
+                            cmds.getAttr(fl_attr, time=frame)
+                            for frame in range(int(start_frame),
+                                               int(end_frame) + 1)
+                        ]
                     except Exception:
                         pass
 
@@ -5730,7 +5771,7 @@ class Exporter(object):
                             opacity=opacity_01,
                             png_output=True,
                             show_hud=show_hud,
-                            focal_length=hud_focal_length,
+                            focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
@@ -5747,7 +5788,7 @@ class Exporter(object):
                             start_frame, mp4_output,
                             opacity=opacity_01,
                             show_hud=show_hud,
-                            focal_length=hud_focal_length,
+                            focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
@@ -5770,7 +5811,7 @@ class Exporter(object):
                             start_frame, composite_out,
                             opacity=opacity_01,
                             show_hud=show_hud,
-                            focal_length=hud_focal_length,
+                            focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
@@ -5857,7 +5898,7 @@ class Exporter(object):
                             ct_tmp, ct_tmp_base, start_frame,
                             mp4_output,
                             show_hud=show_hud,
-                            focal_length=hud_focal_length,
+                            focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
                             plate_name=hud_plate_name)
                     elif png_mode:
@@ -5872,7 +5913,7 @@ class Exporter(object):
                         hud_filters = None
                         if show_hud and self._has_drawtext():
                             hud_f = self._build_hud_drawtext(
-                                start_frame, hud_focal_length,
+                                start_frame, hud_focal_lengths,
                                 resolution=(pb_width, pb_height),
                                 plate_name=hud_plate_name)
                             hud_filters = hud_f.replace(
@@ -5961,7 +6002,7 @@ class Exporter(object):
                             ct_tmp, ct_tmp_base, start_frame,
                             ct_output,
                             show_hud=show_hud,
-                            focal_length=hud_focal_length,
+                            focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
                             plate_name=hud_plate_name)
                     if encode_ok:
