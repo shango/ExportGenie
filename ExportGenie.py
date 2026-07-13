@@ -7,6 +7,7 @@ Compatible with Maya 2025+.
 """
 
 import datetime
+import json
 import math
 import os
 import re
@@ -30,7 +31,7 @@ try:
         QCheckBox, QPushButton, QLineEdit, QComboBox, QSpinBox,
         QDoubleSpinBox, QSlider,
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
-        QColorDialog, QSizePolicy, QFrame, QApplication,
+        QColorDialog, QSizePolicy, QFrame, QApplication, QInputDialog,
     )
     from PySide6.QtCore import Qt, Signal, QSize
     from PySide6.QtGui import QColor, QFont, QTextCursor
@@ -41,7 +42,7 @@ except ImportError:
         QCheckBox, QPushButton, QLineEdit, QComboBox, QSpinBox,
         QDoubleSpinBox, QSlider,
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
-        QColorDialog, QSizePolicy, QFrame, QApplication,
+        QColorDialog, QSizePolicy, QFrame, QApplication, QInputDialog,
     )
     from PySide2.QtCore import Qt, Signal, QSize
     from PySide2.QtGui import QColor, QFont, QTextCursor
@@ -53,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v16"
+TOOL_VERSION = "v18"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -9474,11 +9475,30 @@ class CollapsibleGroupBox(QGroupBox):
 class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
     """Main Export Genie UI  -- PySide2/6 dockable widget."""
 
+    # Playblast Settings tab widgets captured by a preset. Each entry is
+    # (attr_name, kind) where kind is "check" (QCheckBox), "spin"
+    # (QSpinBox) or "color" (QPushButton carrying a ._color tuple).
+    _PLAYBLAST_PRESET_FIELDS = (
+        ("pb_aa16_cb", "check"),
+        ("pb_far_clip_spin", "spin"),
+        ("pb_raw_playblast_cb", "check"),
+        ("pb_custom_vt_cb", "check"),
+        ("pb_hud_overlay_cb", "check"),
+        ("pb_wireframe_shader_cb", "check"),
+        ("pb_motion_blur_cb", "check"),
+        ("pb_wireframe_overlay_cb", "check"),
+        ("pb_wireframe_opacity_spin", "spin"),
+        ("pb_wireframe_color_btn", "color"),
+        ("pb_checker_color_btn", "color"),
+        ("pb_checker_scale_spin", "spin"),
+        ("pb_checker_opacity_spin", "spin"),
+    )
+
     def __init__(self, parent=None):
         super(ExportGenieWidget, self).__init__(parent)
         self.setObjectName("exportGenie")
         self.setWindowTitle("Export Genie  {}".format(TOOL_VERSION))
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(253)
         # Shared
         self.scene_info_label = None
         self.export_root_field = None
@@ -9524,6 +9544,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_checker_opacity_spin = None
         self.pb_wireframe_opacity_spin = None
         self.pb_wireframe_color_btn = None
+        self.preset_combo = None
         # Matchmove tab (mm_)
         self.mm_camera_entries = []
         self.mm_camera_layout = None
@@ -9864,7 +9885,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         stmap_layout.addLayout(rp_row)
 
         stmap_group.setLayout(stmap_layout)
-        stmap_group.setChecked(False)          # collapsed by default
+        stmap_group.setChecked(True)           # expanded by default
         tab_layout.addWidget(stmap_group)
 
         # Export Formats
@@ -10303,7 +10324,15 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             self.pb_wireframe_opacity_spin.setValue)
         wf_op_row.addWidget(self.pb_wireframe_opacity_spin)
         wf_op_row.addWidget(wf_op_slider)
-        wf_op_row.addWidget(QLabel("Color:"))
+        mmft_layout.addLayout(wf_op_row)
+
+        # Wireframe overlay color on its own row so the opacity row
+        # above stays narrow -- this row used to combine the opacity
+        # slider, spin, and colour swatch, which pinned the docked
+        # panel to a wide minimum.
+        wf_clr_row = QHBoxLayout()
+        wf_clr_row.setSpacing(8)
+        wf_clr_row.addWidget(QLabel("Wireframe Color:"))
         self.pb_wireframe_color_btn = QPushButton()
         self.pb_wireframe_color_btn._color = (0.6, 0.1, 0.1)
         self._update_color_button(self.pb_wireframe_color_btn)
@@ -10312,8 +10341,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             "Color of the wireframe overlay")
         self.pb_wireframe_color_btn.clicked.connect(
             lambda: self._pick_color(self.pb_wireframe_color_btn))
-        wf_op_row.addWidget(self.pb_wireframe_color_btn)
-        mmft_layout.addLayout(wf_op_row)
+        wf_clr_row.addWidget(self.pb_wireframe_color_btn)
+        wf_clr_row.addStretch()
+        mmft_layout.addLayout(wf_clr_row)
 
         mmft_layout.addWidget(QLabel("QC Checker Overlay"))
 
@@ -10372,6 +10402,42 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         mmft.setLayout(mmft_layout)
         tab_layout.addWidget(mmft)
 
+        # Presets -- save/restore every setting on this tab to a JSON
+        # file stored beside the script (see _presets_dir).  Combo and
+        # buttons are on separate rows so the group never forces the
+        # docked window wider than its minimum width.
+        presets = CollapsibleGroupBox("Presets")
+        presets_layout = QVBoxLayout()
+        presets_layout.setSpacing(4)
+        combo_row = QHBoxLayout()
+        combo_row.setSpacing(6)
+        combo_row.addWidget(QLabel("Preset:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setToolTip(
+            "Saved Playblast Settings presets. Stored as .json files in "
+            "the ExportGenie_presets folder beside the script.")
+        combo_row.addWidget(self.preset_combo, 1)
+        presets_layout.addLayout(combo_row)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        load_btn = QPushButton("Load")
+        load_btn.setToolTip("Apply the selected preset to this tab")
+        load_btn.clicked.connect(self._on_load_preset)
+        btn_row.addWidget(load_btn)
+        save_btn = QPushButton("Save As...")
+        save_btn.setToolTip(
+            "Save the current Playblast Settings as a new preset")
+        save_btn.clicked.connect(self._on_save_preset)
+        btn_row.addWidget(save_btn)
+        del_btn = QPushButton("Delete")
+        del_btn.setToolTip("Delete the selected preset file")
+        del_btn.clicked.connect(self._on_delete_preset)
+        btn_row.addWidget(del_btn)
+        presets_layout.addLayout(btn_row)
+        presets.setLayout(presets_layout)
+        tab_layout.addWidget(presets)
+        self._refresh_preset_combo()
+
         reset_row = QHBoxLayout()
         reset_row.addStretch()
         reset_btn = QPushButton("Reset to Defaults")
@@ -10408,6 +10474,182 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self._update_color_button(self.pb_checker_color_btn)
         self.pb_checker_scale_spin.setValue(15)
         self.pb_checker_opacity_spin.setValue(30)
+
+    # ------------------------------------------------------------------
+    # Playblast Settings Presets
+    # ------------------------------------------------------------------
+
+    def _presets_dir(self, create=False):
+        """Absolute path to the ``ExportGenie_presets`` folder beside
+        this source file, mirroring where ``username.txt`` lives.
+
+        Args:
+            create: When True, create the folder if it is missing.
+
+        Returns:
+            str: The folder path, or None if it could not be created.
+        """
+        base = os.path.dirname(os.path.abspath(__file__))
+        if os.path.basename(base) == "__pycache__":
+            base = os.path.dirname(base)
+        path = os.path.join(base, "ExportGenie_presets")
+        if create and not os.path.isdir(path):
+            try:
+                os.makedirs(path)
+            except OSError as exc:
+                sys.stderr.write(
+                    "Could not create presets folder: {}\n".format(exc))
+                return None
+        return path
+
+    def _list_presets(self):
+        """Sorted preset names (each is a ``.json`` filename sans
+        extension) found in the presets folder."""
+        folder = self._presets_dir()
+        if not folder or not os.path.isdir(folder):
+            return []
+        return [f[:-5] for f in sorted(os.listdir(folder))
+                if f.lower().endswith(".json")]
+
+    def _refresh_preset_combo(self, select=None):
+        """Repopulate the preset combo from disk, optionally selecting
+        ``select`` afterwards."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        names = self._list_presets()
+        self.preset_combo.addItems(names)
+        if select and select in names:
+            self.preset_combo.setCurrentText(select)
+        self.preset_combo.blockSignals(False)
+
+    def _gather_playblast_preset(self):
+        """Read every preset-tracked Playblast widget into a plain
+        JSON-serializable dict keyed by attribute name."""
+        data = {}
+        for attr, kind in self._PLAYBLAST_PRESET_FIELDS:
+            widget = getattr(self, attr)
+            if kind == "check":
+                data[attr] = widget.isChecked()
+            elif kind == "spin":
+                data[attr] = widget.value()
+            elif kind == "color":
+                data[attr] = list(widget._color)
+        return data
+
+    def _apply_playblast_preset(self, data):
+        """Apply a settings dict (from ``_gather_playblast_preset``)
+        back onto the widgets. Missing or malformed keys are skipped so
+        the current value is left untouched."""
+        for attr, kind in self._PLAYBLAST_PRESET_FIELDS:
+            if attr not in data:
+                continue
+            widget = getattr(self, attr)
+            value = data[attr]
+            try:
+                if kind == "check":
+                    widget.setChecked(bool(value))
+                elif kind == "spin":
+                    widget.setValue(int(value))
+                elif kind == "color":
+                    widget._color = tuple(float(c) for c in value)
+                    self._update_color_button(widget)
+            except (TypeError, ValueError):
+                continue
+
+    def _on_save_preset(self):
+        """Prompt for a name and write the current Playblast Settings to
+        ``<name>.json`` in the presets folder."""
+        name, ok = QInputDialog.getText(
+            self, "Save Preset", "Preset name:")
+        if not ok:
+            return
+        name = re.sub(r"[^A-Za-z0-9 _-]", "_", (name or "").strip())
+        if not name:
+            self._confirm_dialog(
+                "Save Preset", "Please enter a valid preset name.")
+            return
+        folder = self._presets_dir(create=True)
+        if not folder:
+            self._confirm_dialog(
+                "Save Preset", "Could not access the presets folder.")
+            return
+        path = os.path.join(folder, name + ".json")
+        if os.path.isfile(path) and self._confirm_dialog(
+                "Overwrite Preset",
+                "A preset named '{}' already exists. Overwrite it?".format(
+                    name),
+                buttons=["Overwrite", "Cancel"]) != "Overwrite":
+            return
+        payload = {
+            "tool": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "playblast_settings": self._gather_playblast_preset(),
+        }
+        try:
+            with open(path, "w") as fh:
+                json.dump(payload, fh, indent=2)
+        except (IOError, OSError) as exc:
+            self._confirm_dialog(
+                "Save Preset", "Could not save preset:\n{}".format(exc))
+            return
+        self._refresh_preset_combo(select=name)
+        self._log("Saved Playblast preset '{}'.".format(name))
+
+    def _on_load_preset(self):
+        """Apply the preset currently selected in the combo."""
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            self._confirm_dialog(
+                "Load Preset", "No preset selected to load.")
+            return
+        folder = self._presets_dir()
+        path = os.path.join(folder, name + ".json") if folder else None
+        if not path or not os.path.isfile(path):
+            self._confirm_dialog(
+                "Load Preset", "Preset '{}' was not found.".format(name))
+            self._refresh_preset_combo()
+            return
+        try:
+            with open(path, "r") as fh:
+                payload = json.load(fh)
+        except (IOError, OSError, ValueError) as exc:
+            self._confirm_dialog(
+                "Load Preset", "Could not read preset:\n{}".format(exc))
+            return
+        settings = payload.get("playblast_settings") if isinstance(
+            payload, dict) else None
+        if not isinstance(settings, dict):
+            self._confirm_dialog(
+                "Load Preset",
+                "Preset '{}' is not a valid Playblast preset.".format(name))
+            return
+        self._apply_playblast_preset(settings)
+        self._log("Loaded Playblast preset '{}'.".format(name))
+
+    def _on_delete_preset(self):
+        """Delete the preset file selected in the combo (with confirm)."""
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            self._confirm_dialog(
+                "Delete Preset", "No preset selected to delete.")
+            return
+        if self._confirm_dialog(
+                "Delete Preset",
+                "Delete preset '{}'? This cannot be undone.".format(name),
+                buttons=["Delete", "Cancel"]) != "Delete":
+            return
+        folder = self._presets_dir()
+        path = os.path.join(folder, name + ".json") if folder else None
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                self._confirm_dialog(
+                    "Delete Preset",
+                    "Could not delete preset:\n{}".format(exc))
+                return
+        self._refresh_preset_combo()
+        self._log("Deleted Playblast preset '{}'.".format(name))
 
     def _build_frame_range(self):
         group = CollapsibleGroupBox("Frame Range")
