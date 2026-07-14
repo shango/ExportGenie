@@ -63,10 +63,10 @@ ICON_FILENAME = "ExportGenie.png"
 # Prefix for Script Editor messages  -- includes version for debugging.
 LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 
-# Witness camera (Camera Track QC).  A locked-off side camera rendered
-# as a second, HUD-less .mp4 after the main playblast.  These framing
-# rules are a first pass and are deliberately NOT exposed in the UI --
-# retune them here, not in the tool.
+# Witness camera (Camera Track + Matchmove QC).  A locked-off side
+# camera rendered as a second, HUD-less .mp4 after the main playblast.
+# These framing rules are a first pass and are deliberately NOT exposed
+# in the UI -- retune them here, not in the tool.
 WITNESS_FOCAL_LENGTH = 35.0        # mm
 WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
 WITNESS_FIT_MARGIN = 1.35          # padding around the fitted bounding sphere
@@ -78,6 +78,10 @@ WITNESS_FORWARD_FRAC = 0.35        # slide the witness downstream of the
 WITNESS_ICON_SCALE = 200.0         # locatorScale on the tracked camera so
                                    # its icon reads at witness distance
 WITNESS_CUBE_SIZE = 6.0            # origin cube, sits on the ground plane
+WITNESS_BBOX_SAMPLES = 12          # frames at which the geo bounding box is
+                                   # sampled; an animated Matchmove character
+                                   # moves, and reading its bounds once would
+                                   # let it walk out of the witness frame
 WITNESS_GRID_LINES = 100           # grid line count across the huge-extent
                                    # ground plane (keeps the line density sane)
 
@@ -270,8 +274,9 @@ class FolderManager(object):
         mp4_tmp_dir = os.path.join(dir_path, "_tmp_mp4")
         paths["mp4_tmp_dir"] = mp4_tmp_dir
         paths["mp4_tmp_file"] = os.path.join(mp4_tmp_dir, qc_base)
-        # Witness-camera MP4 (Camera Track) -- a second, HUD-less render
-        # from a locked-off side camera, sitting beside the main .mp4.
+        # Witness-camera MP4 (Camera Track, Matchmove) -- a second,
+        # HUD-less render from a locked-off side camera, sitting beside
+        # the main .mp4.
         witness_base = qc_base + "_witness"
         paths["mp4_witness"] = os.path.join(
             dir_path, witness_base + ".mp4")
@@ -6318,7 +6323,7 @@ class Exporter(object):
             self._log_error("Playblast", e)
             return False
 
-    # --- Witness Camera (Camera Track QC) ---
+    # --- Witness Camera (Camera Track + Matchmove QC) ---
 
     @staticmethod
     def _witness_framing(camera, geo_roots, start_frame, end_frame):
@@ -6330,9 +6335,9 @@ class Exporter(object):
         pulled back far enough to hold the scene geo, the origin cube and
         the tracked camera's ENTIRE animated path.
 
-        The geo bounding box is read once, at the current time.  Camera
-        Track sets are static, so this holds; animated set geo would need
-        per-frame sampling.
+        The geo bounding box is sampled at WITNESS_BBOX_SAMPLES frames
+        spread across the shot, so an animated Matchmove character stays
+        in frame wherever it walks to.
 
         Returns:
             dict: eye (3-tuple), yaw (degrees about world Y), far_clip.
@@ -6371,10 +6376,24 @@ class Exporter(object):
         points.extend([
             (-half, 0.0, -half), (half, WITNESS_CUBE_SIZE, half),
         ])
+        # Sample the geo bounding box across the shot, not just once: a
+        # Matchmove character is animated and would otherwise walk out of
+        # frame. exactWorldBoundingBox takes no time flag, so this has to
+        # scrub -- hence a bounded sample count rather than every frame.
         roots = [g for g in (geo_roots or []) if g and cmds.objExists(g)]
         if roots:
-            bb = cmds.exactWorldBoundingBox(roots)
-            points.extend([(bb[0], bb[1], bb[2]), (bb[3], bb[4], bb[5])])
+            first, last = int(start_frame), int(end_frame)
+            count = min(WITNESS_BBOX_SAMPLES, last - first + 1)
+            step = (last - first) / float(count - 1) if count > 1 else 0
+            original_time = cmds.currentTime(query=True)
+            try:
+                for i in range(count):
+                    cmds.currentTime(int(round(first + i * step)))
+                    bb = cmds.exactWorldBoundingBox(roots)
+                    points.append((bb[0], bb[1], bb[2]))
+                    points.append((bb[3], bb[4], bb[5]))
+            finally:
+                cmds.currentTime(original_time)
 
         lo = [min(p[i] for p in points) for i in range(3)]
         hi = [max(p[i] for p in points) for i in range(3)]
@@ -6429,7 +6448,7 @@ class Exporter(object):
     def export_witness_playblast(self, output_mp4, tmp_png_file, camera,
                                  geo_roots, start_frame, end_frame,
                                  resolution=None):
-        """Render the Camera Track witness QC movie.
+        """Render the witness QC movie (Camera Track and Matchmove).
 
         A second .mp4 from a locked-off camera set 90 degrees off the
         tracked camera, showing the scene geo, a 6x6x6 cube on the
@@ -13398,6 +13417,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_color=wf_color,
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
+
+                    # Witness pass -- a second, HUD-less .mp4 from a
+                    # locked-off side camera. Runs AFTER the main
+                    # playblast so the cube and grid it creates cannot
+                    # leak into that render.
+                    results["witness"] = (
+                        exporter.export_witness_playblast(
+                            paths["mp4_witness"],
+                            paths["mp4_witness_tmp_file"],
+                            camera, geo_roots + proxy_geos,
+                            start_frame, end_frame))
+                    self._log_result("Witness Playblast",
+                                     results["witness"])
                 self._advance_progress()
 
             # FBX is last  -- destructive prep (bake, import refs,
