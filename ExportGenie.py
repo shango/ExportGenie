@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v18"
+TOOL_VERSION = "v19"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -62,6 +62,24 @@ ICON_FILENAME = "ExportGenie.png"
 
 # Prefix for Script Editor messages  -- includes version for debugging.
 LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
+
+# Witness camera (Camera Track QC).  A locked-off side camera rendered
+# as a second, HUD-less .mp4 after the main playblast.  These framing
+# rules are a first pass and are deliberately NOT exposed in the UI --
+# retune them here, not in the tool.
+WITNESS_FOCAL_LENGTH = 35.0        # mm
+WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
+WITNESS_FIT_MARGIN = 1.35          # padding around the fitted bounding sphere
+WITNESS_FORWARD_FRAC = 0.35        # slide the witness downstream of the
+                                   # tracked camera's aim, as a fraction of
+                                   # the pull-back distance, so it sits a bit
+                                   # in front of that camera rather than
+                                   # dead abeam of it
+WITNESS_ICON_SCALE = 200.0         # locatorScale on the tracked camera so
+                                   # its icon reads at witness distance
+WITNESS_CUBE_SIZE = 6.0            # origin cube, sits on the ground plane
+WITNESS_GRID_LINES = 100           # grid line count across the huge-extent
+                                   # ground plane (keeps the line density sane)
 
 # Tab identifiers
 TAB_CAMERA_TRACK = "camera_track"
@@ -252,6 +270,15 @@ class FolderManager(object):
         mp4_tmp_dir = os.path.join(dir_path, "_tmp_mp4")
         paths["mp4_tmp_dir"] = mp4_tmp_dir
         paths["mp4_tmp_file"] = os.path.join(mp4_tmp_dir, qc_base)
+        # Witness-camera MP4 (Camera Track) -- a second, HUD-less render
+        # from a locked-off side camera, sitting beside the main .mp4.
+        witness_base = qc_base + "_witness"
+        paths["mp4_witness"] = os.path.join(
+            dir_path, witness_base + ".mp4")
+        witness_tmp_dir = os.path.join(dir_path, "_tmp_witness")
+        paths["mp4_witness_tmp_dir"] = witness_tmp_dir
+        paths["mp4_witness_tmp_file"] = os.path.join(
+            witness_tmp_dir, witness_base)
         # Composite temp dirs for multi-pass MM/FT playblasts
         composite_tmp = os.path.join(dir_path, "_tmp_composite")
         paths["composite_tmp"] = composite_tmp
@@ -6290,6 +6317,308 @@ class Exporter(object):
         except Exception as e:
             self._log_error("Playblast", e)
             return False
+
+    # --- Witness Camera (Camera Track QC) ---
+
+    @staticmethod
+    def _witness_framing(camera, geo_roots, start_frame, end_frame):
+        """Work out where to park the locked-off witness camera.
+
+        Broadside to the tracked camera: exactly 90 degrees around world
+        Y from that camera's average aim, dead level with the target (no
+        tilt), slid a little downstream of where it is looking, and
+        pulled back far enough to hold the scene geo, the origin cube and
+        the tracked camera's ENTIRE animated path.
+
+        The geo bounding box is read once, at the current time.  Camera
+        Track sets are static, so this holds; animated set geo would need
+        per-frame sampling.
+
+        Returns:
+            dict: eye (3-tuple), yaw (degrees about world Y), far_clip.
+        """
+        cam_shape = (cmds.listRelatives(
+            camera, shapes=True, type="camera") or [None])[0]
+
+        # Sample the tracked camera's world position and aim every frame.
+        # xform is not time-aware, so read worldMatrix at each time.
+        positions = []
+        aims = []
+        for frame in range(int(start_frame), int(end_frame) + 1):
+            m = cmds.getAttr(camera + ".worldMatrix", time=frame)
+            if m and isinstance(m[0], (list, tuple)):
+                m = m[0]
+            positions.append((m[12], m[13], m[14]))
+            # Maya cameras look down their local -Z.
+            aims.append((-m[8], -m[9], -m[10]))
+
+        # Average aim, flattened to the ground plane.
+        fx = sum(a[0] for a in aims) / len(aims)
+        fz = sum(a[2] for a in aims) / len(aims)
+        length = math.sqrt(fx * fx + fz * fz)
+        if length < 1e-4:
+            # Camera points straight up or down, or its aim cancels out
+            # over the shot. Any horizontal direction is as good as any
+            # other; take world +Z.
+            fx, fz = 0.0, 1.0
+        else:
+            fx, fz = fx / length, fz / length
+
+        # Everything the witness must hold: the cube, the scene geo, and
+        # every position the tracked camera passes through.
+        half = WITNESS_CUBE_SIZE / 2.0
+        points = list(positions)
+        points.extend([
+            (-half, 0.0, -half), (half, WITNESS_CUBE_SIZE, half),
+        ])
+        roots = [g for g in (geo_roots or []) if g and cmds.objExists(g)]
+        if roots:
+            bb = cmds.exactWorldBoundingBox(roots)
+            points.extend([(bb[0], bb[1], bb[2]), (bb[3], bb[4], bb[5])])
+
+        lo = [min(p[i] for p in points) for i in range(3)]
+        hi = [max(p[i] for p in points) for i in range(3)]
+        center = [(lo[i] + hi[i]) / 2.0 for i in range(3)]
+        radius = 0.5 * math.sqrt(sum(
+            (hi[i] - lo[i]) ** 2 for i in range(3)))
+        radius = max(radius, WITNESS_CUBE_SIZE)
+
+        # Broadside: rotate the tracked camera's aim +90 degrees about
+        # world Y, (x, z) -> (z, -x). The witness looks ALONG this
+        # vector, so its view axis is exactly 90 degrees off the tracked
+        # camera's and dead level -- no tilt, yaw is the whole rotation.
+        view = (fz, -fx)
+
+        # Slide the witness a little downstream of where the tracked
+        # camera is looking, so it sits a bit in front of that camera
+        # rather than dead abeam of it.  That offset runs perpendicular
+        # to the view axis, so it shifts the framing sideways rather
+        # than rotating it -- widen the fitted radius by the same amount
+        # or the far edge of the scene drops out of frame.
+        offset = WITNESS_FORWARD_FRAC * radius
+        fit_radius = radius + offset
+
+        # Pull back far enough to fit that. Use the tighter of the two
+        # half-angles so the fit holds on both axes.
+        focal = WITNESS_FOCAL_LENGTH
+        half_angles = [
+            math.atan(0.5 * aperture * 25.4 / focal)
+            for aperture in WITNESS_FILM_APERTURE
+        ]
+        distance = (
+            fit_radius / math.tan(min(half_angles))) * WITNESS_FIT_MARGIN
+
+        eye = (
+            center[0] - view[0] * distance + fx * offset,
+            center[1],
+            center[2] - view[1] * distance + fz * offset,
+        )
+
+        # A camera at yaw 0 looks down -Z, so solve -sin(yaw) = view.x
+        # and -cos(yaw) = view.z.
+        yaw = math.degrees(math.atan2(-view[0], -view[1]))
+
+        return {
+            "eye": eye,
+            "yaw": yaw,
+            "far_clip": max(10000.0, (distance + fit_radius) * 2.0),
+            "radius": radius,
+            "cam_shape": cam_shape,
+        }
+
+    def export_witness_playblast(self, output_mp4, tmp_png_file, camera,
+                                 geo_roots, start_frame, end_frame,
+                                 resolution=None):
+        """Render the Camera Track witness QC movie.
+
+        A second .mp4 from a locked-off camera set 90 degrees off the
+        tracked camera, showing the scene geo, a 6x6x6 cube on the
+        ground plane, an effectively infinite default grid, and the
+        tracked camera itself (icon scaled up so it reads at distance).
+        No HUD.
+
+        Everything this creates or changes -- the witness camera, the
+        cube, the grid preferences, the tracked camera's icon scale, the
+        panel flags, the selection and the current frame -- is undone
+        before returning.  Must run AFTER the main playblast, so the cube
+        and grid cannot leak into it.
+
+        Returns:
+            bool: True if the witness .mp4 was written.
+        """
+        if not self._find_ffmpeg():
+            self.log("Witness playblast skipped  -- ffmpeg not found.")
+            return False
+        if resolution is None:
+            resolution = self._get_image_plane_resolution(camera)
+        pb_width, pb_height = resolution
+        if pb_width > 1920:
+            pb_height = int(round(pb_height * 1920.0 / pb_width))
+            pb_width = 1920
+
+        created = []
+        model_panel = None
+        original_panel = {}
+        original_cam = None
+        original_grid_prefs = None
+        original_icon_scale = None
+        original_sel = cmds.ls(selection=True)
+        original_time = cmds.currentTime(query=True)
+
+        try:
+            framing = self._witness_framing(
+                camera, geo_roots, start_frame, end_frame)
+
+            cube = cmds.polyCube(
+                width=WITNESS_CUBE_SIZE, height=WITNESS_CUBE_SIZE,
+                depth=WITNESS_CUBE_SIZE, name="EG_witness_cube")[0]
+            created.append(cube)
+            # +half in Y so the cube sits ON the ground plane.
+            cmds.setAttr(cube + ".translateY", WITNESS_CUBE_SIZE / 2.0)
+
+            wit_cam = cmds.camera(
+                focalLength=WITNESS_FOCAL_LENGTH,
+                horizontalFilmAperture=WITNESS_FILM_APERTURE[0],
+                verticalFilmAperture=WITNESS_FILM_APERTURE[1],
+                farClipPlane=framing["far_clip"])[0]
+            wit_cam = cmds.rename(wit_cam, "EG_witness_cam")
+            created.append(wit_cam)
+            eye = framing["eye"]
+            for axis, value in zip("XYZ", eye):
+                cmds.setAttr(wit_cam + ".translate" + axis, value)
+            # Level, so yaw is the whole rotation.
+            cmds.setAttr(wit_cam + ".rotateX", 0.0)
+            cmds.setAttr(wit_cam + ".rotateY", framing["yaw"])
+            cmds.setAttr(wit_cam + ".rotateZ", 0.0)
+
+            # Scale the tracked camera's viewport icon so it is legible
+            # from the witness. locatorScale touches the icon only -- it
+            # does not affect the render, unlike scaling the transform.
+            if framing["cam_shape"]:
+                icon_attr = framing["cam_shape"] + ".locatorScale"
+                original_icon_scale = cmds.getAttr(icon_attr)
+                cmds.setAttr(icon_attr, WITNESS_ICON_SCALE)
+
+            # Maya's grid is finite, so stand in for an infinite ground
+            # plane by blowing its extent out past the far clip.
+            original_grid_prefs = {
+                "size": cmds.grid(query=True, size=True),
+                "spacing": cmds.grid(query=True, spacing=True),
+                "divisions": cmds.grid(query=True, divisions=True),
+            }
+            grid_size = framing["far_clip"]
+            cmds.grid(
+                size=grid_size,
+                spacing=grid_size / WITNESS_GRID_LINES,
+                divisions=1)
+
+            for panel in (cmds.getPanel(visiblePanels=True) or []):
+                if cmds.getPanel(typeOf=panel) == "modelPanel":
+                    model_panel = panel
+                    break
+            if not model_panel:
+                panels = cmds.getPanel(type="modelPanel") or []
+                if panels:
+                    model_panel = panels[0]
+            if not model_panel:
+                self.log("Witness playblast skipped  -- no model panel.")
+                return False
+
+            for flag in ("grid", "cameras", "imagePlane",
+                         "displayAppearance"):
+                original_panel[flag] = cmds.modelEditor(
+                    model_panel, query=True, **{flag: True})
+            cmds.modelEditor(
+                model_panel, edit=True, grid=True, cameras=True,
+                imagePlane=False, displayAppearance="smoothShaded")
+
+            original_cam = cmds.modelPanel(
+                model_panel, query=True, camera=True)
+            cmds.lookThru(model_panel, wit_cam)
+            try:
+                cmds.setFocus(model_panel)
+            except Exception:
+                pass
+
+            cmds.select(clear=True)
+            self.log("Rendering witness pass...")
+            tmp_dir = os.path.dirname(tmp_png_file)
+            if not os.path.exists(tmp_dir):
+                os.makedirs(tmp_dir)
+            cmds.refresh(force=True)
+            cmds.playblast(
+                filename=tmp_png_file,
+                format="image",
+                compression="png",
+                startTime=start_frame,
+                endTime=end_frame,
+                forceOverwrite=True,
+                sequenceTime=False,
+                clearCache=True,
+                viewer=False,
+                showOrnaments=False,
+                framePadding=4,
+                percent=100,
+                quality=100,
+                widthHeight=[pb_width, pb_height],
+            )
+
+            encode_ok = self._encode_mp4(
+                tmp_dir, os.path.basename(tmp_png_file), start_frame,
+                output_mp4,
+                show_hud=False,
+                resolution=(pb_width, pb_height))
+            if encode_ok:
+                self._cleanup_temp_pngs(tmp_dir)
+            else:
+                self.log(
+                    "Witness encode failed  -- temp PNGs kept at "
+                    "{}".format(tmp_dir))
+            return encode_ok
+
+        except Exception as e:
+            self._log_error("Witness playblast", e)
+            return False
+
+        finally:
+            if model_panel:
+                for flag, value in original_panel.items():
+                    try:
+                        cmds.modelEditor(
+                            model_panel, edit=True, **{flag: value})
+                    except Exception:
+                        pass
+                if original_cam:
+                    try:
+                        cmds.lookThru(model_panel, original_cam)
+                    except Exception:
+                        pass
+            if original_grid_prefs:
+                try:
+                    cmds.grid(**original_grid_prefs)
+                except Exception:
+                    pass
+            if original_icon_scale is not None:
+                try:
+                    cmds.setAttr(
+                        framing["cam_shape"] + ".locatorScale",
+                        original_icon_scale)
+                except Exception:
+                    pass
+            for node in created:
+                try:
+                    if cmds.objExists(node):
+                        cmds.delete(node)
+                except Exception:
+                    pass
+            try:
+                cmds.currentTime(original_time)
+                if original_sel:
+                    cmds.select(original_sel, replace=True)
+                else:
+                    cmds.select(clear=True)
+            except Exception:
+                pass
 
     # --- Colour Management Helper ---
 
@@ -12539,6 +12868,21 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         show_hud=show_hud,
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
+
+                    # Witness pass -- a second, HUD-less .mp4 from a
+                    # locked-off side camera. Runs AFTER the main
+                    # playblast so the cube and grid it creates cannot
+                    # leak into that render.
+                    results["witness"] = (
+                        exporter.export_witness_playblast(
+                            paths["mp4_witness"],
+                            paths["mp4_witness_tmp_file"],
+                            primary_camera, geo_roots,
+                            start_frame, end_frame))
+                    if results["witness"]:
+                        all_paths["witness"] = paths["mp4_witness"]
+                    self._log_result("Witness Playblast",
+                                     results["witness"])
                 self._advance_progress()
             if do_nk:
                 paths = FolderManager.build_export_paths(
