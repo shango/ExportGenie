@@ -6407,8 +6407,8 @@ class Exporter(object):
         """Render the witness QC movie (Camera Track and Matchmove).
 
         A second .mp4 from a locked-off camera set 90 degrees off the
-        tracked camera, showing the scene geo, a 6x6x6 cube on the
-        ground plane, an effectively infinite default grid, and the
+        tracked camera, showing the scene geo and a 6x6x6 cube (both as
+        wireframe) on an effectively infinite default grid, plus the
         tracked camera itself (icon scaled up so it reads at distance).
         No HUD.
 
@@ -6505,7 +6505,7 @@ class Exporter(object):
                     model_panel, query=True, **{flag: True})
             cmds.modelEditor(
                 model_panel, edit=True, grid=True, cameras=True,
-                imagePlane=False, displayAppearance="smoothShaded")
+                imagePlane=False, displayAppearance="wireframe")
 
             original_cam = cmds.modelPanel(
                 model_panel, query=True, camera=True)
