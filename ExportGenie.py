@@ -272,13 +272,13 @@ class FolderManager(object):
         mp4_tmp_dir = os.path.join(dir_path, "_tmp_mp4")
         paths["mp4_tmp_dir"] = mp4_tmp_dir
         paths["mp4_tmp_file"] = os.path.join(mp4_tmp_dir, qc_base)
-        # Witness-camera MP4 (Camera Track, Matchmove) -- a second,
+        # Witness-camera "qc" MP4 (Camera Track, Matchmove) -- a second,
         # HUD-less render from a locked-off side camera, sitting beside
         # the main .mp4.
-        witness_base = qc_base + "_witness"
+        witness_base = qc_base + "_qc"
         paths["mp4_witness"] = os.path.join(
             dir_path, witness_base + ".mp4")
-        witness_tmp_dir = os.path.join(dir_path, "_tmp_witness")
+        witness_tmp_dir = os.path.join(dir_path, "_tmp_qc")
         paths["mp4_witness_tmp_dir"] = witness_tmp_dir
         paths["mp4_witness_tmp_file"] = os.path.join(
             witness_tmp_dir, witness_base)
@@ -6462,7 +6462,7 @@ class Exporter(object):
                 horizontalFilmAperture=WITNESS_FILM_APERTURE[0],
                 verticalFilmAperture=WITNESS_FILM_APERTURE[1],
                 farClipPlane=framing["far_clip"])[0]
-            wit_cam = cmds.rename(wit_cam, "_qc")
+            wit_cam = cmds.rename(wit_cam, "qc")
             created.append(wit_cam)
             eye = framing["eye"]
             for axis, value in zip("XYZ", eye):
