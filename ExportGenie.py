@@ -6456,7 +6456,7 @@ class Exporter(object):
                 horizontalFilmAperture=WITNESS_FILM_APERTURE[0],
                 verticalFilmAperture=WITNESS_FILM_APERTURE[1],
                 farClipPlane=framing["far_clip"])[0]
-            wit_cam = cmds.rename(wit_cam, "EG_witness_cam")
+            wit_cam = cmds.rename(wit_cam, "_qc")
             created.append(wit_cam)
             eye = framing["eye"]
             for axis, value in zip("XYZ", eye):
