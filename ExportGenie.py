@@ -69,19 +69,17 @@ LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 # in the UI -- retune them here, not in the tool.
 WITNESS_FOCAL_LENGTH = 35.0        # mm
 WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
-WITNESS_FIT_MARGIN = 1.35          # padding around the fitted bounding sphere
+WITNESS_SIDE_DISTANCE = 100.0      # units out to the side of the tracked
+                                   # camera; frames that camera and its
+                                   # surroundings, not the whole scene
 WITNESS_FORWARD_FRAC = 0.35        # slide the witness downstream of the
                                    # tracked camera's aim, as a fraction of
-                                   # the pull-back distance, so it sits a bit
+                                   # the side distance, so it sits a bit
                                    # in front of that camera rather than
                                    # dead abeam of it
 WITNESS_ICON_SCALE = 200.0         # locatorScale on the tracked camera so
                                    # its icon reads at witness distance
 WITNESS_CUBE_SIZE = 6.0            # origin cube, sits on the ground plane
-WITNESS_BBOX_SAMPLES = 12          # frames at which the geo bounding box is
-                                   # sampled; an animated Matchmove character
-                                   # moves, and reading its bounds once would
-                                   # let it walk out of the witness frame
 WITNESS_GRID_LINES = 100           # grid line count across the huge-extent
                                    # ground plane (keeps the line density sane)
 
@@ -6326,21 +6324,19 @@ class Exporter(object):
     # --- Witness Camera (Camera Track + Matchmove QC) ---
 
     @staticmethod
-    def _witness_framing(camera, geo_roots, start_frame, end_frame):
+    def _witness_framing(camera, start_frame, end_frame):
         """Work out where to park the locked-off witness camera.
 
-        Broadside to the tracked camera: exactly 90 degrees around world
-        Y from that camera's average aim, dead level with the target (no
-        tilt), slid a little downstream of where it is looking, and
-        pulled back far enough to hold the scene geo, the origin cube and
-        the tracked camera's ENTIRE animated path.
-
-        The geo bounding box is sampled at WITNESS_BBOX_SAMPLES frames
-        spread across the shot, so an animated Matchmove character stays
-        in frame wherever it walks to.
+        A fixed offset to the side of the tracked camera: exactly 90
+        degrees around world Y from that camera's average aim, dead
+        level with it, WITNESS_SIDE_DISTANCE units out to the side and
+        nudged a little downstream of where it is looking.  This
+        deliberately does NOT try to fit the whole scene -- it frames
+        the tracked camera and its immediate surroundings.
 
         Returns:
-            dict: eye (3-tuple), yaw (degrees about world Y), far_clip.
+            dict: eye (3-tuple), yaw (degrees about world Y), far_clip,
+                cam_shape.
         """
         cam_shape = (cmds.listRelatives(
             camera, shapes=True, type="camera") or [None])[0]
@@ -6357,7 +6353,9 @@ class Exporter(object):
             # Maya cameras look down their local -Z.
             aims.append((-m[8], -m[9], -m[10]))
 
-        # Average aim, flattened to the ground plane.
+        # Average position, and average aim flattened to the ground plane.
+        cam_center = [sum(p[i] for p in positions) / len(positions)
+                      for i in range(3)]
         fx = sum(a[0] for a in aims) / len(aims)
         fz = sum(a[2] for a in aims) / len(aims)
         length = math.sqrt(fx * fx + fz * fz)
@@ -6369,84 +6367,42 @@ class Exporter(object):
         else:
             fx, fz = fx / length, fz / length
 
-        # Everything the witness must hold: the cube, the scene geo, and
-        # every position the tracked camera passes through.
-        half = WITNESS_CUBE_SIZE / 2.0
-        points = list(positions)
-        points.extend([
-            (-half, 0.0, -half), (half, WITNESS_CUBE_SIZE, half),
-        ])
-        # Sample the geo bounding box across the shot, not just once: a
-        # Matchmove character is animated and would otherwise walk out of
-        # frame. exactWorldBoundingBox takes no time flag, so this has to
-        # scrub -- hence a bounded sample count rather than every frame.
-        roots = [g for g in (geo_roots or []) if g and cmds.objExists(g)]
-        if roots:
-            first, last = int(start_frame), int(end_frame)
-            count = min(WITNESS_BBOX_SAMPLES, last - first + 1)
-            step = (last - first) / float(count - 1) if count > 1 else 0
-            original_time = cmds.currentTime(query=True)
-            try:
-                for i in range(count):
-                    cmds.currentTime(int(round(first + i * step)))
-                    bb = cmds.exactWorldBoundingBox(roots)
-                    points.append((bb[0], bb[1], bb[2]))
-                    points.append((bb[3], bb[4], bb[5]))
-            finally:
-                cmds.currentTime(original_time)
-
-        lo = [min(p[i] for p in points) for i in range(3)]
-        hi = [max(p[i] for p in points) for i in range(3)]
-        center = [(lo[i] + hi[i]) / 2.0 for i in range(3)]
-        radius = 0.5 * math.sqrt(sum(
-            (hi[i] - lo[i]) ** 2 for i in range(3)))
-        radius = max(radius, WITNESS_CUBE_SIZE)
-
         # Broadside: rotate the tracked camera's aim +90 degrees about
         # world Y, (x, z) -> (z, -x). The witness looks ALONG this
         # vector, so its view axis is exactly 90 degrees off the tracked
         # camera's and dead level -- no tilt, yaw is the whole rotation.
         view = (fz, -fx)
 
-        # Slide the witness a little downstream of where the tracked
-        # camera is looking, so it sits a bit in front of that camera
-        # rather than dead abeam of it.  That offset runs perpendicular
-        # to the view axis, so it shifts the framing sideways rather
-        # than rotating it -- widen the fitted radius by the same amount
-        # or the far edge of the scene drops out of frame.
-        offset = WITNESS_FORWARD_FRAC * radius
-        fit_radius = radius + offset
-
-        # Pull back far enough to fit that. Use the tighter of the two
-        # half-angles so the fit holds on both axes.
-        focal = WITNESS_FOCAL_LENGTH
-        half_angles = [
-            math.atan(0.5 * aperture * 25.4 / focal)
-            for aperture in WITNESS_FILM_APERTURE
-        ]
-        distance = (
-            fit_radius / math.tan(min(half_angles))) * WITNESS_FIT_MARGIN
-
+        # Park it a fixed distance to the side of the tracked camera,
+        # nudged a little downstream of that camera's aim so it sits a
+        # bit in front rather than dead abeam. The nudge runs along the
+        # view axis, so it does not disturb the exact 90 degrees.
+        side = WITNESS_SIDE_DISTANCE
+        offset = WITNESS_FORWARD_FRAC * side
         eye = (
-            center[0] - view[0] * distance + fx * offset,
-            center[1],
-            center[2] - view[1] * distance + fz * offset,
+            cam_center[0] - view[0] * side + fx * offset,
+            cam_center[1],
+            cam_center[2] - view[1] * side + fz * offset,
         )
 
         # A camera at yaw 0 looks down -Z, so solve -sin(yaw) = view.x
         # and -cos(yaw) = view.z.
         yaw = math.degrees(math.atan2(-view[0], -view[1]))
 
+        # Far clip only needs to reach the cube at origin and the whole
+        # tracked-camera path; we are not fitting the wider scene.
+        reach = [(0.0, 0.0, 0.0)] + positions
+        far = max(math.sqrt(sum((eye[i] - p[i]) ** 2 for i in range(3)))
+                  for p in reach)
         return {
             "eye": eye,
             "yaw": yaw,
-            "far_clip": max(10000.0, (distance + fit_radius) * 2.0),
-            "radius": radius,
+            "far_clip": max(10000.0, far * 1.5),
             "cam_shape": cam_shape,
         }
 
     def export_witness_playblast(self, output_mp4, tmp_png_file, camera,
-                                 geo_roots, start_frame, end_frame,
+                                 start_frame, end_frame,
                                  resolution=None):
         """Render the witness QC movie (Camera Track and Matchmove).
 
@@ -6486,7 +6442,7 @@ class Exporter(object):
 
         try:
             framing = self._witness_framing(
-                camera, geo_roots, start_frame, end_frame)
+                camera, start_frame, end_frame)
 
             cube = cmds.polyCube(
                 width=WITNESS_CUBE_SIZE, height=WITNESS_CUBE_SIZE,
@@ -12896,7 +12852,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         exporter.export_witness_playblast(
                             paths["mp4_witness"],
                             paths["mp4_witness_tmp_file"],
-                            primary_camera, geo_roots,
+                            primary_camera,
                             start_frame, end_frame))
                     if results["witness"]:
                         all_paths["witness"] = paths["mp4_witness"]
@@ -13426,7 +13382,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         exporter.export_witness_playblast(
                             paths["mp4_witness"],
                             paths["mp4_witness_tmp_file"],
-                            camera, geo_roots + proxy_geos,
+                            camera,
                             start_frame, end_frame))
                     self._log_result("Witness Playblast",
                                      results["witness"])
