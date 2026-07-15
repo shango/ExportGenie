@@ -582,6 +582,13 @@ class Exporter(object):
     def __init__(self, log_callback):
         self.log = log_callback
 
+    def _trace(self, message):
+        """Technical progress breadcrumb  -- goes to the Script Editor
+        only, not the in-tool status window.  The status window stays
+        broad (deliverable-level updates and errors); these finer steps
+        are still there for diagnostics when something fails."""
+        sys.stderr.write("{} {}\n".format(LOG_PREFIX, message))
+
     def _log_error(self, tag, exception):
         """Dump a verbose, readable error report to Maya's Script Editor
         (stderr shows as red text) so the artist can copy/paste it for
@@ -1275,7 +1282,7 @@ class Exporter(object):
             "-movflags", "+faststart",
         ])
 
-        self.log("Encoding MP4...")
+        self._trace("Encoding MP4...")
         try:
             if sys.platform == "win32":
                 # Windows: write filter to temp file to avoid colon
@@ -1330,7 +1337,7 @@ class Exporter(object):
                 self.log(
                     "MP4 encoding failed. See Script Editor.")
                 return False
-            self.log("MP4 encoding complete.")
+            self._trace("MP4 encoding complete.")
             return True
         except subprocess.TimeoutExpired:
             self.log("MP4 encoding timed out. See Script Editor.")
@@ -1525,7 +1532,7 @@ class Exporter(object):
                 output_path,
             ])
 
-        self.log("Compositing passes...")
+        self._trace("Compositing passes...")
         try:
             result = self._run_ffmpeg(
                 cmd, filter_complex=filter_complex,
@@ -1537,7 +1544,7 @@ class Exporter(object):
                 self.log(
                     "Composite encoding failed. See Script Editor.")
                 return False
-            self.log("Composite encoding complete.")
+            self._trace("Composite encoding complete.")
             return True
         except subprocess.TimeoutExpired:
             self.log("Composite encoding timed out.")
@@ -3081,7 +3088,7 @@ class Exporter(object):
         # Strip namespace and DAG path for clean naming
         short_name = src_xform.split("|")[-1].rsplit(":", 1)[-1]
 
-        self.log("Creating blendshapes for '{}'  -- {} frames...".format(
+        self._trace("Creating blendshapes for '{}'  -- {} frames...".format(
             short_name, len(frames)))
 
         # Preserve hierarchy: parent base under same parent as source
@@ -3141,7 +3148,7 @@ class Exporter(object):
                 bs_node, e=True, t=(base_mesh, i, tgt, 1.0))
 
             if (i + 1) % 50 == 0 or (i + 1) == len(frames):
-                self.log("  {}/{} targets created...".format(
+                self._trace("  {}/{} targets created...".format(
                     i + 1, len(frames)))
 
         # --- Pass 2: key all weights by index ---
@@ -3184,7 +3191,7 @@ class Exporter(object):
             kc = cmds.keyframe(w, query=True, keyframeCount=True) or 0
             if kc > 0:
                 keyed_count += 1
-        self.log("Keyed {}/{} blendshape weights on '{}'.".format(
+        self._trace("Keyed {}/{} blendshape weights on '{}'.".format(
             keyed_count, len(frames), bs_node))
 
         # Delete target shapes and their group  -- the blendShape node
@@ -3211,13 +3218,13 @@ class Exporter(object):
                     LOG_PREFIX + " WARNING: Could not delete source "
                     "mesh '{}': {}\n".format(src_xform, exc))
 
-        self.log("Prepared {} target(s) for FBX export.".format(
+        self._trace("Prepared {} target(s) for FBX export.".format(
             len(frames)))
 
         # Restore original time
         cmds.currentTime(original_time, e=True)
 
-        self.log("Blendshape conversion complete.")
+        self._trace("Blendshape conversion complete.")
         return {
             "base_mesh": base_mesh,
             "blendshape_node": bs_node,
@@ -3337,7 +3344,7 @@ class Exporter(object):
             except Exception:
                 pass
         if refs_imported:
-            self.log("Importing references...")
+            self._trace("Importing references...")
 
         # --- Step 0: Bake camera animation ---
         if camera and cmds.objExists(camera):
@@ -3356,7 +3363,7 @@ class Exporter(object):
                 preserveOutsideKeys=True,
                 minimizeRotation=True,
             )
-            self.log("Baking camera animation...")
+            self._trace("Baking camera animation...")
 
         # --- Step 1: Bake animation to skeleton joints ---
         # Must happen first while constraints are still live.
@@ -3753,7 +3760,7 @@ class Exporter(object):
                 LOG_PREFIX + "   Baking {} joint(s) + {} "
                 "constrained transform(s)\n".format(
                     len(all_joints), len(constrained_xforms)))
-            self.log("Baking animation...")
+            self._trace("Baking animation...")
             # Unlock TRS channels before baking
             for node in all_bake_nodes:
                 for a in trs:
@@ -3796,7 +3803,7 @@ class Exporter(object):
                         except Exception:
                             pass
         if constraints_removed:
-            self.log("Removing constraints...")
+            self._trace("Removing constraints...")
 
         # Disconnect non-animCurve sources on all baked nodes
         for node in all_bake_nodes:
@@ -3892,7 +3899,7 @@ class Exporter(object):
             except Exception:
                 pass
         if history_deleted:
-            self.log("Cleaning up history...")
+            self._trace("Cleaning up history...")
 
         # Verify skinClusters survived Step 4
         sys.stderr.write(
@@ -3951,7 +3958,7 @@ class Exporter(object):
             except Exception:
                 pass
         if transforms_frozen:
-            self.log("Freezing transforms...")
+            self._trace("Freezing transforms...")
 
         # Verify skinClusters survived Step 5
         sys.stderr.write(
@@ -4007,7 +4014,7 @@ class Exporter(object):
             except Exception:
                 pass
         if namespaces_stripped:
-            self.log("Stripping namespaces...")
+            self._trace("Stripping namespaces...")
 
         # Verify skinClusters survived Step 6
         sys.stderr.write(
@@ -4049,7 +4056,7 @@ class Exporter(object):
                 LOG_PREFIX + "   Deleting {} dagPose node(s): "
                 "{}\n".format(len(dag_poses), dag_poses))
             cmds.delete(dag_poses)
-            self.log("Removing bind pose nodes...")
+            self._trace("Removing bind pose nodes...")
         else:
             sys.stderr.write(
                 LOG_PREFIX + "   No dagPose nodes found\n")
@@ -4239,8 +4246,7 @@ class Exporter(object):
                 seen.add(long_name)
                 unique_leaves.append(leaf)
 
-        self.log("Classifying geometry..."
-                 )
+        self._trace("Classifying geometry...")
         sys.stderr.write(
             LOG_PREFIX + " Found {} leaf transforms to classify.\n".format(
             len(unique_leaves)))
@@ -4270,7 +4276,7 @@ class Exporter(object):
                 select_for_export.append(leaf)
                 static_count += 1
 
-        self.log(
+        self._trace(
             "Classification: {} blendshape, {} animated, "
             "{} static".format(
                 vertex_anim_count, anim_curve_count, static_count))
@@ -4383,13 +4389,13 @@ class Exporter(object):
                         button=["OK"],
                     )
                     return False
-                self.log("Checking for ffmpeg...")
+                self._trace("Checking for ffmpeg...")
             elif png_mode:
                 pb_format = "image"
-                self.log("Setting up viewport...")
+                self._trace("Setting up viewport...")
             else:
                 pb_format, diag = self._validate_playblast_format()
-                self.log("Setting up viewport...")
+                self._trace("Setting up viewport...")
 
                 if pb_format is None:
                     # Build a clear, non-technical message
@@ -5116,7 +5122,7 @@ class Exporter(object):
                         # layer) so frame/FL text is visible in the
                         # final composite.  Color and matte passes
                         # use showOrnaments=False for clean keying.
-                        self.log("Rendering plate pass...")
+                        self._trace("Rendering plate pass...")
                         cmds.modelEditor(
                             model_panel, edit=True,
                             imagePlane=True, polymeshes=False,
@@ -5142,7 +5148,7 @@ class Exporter(object):
                         )
 
                         # --- Pass 2: Solid Color Mesh ---
-                        self.log("Rendering color pass...")
+                        self._trace("Rendering color pass...")
                         # Black background, no gradient
                         cmds.displayRGBColor(
                             "background", 0, 0, 0)
@@ -5239,7 +5245,7 @@ class Exporter(object):
                             if n not in (solid_lambert, solid_sg)]
 
                         # --- Pass 3: B&W Checker Matte ---
-                        self.log("Rendering matte pass...")
+                        self._trace("Rendering matte pass...")
                         chk_lambert = cmds.shadingNode(
                             "lambert", asShader=True,
                             name="mme_matteCk_mtl")
@@ -5357,7 +5363,7 @@ class Exporter(object):
                             crown_dir = os.path.dirname(crown_path)
                             if not os.path.exists(crown_dir):
                                 os.makedirs(crown_dir)
-                            self.log("Rendering crown pass...")
+                            self._trace("Rendering crown pass...")
                             # Ensure black background for crown pass
                             cmds.displayRGBColor(
                                 "background", 0, 0, 0)
@@ -5479,7 +5485,7 @@ class Exporter(object):
                             wf_dir = os.path.dirname(wf_path)
                             if not os.path.exists(wf_dir):
                                 os.makedirs(wf_dir)
-                            self.log("Rendering wireframe pass...")
+                            self._trace("Rendering wireframe pass...")
                             # Ensure black background
                             cmds.displayRGBColor(
                                 "background", 0, 0, 0)
@@ -5906,7 +5912,7 @@ class Exporter(object):
                             "failed: {}\n".format(exc))
                     finally:
                         self._cleanup_temp_pngs(warmup_dir)
-                    self.log("Rendering...")
+                    self._trace("Rendering...")
                     cmds.playblast(
                         filename=ct_tmp_file,
                         format="image",
@@ -6516,7 +6522,7 @@ class Exporter(object):
                 pass
 
             cmds.select(clear=True)
-            self.log("Rendering witness pass...")
+            self._trace("Rendering witness pass...")
             tmp_dir = os.path.dirname(tmp_png_file)
             if not os.path.exists(tmp_dir):
                 os.makedirs(tmp_dir)
@@ -6681,7 +6687,7 @@ class Exporter(object):
         # Disable "Use View Transform" for playblast so Maya uses
         # our explicit outputTransformName instead of inheriting
         # whatever the viewport is set to.
-        self.log("Setting color management to Raw...")
+        self._trace("Setting color management to Raw...")
         try:
             cmds.colorManagementPrefs(
                 edit=True,
@@ -8022,7 +8028,7 @@ class Exporter(object):
         ]:
             if not stmap_path:
                 continue
-            self.log("Reading STMap: {}".format(
+            self._trace("Reading STMap: {}".format(
                 os.path.basename(stmap_path)))
             img_w, img_h, pixels = Exporter._read_stmap_pixels(stmap_path)
 
@@ -8056,7 +8062,7 @@ class Exporter(object):
                 overscan_x, overscan_y)
 
             # Diagnostic: log STMap properties and key grid positions
-            self.log("{} STMap: {}x{}, overscan=({:.4f}, {:.4f}), "
+            self._trace("{} STMap: {}x{}, overscan=({:.4f}, {:.4f}), "
                      "UV range U=[{:.4f},{:.4f}] V=[{:.4f},{:.4f}]".format(
                          label, img_w, img_h,
                          overscan_x, overscan_y,
@@ -8068,7 +8074,7 @@ class Exporter(object):
                 (_gr // 2, _gr // 2, "center"),
             ]:
                 _e = grid[_gy][_gx]
-                self.log("  grid[{},{}] ({}) src=({:.4f},{:.4f}) "
+                self._trace("  grid[{},{}] ({}) src=({:.4f},{:.4f}) "
                          "dst=({:.4f},{:.4f}) -> AE=({:.4f},{:.4f})".format(
                              _gy, _gx, _lbl,
                              _e[0], _e[1], _e[2], _e[3],
@@ -8079,7 +8085,7 @@ class Exporter(object):
                 scene_base, tag, version_str)
             ffx_path = os.path.join(ae_dir, ffx_name)
 
-            self.log("Writing .ffx preset: {}".format(ffx_name))
+            self._trace("Writing .ffx preset: {}".format(ffx_name))
             Exporter._write_mesh_warp_ffx(
                 ffx_path, grid_res, grid_res, grid,
                 fps, int(start_frame))
@@ -12548,7 +12554,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             abc_nodes.add(cn)
                 if not abc_nodes:
                     continue
-                self._log("Baking Alembic camera '{}'...".format(cam))
+                sys.stderr.write(
+                    "{} Baking Alembic camera '{}'...\n".format(
+                        LOG_PREFIX, cam))
                 cmds.undoInfo(openChunk=True)
                 baked_abc_cams.append(cam)
                 trs = ["tx", "ty", "tz", "rx", "ry", "rz",
@@ -13170,7 +13178,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         if cmds.nodeType(c) == "AlembicNode":
                             abc_nodes.add(c)
                 if abc_nodes:
-                    self._log("Baking Alembic camera...")
+                    sys.stderr.write(
+                        "{} Baking Alembic camera...\n".format(LOG_PREFIX))
                     cmds.undoInfo(openChunk=True)
                     baked_abc_cam = True
                     trs = ["tx", "ty", "tz", "rx", "ry", "rz",
@@ -13725,7 +13734,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         if cmds.nodeType(c) == "AlembicNode":
                             abc_nodes.add(c)
                 if abc_nodes:
-                    self._log("Baking Alembic camera...")
+                    sys.stderr.write(
+                        "{} Baking Alembic camera...\n".format(LOG_PREFIX))
                     bake_pre = int(start_frame) - 1
                     trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                            "sx", "sy", "sz"]
