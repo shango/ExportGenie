@@ -69,7 +69,7 @@ LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 # in the UI -- retune them here, not in the tool.
 WITNESS_FOCAL_LENGTH = 35.0        # mm
 WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
-WITNESS_SIDE_DISTANCE = 100.0      # units out to the side of the tracked
+WITNESS_SIDE_DISTANCE = 1000.0     # units out to the side of the tracked
                                    # camera; frames that camera and its
                                    # surroundings, not the whole scene
 WITNESS_FORWARD_FRAC = 0.35        # slide the witness downstream of the
