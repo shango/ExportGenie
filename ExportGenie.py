@@ -80,8 +80,12 @@ WITNESS_FORWARD_FRAC = 0.35        # slide the witness downstream of the
 WITNESS_ICON_SCALE = 200.0         # locatorScale on the tracked camera so
                                    # its icon reads at witness distance
 WITNESS_CUBE_SIZE = 6.0            # origin cube, sits on the ground plane
-WITNESS_GRID_LINES = 100           # grid line count across the huge-extent
-                                   # ground plane (keeps the line density sane)
+WITNESS_GRID_MAJOR_LINES = 100     # major grid lines from centre to each
+                                   # edge; grid extent / this = the major
+                                   # square size
+WITNESS_GRID_DIVISIONS = 10        # subdivisions per major square. Smallest
+                                   # visible square = major square / this, so
+                                   # raise this for a finer (higher-res) grid
 
 # Tab identifiers
 TAB_CAMERA_TRACK = "camera_track"
@@ -6481,17 +6485,26 @@ class Exporter(object):
                 cmds.setAttr(icon_attr, WITNESS_ICON_SCALE)
 
             # Maya's grid is finite, so stand in for an infinite ground
-            # plane by blowing its extent out past the far clip.
+            # plane by blowing its extent out to the far clip. The grid
+            # lines and their subdivisions are forced on (and restored
+            # after) so the ground reads regardless of the artist's own
+            # grid preferences.
             original_grid_prefs = {
                 "size": cmds.grid(query=True, size=True),
                 "spacing": cmds.grid(query=True, spacing=True),
                 "divisions": cmds.grid(query=True, divisions=True),
+                "displayGridLines": cmds.grid(
+                    query=True, displayGridLines=True),
+                "displayDivisionLines": cmds.grid(
+                    query=True, displayDivisionLines=True),
             }
             grid_size = framing["far_clip"]
             cmds.grid(
                 size=grid_size,
-                spacing=grid_size / WITNESS_GRID_LINES,
-                divisions=1)
+                spacing=grid_size / WITNESS_GRID_MAJOR_LINES,
+                divisions=WITNESS_GRID_DIVISIONS,
+                displayGridLines=True,
+                displayDivisionLines=True)
 
             for panel in (cmds.getPanel(visiblePanels=True) or []):
                 if cmds.getPanel(typeOf=panel) == "modelPanel":
