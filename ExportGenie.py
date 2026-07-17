@@ -69,19 +69,43 @@ LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 # in the UI -- retune them here, not in the tool.
 WITNESS_FOCAL_LENGTH = 35.0        # mm
 WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
-WITNESS_ICON_SCALE = 200.0         # locatorScale on the tracked camera so
-                                   # its icon reads at witness distance
-WITNESS_STICK_HEIGHT = 72.0        # origin measuring stick, ~6 ft (1 unit
-                                   # ~= 1 inch); sits on the ground plane
-WITNESS_STICK_RADIUS = 1.5         # thin, so it reads as a scale reference
+WITNESS_ICON_SCALE_FRAC = 0.05     # tracked-camera icon locatorScale as a
+                                   # fraction of the witness standoff, so the
+                                   # icon reads at distance in a big scene but
+                                   # stays small in a small one
+WITNESS_ICON_MIN_SCALE = 1.0       # floor so a tiny-scene icon is still
+                                   # visible (never larger than proportional)
+WITNESS_STICK_HEIGHT_FT = 6.0      # origin measuring stick height (a human-
+                                   # height scale gauge). Converted to the
+                                   # scene's linear unit at build time (see
+                                   # Exporter._witness_stick_height) so it is a
+                                   # true 6 ft whether the scene is in cm
+                                   # (Maya/Unreal default), inches, metres, ...
+                                   # It sits on the ground plane at the origin.
+WITNESS_STICK_RADIUS_FRAC = 0.02   # radius as a fraction of height, so the
+                                   # pole stays proportionally thin in any unit
 WITNESS_FRAME_MARGIN = 1.15        # padding when fitting geo + camera path
                                    # into the pulled-back witness frame
-WITNESS_GRID_MAJOR_LINES = 100     # major grid lines from centre to each
-                                   # edge; grid extent / this = the major
-                                   # square size
-WITNESS_GRID_DIVISIONS = 10        # subdivisions per major square. Smallest
-                                   # visible square = major square / this, so
-                                   # raise this for a finer (higher-res) grid
+WITNESS_VERTICAL_MARGIN = 1.35     # extra vertical padding (top + bottom):
+                                   # the render is usually wider than the
+                                   # witness film back, so the true vertical
+                                   # FOV is tighter than the film aperture
+                                   # implies -- without this the scene top
+                                   # kisses / clips the frame edge
+# The witness pass draws its ground as an actual subdivided poly plane
+# (wireframe) rather than Maya's viewport grid, which renders unreliably in
+# offscreen playblasts. The plane is witness-only: built for the render and
+# torn down after, never exported.
+WITNESS_GROUND_EXTENT = 8.0        # ground-plane width as a multiple of the
+                                   # witness standoff, so it reaches roughly
+                                   # the sky-dome extent and, sitting well
+                                   # beyond the camera, reads as ground
+WITNESS_GROUND_SUBDIV = 160        # subdivisions per side; with the extent
+                                   # above this yields ~standoff/20 squares,
+                                   # so the wireframe reads as a grid at
+                                   # distance (raise for a finer grid)
+WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
+                                           # plane (per-object draw override)
 
 # Skydome backdrop.  If the scene has no sky sphere the exporter builds
 # one that encloses the assigned geo and the whole camera path, sitting
@@ -1972,6 +1996,69 @@ class Exporter(object):
         grp = cmds.group(em=True, name=name)
         return grp
 
+    def _world_baked_camera(self, camera, start_frame, end_frame):
+        """Return a standalone, world-space-baked copy of *camera* for the
+        FBX export, plus the throwaway nodes to delete afterward.
+
+        Unreal's FBX importer applies its axis conversion and camera-aim
+        fix (-Z look -> +X look) directly to the camera; when the camera
+        sits under a parent transform those do not compose through the
+        parent and the camera lands ~90 deg off in Unreal. A copy that
+        carries the full world transform on its own (parentless) channels
+        avoids that. The bake is driven by a parent constraint, so it is
+        correct no matter how the camera got there -- grouped,
+        repositioned, or parented to a moving object -- and it leaves the
+        original camera and its hierarchy untouched.
+
+        A camera already at the world root needs no fix, so the original
+        is returned with an empty cleanup list.
+        """
+        if not camera or not cmds.objExists(camera):
+            return camera, []
+        if not cmds.listRelatives(camera, parent=True, fullPath=True):
+            return camera, []
+
+        short = camera.rsplit("|", 1)[-1].rsplit(":", 1)[-1]
+        dup = cmds.duplicate(
+            camera, returnRootsOnly=True, name=short + "_ue")[0]
+        if cmds.listRelatives(dup, parent=True, fullPath=True):
+            dup = cmds.parent(dup, world=True)[0]
+
+        # The constraint owns placement, so clear the copy's transform
+        # channels (unlock + drop any copied animation) and reset scale so
+        # nothing fights it.
+        for a in ("translate", "rotate", "scale"):
+            for ax in "XYZ":
+                attr = "{}.{}{}".format(dup, a, ax)
+                try:
+                    cmds.setAttr(attr, lock=False, keyable=True)
+                except Exception:
+                    pass
+                try:
+                    cmds.cutKey(attr, clear=True)
+                except Exception:
+                    pass
+        for ax in "XYZ":
+            try:
+                cmds.setAttr("{}.scale{}".format(dup, ax), 1.0)
+            except Exception:
+                pass
+
+        con = cmds.parentConstraint(camera, dup, maintainOffset=False)
+        cmds.bakeResults(
+            dup, t=(int(start_frame), int(end_frame)),
+            at=["tx", "ty", "tz", "rx", "ry", "rz"],
+            simulation=True, preserveOutsideKeys=False,
+            minimizeRotation=True)
+        try:
+            cmds.delete(con)
+        except Exception:
+            pass
+        sys.stderr.write(
+            LOG_PREFIX + " FBX: exporting world-baked camera copy '{}' "
+            "in place of parented '{}'.\n".format(dup, camera))
+        return dup, [dup]
+
     def export_fbx(self, file_path, camera, geo_roots, rig_roots, proxy_geos,
                    start_frame, end_frame,
                    export_input_connections=False):
@@ -2182,6 +2269,18 @@ class Exporter(object):
             mel.eval("FBXExportScaleFactor 1")
             mel.eval("FBXExportUseSceneName -v false")
 
+            # Swap a parented camera for a world-space-baked standalone
+            # copy so Unreal's camera-aim conversion doesn't compose
+            # through a parent null (see _world_baked_camera). A camera
+            # already at the world root is returned unchanged.
+            cam_cleanup = []
+            if effective_cam and effective_cam in sel:
+                fbx_cam, cam_cleanup = self._world_baked_camera(
+                    effective_cam, start_frame, end_frame)
+                if fbx_cam != effective_cam:
+                    sel = [fbx_cam if s == effective_cam else s
+                           for s in sel]
+
             # Create metadata group and include in export
             info_grp = self._create_metadata_grp()
             sel.append(info_grp)
@@ -2196,6 +2295,12 @@ class Exporter(object):
                         cmds.delete(info_grp)
                     except Exception:
                         pass
+                for node in cam_cleanup:
+                    if cmds.objExists(node):
+                        try:
+                            cmds.delete(node)
+                        except Exception:
+                            pass
 
             return True
         except Exception as e:
@@ -6353,20 +6458,39 @@ class Exporter(object):
     # --- Witness Camera (Camera Track + Matchmove QC) ---
 
     @staticmethod
+    def _witness_stick_height():
+        """Height of the origin measuring stick in the scene's current
+        linear unit, so it is always WITNESS_STICK_HEIGHT_FT (a real 6 ft)
+        whether the scene is in cm (Maya/Unreal default), inches, metres,
+        etc. Falls back to a cm scene if the unit can't be read."""
+        cm_per_unit = {
+            'mm': 0.1, 'cm': 1.0, 'in': 2.54,
+            'ft': 30.48, 'yd': 91.44, 'm': 100.0, 'km': 100000.0,
+        }
+        try:
+            unit = cmds.currentUnit(query=True, linear=True)
+        except Exception:
+            unit = 'cm'
+        cmu = cm_per_unit.get(unit, 1.0)
+        return WITNESS_STICK_HEIGHT_FT * 30.48 / cmu
+
+    @staticmethod
     def _witness_framing(camera, start_frame, end_frame, geo_nodes=None):
         """Work out where to park the locked-off witness camera.
 
         Exactly 90 degrees around world Y from the tracked camera's
         average aim and dead level with it -- the orientation is fixed.
         The DISTANCE is solved so the pulled-back frame encloses the
-        assigned geo and the tracked camera's whole path: the combined
-        world bounds are projected onto the witness camera's right / up /
-        forward axes and the standoff is taken from the tighter of the
-        horizontal and vertical fields of view (plus WITNESS_FRAME_MARGIN).
+        assigned geo, the tracked camera's whole path, and the origin
+        measuring stick: the combined world bounds are projected onto the
+        witness camera's right / up / forward axes and the standoff is
+        taken from the tighter of the horizontal and vertical fields of
+        view (plus the frame margins).
 
         Returns:
             dict: eye (3-tuple), yaw (degrees about world Y), far_clip,
-                cam_shape.
+                cam_shape, standoff (distance from bounds centre to eye,
+                used to size the tracked-camera icon proportionally).
         """
         cam_shape = (cmds.listRelatives(
             camera, shapes=True, type="camera") or [None])[0]
@@ -6412,21 +6536,37 @@ class Exporter(object):
         fwd = (view[0], 0.0, view[1])
         right = (view[1], 0.0, -view[0])
 
+        # Combined world extent to frame: the assigned geo, the tracked
+        # camera's path, AND the origin measuring stick. The stick is
+        # created for the render and does not exist yet at framing time,
+        # so its box is taken from the constants (thin, standing on the
+        # ground at the origin, ~6 ft tall in the scene's unit). The frame
+        # margins in the standoff solve below then hold it off the edge.
+        sh = Exporter._witness_stick_height()
+        sr = sh * WITNESS_STICK_RADIUS_FRAC
+        pts = [(x, y, z)
+               for x in (-sr, sr)
+               for y in (0.0, sh)
+               for z in (-sr, sr)]
         bounds = Exporter._geo_camera_bounds(geo_nodes, camera, frames)
         if bounds:
-            center = bounds["center"]
             x0, y0, z0, x1, y1, z1 = bounds["bbox"]
-            corners = [(cx, cy, cz)
-                       for cx in (x0, x1)
-                       for cy in (y0, y1)
-                       for cz in (z0, z1)]
-        else:
-            center = (0.0, 0.0, 0.0)
-            corners = [center]
+            pts += [(cx, cy, cz)
+                    for cx in (x0, x1)
+                    for cy in (y0, y1)
+                    for cz in (z0, z1)]
+        bb_min = [min(p[i] for p in pts) for i in range(3)]
+        bb_max = [max(p[i] for p in pts) for i in range(3)]
+        center = tuple((bb_min[i] + bb_max[i]) / 2.0 for i in range(3))
+        corners = [(cx, cy, cz)
+                   for cx in (bb_min[0], bb_max[0])
+                   for cy in (bb_min[1], bb_max[1])
+                   for cz in (bb_min[2], bb_max[2])]
 
         # Half-angles of the witness camera's fixed lens. Film aperture
-        # is in inches, focal length in mm. A minor render-aspect vs
-        # film-aspect mismatch is absorbed by WITNESS_FRAME_MARGIN.
+        # is in inches, focal length in mm. The render is usually wider
+        # than the film back, so the true vertical FOV runs tighter than
+        # tan_v implies; WITNESS_VERTICAL_MARGIN pads for it (top + bottom).
         tan_h = (WITNESS_FILM_APERTURE[0] * 25.4 * 0.5) / WITNESS_FOCAL_LENGTH
         tan_v = (WITNESS_FILM_APERTURE[1] * 25.4 * 0.5) / WITNESS_FOCAL_LENGTH
 
@@ -6444,7 +6584,7 @@ class Exporter(object):
             min_af = min(min_af, a_f)
             d = max(d,
                     abs(a_r) * WITNESS_FRAME_MARGIN / tan_h - a_f,
-                    abs(a_u) * WITNESS_FRAME_MARGIN / tan_v - a_f)
+                    abs(a_u) * WITNESS_VERTICAL_MARGIN / tan_v - a_f)
         # Keep the eye in front of the nearest corner.
         d = max(d, -min_af + 1.0)
 
@@ -6452,17 +6592,16 @@ class Exporter(object):
                center[1],
                center[2] - fwd[2] * d)
 
-        # Far clip reaches the farthest of the bounds corners, the origin,
-        # and the top of the measuring stick.
-        reach = corners + [(0.0, 0.0, 0.0),
-                           (0.0, WITNESS_STICK_HEIGHT, 0.0)]
+        # Far clip reaches the farthest bounds corner (geo, camera path and
+        # the measuring stick are all folded into `corners`).
         far = max(math.sqrt(sum((eye[i] - p[i]) ** 2 for i in range(3)))
-                  for p in reach)
+                  for p in corners)
         return {
             "eye": eye,
             "yaw": yaw,
             "far_clip": max(10000.0, far * 1.5),
             "cam_shape": cam_shape,
+            "standoff": d,
         }
 
     def export_witness_playblast(self, output_mp4, tmp_png_file, camera,
@@ -6472,16 +6611,16 @@ class Exporter(object):
         """Render the witness QC movie (Camera Track and Matchmove).
 
         A second .mp4 from a locked-off camera set 90 degrees off the
-        tracked camera, showing the scene geo and a tall thin origin
-        measuring stick (both as wireframe) on an effectively infinite
-        default grid, plus the tracked camera itself (icon scaled up so
-        it reads at distance). No HUD.
+        tracked camera, showing the scene geo, a tall thin origin measuring
+        stick, and a large subdivided ground plane at y=0 (all as
+        wireframe), plus the tracked camera itself (icon scaled up so it
+        reads at distance). No HUD.
 
         Everything this creates or changes -- the witness camera, the
-        measuring stick, the grid preferences, the tracked camera's icon
-        scale, the panel flags, the selection and the current frame -- is
-        undone before returning.  Must run AFTER the main playblast, so
-        the stick and grid cannot leak into it.
+        measuring stick, the ground plane, the tracked camera's icon scale,
+        the panel flags, the selection and the current frame -- is undone
+        before returning.  Must run AFTER the main playblast, so the stick
+        and ground cannot leak into it.
 
         Returns:
             bool: True if the witness .mp4 was written.
@@ -6500,7 +6639,6 @@ class Exporter(object):
         model_panel = None
         original_panel = {}
         original_cam = None
-        original_grid_prefs = None
         original_icon_scale = None
         hidden_domes = []
         original_sel = cmds.ls(selection=True)
@@ -6531,16 +6669,16 @@ class Exporter(object):
             framing = self._witness_framing(
                 camera, start_frame, end_frame, geo_nodes)
 
-            # Tall thin measuring stick at the origin, ~6 ft, as a scale
-            # reference in the witness view.
+            # Tall thin measuring stick at the origin, a real 6 ft in the
+            # scene's unit, as a scale reference in the witness view.
+            stick_h = Exporter._witness_stick_height()
             stick = cmds.polyCylinder(
-                radius=WITNESS_STICK_RADIUS,
-                height=WITNESS_STICK_HEIGHT,
+                radius=stick_h * WITNESS_STICK_RADIUS_FRAC,
+                height=stick_h,
                 name="EG_witness_stick")[0]
             created.append(stick)
             # +half its height in Y so the base sits ON the ground plane.
-            cmds.setAttr(
-                stick + ".translateY", WITNESS_STICK_HEIGHT / 2.0)
+            cmds.setAttr(stick + ".translateY", stick_h / 2.0)
 
             wit_cam = cmds.camera(
                 focalLength=WITNESS_FOCAL_LENGTH,
@@ -6560,32 +6698,42 @@ class Exporter(object):
             # Scale the tracked camera's viewport icon so it is legible
             # from the witness. locatorScale touches the icon only -- it
             # does not affect the render, unlike scaling the transform.
+            # Proportional to the standoff: big enough to read at distance
+            # in a large scene, but not a giant icon in a small one.
             if framing["cam_shape"]:
                 icon_attr = framing["cam_shape"] + ".locatorScale"
                 original_icon_scale = cmds.getAttr(icon_attr)
-                cmds.setAttr(icon_attr, WITNESS_ICON_SCALE)
+                icon_scale = max(
+                    WITNESS_ICON_MIN_SCALE,
+                    framing["standoff"] * WITNESS_ICON_SCALE_FRAC)
+                cmds.setAttr(icon_attr, icon_scale)
 
-            # Maya's grid is finite, so stand in for an infinite ground
-            # plane by blowing its extent out to the far clip. The grid
-            # lines and their subdivisions are forced on (and restored
-            # after) so the ground reads regardless of the artist's own
-            # grid preferences.
-            original_grid_prefs = {
-                "size": cmds.grid(query=True, size=True),
-                "spacing": cmds.grid(query=True, spacing=True),
-                "divisions": cmds.grid(query=True, divisions=True),
-                "displayGridLines": cmds.grid(
-                    query=True, displayGridLines=True),
-                "displayDivisionLines": cmds.grid(
-                    query=True, displayDivisionLines=True),
-            }
-            grid_size = framing["far_clip"]
-            cmds.grid(
-                size=grid_size,
-                spacing=grid_size / WITNESS_GRID_MAJOR_LINES,
-                divisions=WITNESS_GRID_DIVISIONS,
-                displayGridLines=True,
-                displayDivisionLines=True)
+            # Ground reference: an actual subdivided poly plane at y=0,
+            # rendered as wireframe (the panel forces wireframe below), so a
+            # grid always reads in the offscreen playblast where Maya's own
+            # viewport grid does not. Sized to the standoff so it reaches
+            # roughly the sky-dome extent and sits well beyond the camera,
+            # and subdivided so the squares read at distance. Witness-only:
+            # torn down with the rest of `created`.
+            ground_size = framing["standoff"] * WITNESS_GROUND_EXTENT
+            ground = cmds.polyPlane(
+                width=ground_size, height=ground_size,
+                subdivisionsX=WITNESS_GROUND_SUBDIV,
+                subdivisionsY=WITNESS_GROUND_SUBDIV,
+                createUVs=0, constructionHistory=False,
+                name="EG_witness_ground")[0]
+            created.append(ground)
+            # Soft-red wireframe via a per-object draw override, so the
+            # ground reads distinctly from the geo in the wireframe render.
+            for gs in (cmds.listRelatives(
+                    ground, shapes=True, fullPath=True) or []):
+                try:
+                    cmds.setAttr(gs + ".overrideEnabled", 1)
+                    cmds.setAttr(gs + ".overrideRGBColors", 1)
+                    cmds.setAttr(gs + ".overrideColorRGB",
+                                 *WITNESS_GROUND_COLOR, type="double3")
+                except Exception:
+                    pass
 
             for panel in (cmds.getPanel(visiblePanels=True) or []):
                 if cmds.getPanel(typeOf=panel) == "modelPanel":
@@ -6604,7 +6752,7 @@ class Exporter(object):
                 original_panel[flag] = cmds.modelEditor(
                     model_panel, query=True, **{flag: True})
             cmds.modelEditor(
-                model_panel, edit=True, grid=True, cameras=True,
+                model_panel, edit=True, grid=False, cameras=True,
                 imagePlane=False, displayAppearance="wireframe")
 
             original_cam = cmds.modelPanel(
@@ -6668,11 +6816,6 @@ class Exporter(object):
                         cmds.lookThru(model_panel, original_cam)
                     except Exception:
                         pass
-            if original_grid_prefs:
-                try:
-                    cmds.grid(**original_grid_prefs)
-                except Exception:
-                    pass
             if original_icon_scale is not None:
                 try:
                     cmds.setAttr(
@@ -7507,18 +7650,30 @@ class Exporter(object):
 
     @staticmethod
     def _create_skydome(center, radius):
-        """Build an inward-facing sky sphere named SKYDOME_NAME at
-        *center* with *radius*, keeping Maya's default lambert. Normals
-        are reversed so the interior faces the tracked camera. History is
+        """Build an inward-facing sky DOME (upper hemisphere) named
+        SKYDOME_NAME at *center* with *radius*, keeping Maya's default
+        lambert. The lower (-Y) half of the sphere is removed, normals are
+        reversed so the interior faces the tracked camera, and history is
         deleted so the exported node is clean. Returns the transform."""
         dome = cmds.polySphere(
             radius=radius,
             subdivisionsX=SKYDOME_SUBDIV,
             subdivisionsY=SKYDOME_SUBDIV,
             name=SKYDOME_NAME)[0]
+        # Drop the lower (-Y) hemisphere so the dome is a semi sphere. The
+        # sphere is still at the origin, so its equator sits at y=0; with an
+        # even SKYDOME_SUBDIV there is a clean edge loop there and every
+        # face lies wholly above or below it. A face whose top (bbox ymax)
+        # is at or below the equator is in the -Y half.
+        lower = [
+            f for f in (cmds.ls(dome + ".f[*]", flatten=True) or [])
+            if cmds.xform(f, query=True, boundingBox=True,
+                          worldSpace=True)[4] <= 1e-4]
+        if lower:
+            cmds.delete(lower)
         for axis, value in zip("XYZ", center):
             cmds.setAttr(dome + ".translate" + axis, value)
-        # normalMode 0 reverses the normals, flipping the sphere inward.
+        # normalMode 0 reverses the normals, flipping the dome inward.
         cmds.polyNormal(dome, normalMode=0, ch=False)
         cmds.delete(dome, constructionHistory=True)
         return dome
