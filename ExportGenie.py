@@ -69,23 +69,42 @@ LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 # in the UI -- retune them here, not in the tool.
 WITNESS_FOCAL_LENGTH = 35.0        # mm
 WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
-WITNESS_SIDE_DISTANCE = 1000.0     # units out to the side of the tracked
-                                   # camera; frames that camera and its
-                                   # surroundings, not the whole scene
-WITNESS_FORWARD_FRAC = 0.35        # slide the witness downstream of the
-                                   # tracked camera's aim, as a fraction of
-                                   # the side distance, so it sits a bit
-                                   # in front of that camera rather than
-                                   # dead abeam of it
 WITNESS_ICON_SCALE = 200.0         # locatorScale on the tracked camera so
                                    # its icon reads at witness distance
-WITNESS_CUBE_SIZE = 6.0            # origin cube, sits on the ground plane
+WITNESS_STICK_HEIGHT = 72.0        # origin measuring stick, ~6 ft (1 unit
+                                   # ~= 1 inch); sits on the ground plane
+WITNESS_STICK_RADIUS = 1.5         # thin, so it reads as a scale reference
+WITNESS_FRAME_MARGIN = 1.15        # padding when fitting geo + camera path
+                                   # into the pulled-back witness frame
 WITNESS_GRID_MAJOR_LINES = 100     # major grid lines from centre to each
                                    # edge; grid extent / this = the major
                                    # square size
 WITNESS_GRID_DIVISIONS = 10        # subdivisions per major square. Smallest
                                    # visible square = major square / this, so
                                    # raise this for a finer (higher-res) grid
+
+# Skydome backdrop.  If the scene has no sky sphere the exporter builds
+# one that encloses the assigned geo and the whole camera path, sitting
+# beyond each frame's image plane, with normals flipped inward so the
+# tracked camera sees it correctly.  The created dome persists in the
+# exported files but is hidden from the witness (qc) render.
+SKYDOME_NAME = "EG_skydome"
+# Definite matches -- an unambiguous sky-dome name; treated as a dome with
+# no prompt. Ambiguous matches ("sky" or "dome" alone, e.g. "geodome" or
+# "sky_backdrop") are confirmed with the user before being treated as one.
+SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere")
+SKYDOME_AMBIGUOUS_KEYWORDS = ("sky", "dome")
+SKYDOME_RADIUS_MARGIN = 1.25       # grow the enclosing radius so the dome
+                                   # clears the farthest geo / camera / plate
+SKYDOME_SUBDIV = 32                # sphere axis/height subdivisions
+
+# The playblast far clip is derived from the camera's fitted far clip (the
+# auto-fit and sky-dome passes push it a few units past the farthest object)
+# rather than a UI control.
+PLAYBLAST_FAR_MARGIN = 10.0        # extra headroom past the farthest object
+                                   # so it never sits on the far plane
+PLAYBLAST_FAR_FALLBACK = 800000.0  # used only when the camera has no fitted
+                                   # far clip (e.g. no geo configured)
 
 # Tab identifiers
 TAB_CAMERA_TRACK = "camera_track"
@@ -6334,15 +6353,16 @@ class Exporter(object):
     # --- Witness Camera (Camera Track + Matchmove QC) ---
 
     @staticmethod
-    def _witness_framing(camera, start_frame, end_frame):
+    def _witness_framing(camera, start_frame, end_frame, geo_nodes=None):
         """Work out where to park the locked-off witness camera.
 
-        A fixed offset to the side of the tracked camera: exactly 90
-        degrees around world Y from that camera's average aim, dead
-        level with it, WITNESS_SIDE_DISTANCE units out to the side and
-        nudged a little downstream of where it is looking.  This
-        deliberately does NOT try to fit the whole scene -- it frames
-        the tracked camera and its immediate surroundings.
+        Exactly 90 degrees around world Y from the tracked camera's
+        average aim and dead level with it -- the orientation is fixed.
+        The DISTANCE is solved so the pulled-back frame encloses the
+        assigned geo and the tracked camera's whole path: the combined
+        world bounds are projected onto the witness camera's right / up /
+        forward axes and the standoff is taken from the tighter of the
+        horizontal and vertical fields of view (plus WITNESS_FRAME_MARGIN).
 
         Returns:
             dict: eye (3-tuple), yaw (degrees about world Y), far_clip,
@@ -6350,58 +6370,92 @@ class Exporter(object):
         """
         cam_shape = (cmds.listRelatives(
             camera, shapes=True, type="camera") or [None])[0]
+        frames = list(range(int(start_frame), int(end_frame) + 1))
 
-        # Sample the tracked camera's world position and aim every frame.
-        # xform is not time-aware, so read worldMatrix at each time.
-        positions = []
+        # Never fit to a sky dome -- it encloses everything by design, so
+        # it would blow the standoff out. It is hidden from this render
+        # anyway.
+        geo_nodes = [
+            g for g in (geo_nodes or [])
+            if not any(
+                kw in g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
+                for kw in SKYDOME_NAME_KEYWORDS)]
+
+        # Sample the tracked camera's aim every frame for the view
+        # direction. worldMatrix is read at each time (no timeline scrub).
         aims = []
-        for frame in range(int(start_frame), int(end_frame) + 1):
+        for frame in frames:
             m = cmds.getAttr(camera + ".worldMatrix", time=frame)
             if m and isinstance(m[0], (list, tuple)):
                 m = m[0]
-            positions.append((m[12], m[13], m[14]))
             # Maya cameras look down their local -Z.
             aims.append((-m[8], -m[9], -m[10]))
-
-        # Average position, and average aim flattened to the ground plane.
-        cam_center = [sum(p[i] for p in positions) / len(positions)
-                      for i in range(3)]
         fx = sum(a[0] for a in aims) / len(aims)
         fz = sum(a[2] for a in aims) / len(aims)
         length = math.sqrt(fx * fx + fz * fz)
         if length < 1e-4:
-            # Camera points straight up or down, or its aim cancels out
-            # over the shot. Any horizontal direction is as good as any
-            # other; take world +Z.
+            # Aim is vertical or cancels over the shot; any horizontal
+            # direction works -- take world +Z.
             fx, fz = 0.0, 1.0
         else:
             fx, fz = fx / length, fz / length
 
-        # Broadside: rotate the tracked camera's aim +90 degrees about
-        # world Y, (x, z) -> (z, -x). The witness looks ALONG this
-        # vector, so its view axis is exactly 90 degrees off the tracked
-        # camera's and dead level -- no tilt, yaw is the whole rotation.
+        # Broadside: rotate the aim +90 degrees about world Y,
+        # (x, z) -> (z, -x). The witness looks ALONG this, so its view
+        # axis is exactly 90 degrees off and dead level.
         view = (fz, -fx)
-
-        # Park it a fixed distance to the side of the tracked camera,
-        # nudged a little downstream of that camera's aim so it sits a
-        # bit in front rather than dead abeam. The nudge runs along the
-        # view axis, so it does not disturb the exact 90 degrees.
-        side = WITNESS_SIDE_DISTANCE
-        offset = WITNESS_FORWARD_FRAC * side
-        eye = (
-            cam_center[0] - view[0] * side + fx * offset,
-            cam_center[1],
-            cam_center[2] - view[1] * side + fz * offset,
-        )
-
-        # A camera at yaw 0 looks down -Z, so solve -sin(yaw) = view.x
-        # and -cos(yaw) = view.z.
+        # A camera at yaw 0 looks down -Z, so -sin(yaw) = view.x and
+        # -cos(yaw) = view.z.
         yaw = math.degrees(math.atan2(-view[0], -view[1]))
 
-        # Far clip only needs to reach the cube at origin and the whole
-        # tracked-camera path; we are not fitting the wider scene.
-        reach = [(0.0, 0.0, 0.0)] + positions
+        # Horizontal forward (F) and horizontal right (R); up is world +Y.
+        fwd = (view[0], 0.0, view[1])
+        right = (view[1], 0.0, -view[0])
+
+        bounds = Exporter._geo_camera_bounds(geo_nodes, camera, frames)
+        if bounds:
+            center = bounds["center"]
+            x0, y0, z0, x1, y1, z1 = bounds["bbox"]
+            corners = [(cx, cy, cz)
+                       for cx in (x0, x1)
+                       for cy in (y0, y1)
+                       for cz in (z0, z1)]
+        else:
+            center = (0.0, 0.0, 0.0)
+            corners = [center]
+
+        # Half-angles of the witness camera's fixed lens. Film aperture
+        # is in inches, focal length in mm. A minor render-aspect vs
+        # film-aspect mismatch is absorbed by WITNESS_FRAME_MARGIN.
+        tan_h = (WITNESS_FILM_APERTURE[0] * 25.4 * 0.5) / WITNESS_FOCAL_LENGTH
+        tan_v = (WITNESS_FILM_APERTURE[1] * 25.4 * 0.5) / WITNESS_FOCAL_LENGTH
+
+        # Solve the standoff d (along -F from centre): a corner at forward
+        # offset a_f and lateral / vertical offsets a_r / a_u sits at depth
+        # (d + a_f) from the eye, so it fits when |a_r| <= (d + a_f) tan_h
+        # and |a_u| <= (d + a_f) tan_v. Take the binding corner per axis.
+        d = 0.0
+        min_af = 0.0
+        for c in corners:
+            o = (c[0] - center[0], c[1] - center[1], c[2] - center[2])
+            a_r = o[0] * right[0] + o[1] * right[1] + o[2] * right[2]
+            a_u = o[1]
+            a_f = o[0] * fwd[0] + o[1] * fwd[1] + o[2] * fwd[2]
+            min_af = min(min_af, a_f)
+            d = max(d,
+                    abs(a_r) * WITNESS_FRAME_MARGIN / tan_h - a_f,
+                    abs(a_u) * WITNESS_FRAME_MARGIN / tan_v - a_f)
+        # Keep the eye in front of the nearest corner.
+        d = max(d, -min_af + 1.0)
+
+        eye = (center[0] - fwd[0] * d,
+               center[1],
+               center[2] - fwd[2] * d)
+
+        # Far clip reaches the farthest of the bounds corners, the origin,
+        # and the top of the measuring stick.
+        reach = corners + [(0.0, 0.0, 0.0),
+                           (0.0, WITNESS_STICK_HEIGHT, 0.0)]
         far = max(math.sqrt(sum((eye[i] - p[i]) ** 2 for i in range(3)))
                   for p in reach)
         return {
@@ -6413,20 +6467,21 @@ class Exporter(object):
 
     def export_witness_playblast(self, output_mp4, tmp_png_file, camera,
                                  start_frame, end_frame,
-                                 resolution=None):
+                                 geo_nodes=None, resolution=None,
+                                 hide_domes=None):
         """Render the witness QC movie (Camera Track and Matchmove).
 
         A second .mp4 from a locked-off camera set 90 degrees off the
-        tracked camera, showing the scene geo and a 6x6x6 cube (both as
-        wireframe) on an effectively infinite default grid, plus the
-        tracked camera itself (icon scaled up so it reads at distance).
-        No HUD.
+        tracked camera, showing the scene geo and a tall thin origin
+        measuring stick (both as wireframe) on an effectively infinite
+        default grid, plus the tracked camera itself (icon scaled up so
+        it reads at distance). No HUD.
 
         Everything this creates or changes -- the witness camera, the
-        cube, the grid preferences, the tracked camera's icon scale, the
-        panel flags, the selection and the current frame -- is undone
-        before returning.  Must run AFTER the main playblast, so the cube
-        and grid cannot leak into it.
+        measuring stick, the grid preferences, the tracked camera's icon
+        scale, the panel flags, the selection and the current frame -- is
+        undone before returning.  Must run AFTER the main playblast, so
+        the stick and grid cannot leak into it.
 
         Returns:
             bool: True if the witness .mp4 was written.
@@ -6447,19 +6502,45 @@ class Exporter(object):
         original_cam = None
         original_grid_prefs = None
         original_icon_scale = None
+        hidden_domes = []
         original_sel = cmds.ls(selection=True)
         original_time = cmds.currentTime(query=True)
 
         try:
-            framing = self._witness_framing(
-                camera, start_frame, end_frame)
+            # Hide any sky dome so it cannot occlude the witness view;
+            # visibility is restored in the finally. The dome stays in the
+            # exported files -- only this qc render is kept clear of it.
+            # Definite domes (incl. our EG_skydome) are found by name; any
+            # ambiguously named node the user confirmed comes in via
+            # hide_domes.
+            dome_set = list(Exporter._find_skydomes())
+            for extra in (hide_domes or []):
+                if extra not in dome_set:
+                    dome_set.append(extra)
+            for dome in dome_set:
+                vis_attr = dome + ".visibility"
+                try:
+                    if cmds.getAttr(vis_attr, lock=True):
+                        continue
+                    hidden_domes.append(
+                        (vis_attr, cmds.getAttr(vis_attr)))
+                    cmds.setAttr(vis_attr, False)
+                except Exception:
+                    pass
 
-            cube = cmds.polyCube(
-                width=WITNESS_CUBE_SIZE, height=WITNESS_CUBE_SIZE,
-                depth=WITNESS_CUBE_SIZE, name="EG_witness_cube")[0]
-            created.append(cube)
-            # +half in Y so the cube sits ON the ground plane.
-            cmds.setAttr(cube + ".translateY", WITNESS_CUBE_SIZE / 2.0)
+            framing = self._witness_framing(
+                camera, start_frame, end_frame, geo_nodes)
+
+            # Tall thin measuring stick at the origin, ~6 ft, as a scale
+            # reference in the witness view.
+            stick = cmds.polyCylinder(
+                radius=WITNESS_STICK_RADIUS,
+                height=WITNESS_STICK_HEIGHT,
+                name="EG_witness_stick")[0]
+            created.append(stick)
+            # +half its height in Y so the base sits ON the ground plane.
+            cmds.setAttr(
+                stick + ".translateY", WITNESS_STICK_HEIGHT / 2.0)
 
             wit_cam = cmds.camera(
                 focalLength=WITNESS_FOCAL_LENGTH,
@@ -6597,6 +6678,11 @@ class Exporter(object):
                     cmds.setAttr(
                         framing["cam_shape"] + ".locatorScale",
                         original_icon_scale)
+                except Exception:
+                    pass
+            for vis_attr, vis_value in hidden_domes:
+                try:
+                    cmds.setAttr(vis_attr, vis_value)
                 except Exception:
                     pass
             for node in created:
@@ -7266,6 +7352,176 @@ class Exporter(object):
                         camera, actual_fcp, clip_value,
                         ["{:.1f}".format(d) for d in ip_depths],
                         depth_value))
+
+    @staticmethod
+    def _geo_camera_bounds(geo_nodes, camera, frames, log_fn=None):
+        """World-space extent of the assigned geo plus the tracked
+        camera's path over ``frames``.
+
+        Shared by the witness pull-back framing and the skydome sizing so
+        both enclose the same thing. Geo bounds need a timeline scrub
+        (``exactWorldBoundingBox`` is not time-aware), so -- matching the
+        far-fit -- geo is sampled only at start/mid/end and the timeline
+        is restored. The camera path is read via ``worldMatrix`` at every
+        frame (no scrub), so a geo-less call never touches the timeline.
+
+        Returns ``None`` when neither geo shapes nor the camera resolve,
+        otherwise a dict:
+            center      (x, y, z) centre of the combined geo+camera AABB
+            bbox        (xmin, ymin, zmin, xmax, ymax, zmax)
+            geo_reach   max distance from center to any geo bbox corner
+            cam_reach   max distance from center to any camera position
+            plate_depth largest imagePlane.depth on the camera (0.0 if none)
+        """
+        shapes = Exporter._expand_to_renderable_shapes(
+            geo_nodes, log_fn=log_fn)
+        has_cam = bool(camera and cmds.objExists(camera))
+        if not shapes and not has_cam:
+            return None
+        if not frames:
+            frames = [cmds.currentTime(query=True)]
+
+        # imagePlane.depth is a static plate setting, not animated; one
+        # read of the largest depth across image planes is enough.
+        plate_depth = 0.0
+        if has_cam:
+            for cs in (cmds.listRelatives(
+                    camera, shapes=True, type="camera") or []):
+                for ip in (cmds.listConnections(
+                        cs + ".imagePlane", type="imagePlane") or []):
+                    try:
+                        plate_depth = max(
+                            plate_depth, cmds.getAttr(ip + ".depth"))
+                    except Exception:
+                        pass
+
+        geo_corners = []
+        if shapes:
+            geo_frames = sorted(set([frames[0],
+                                     frames[len(frames) // 2],
+                                     frames[-1]]))
+            saved = cmds.currentTime(query=True)
+            try:
+                for f in geo_frames:
+                    try:
+                        cmds.currentTime(f, edit=True)
+                    except Exception:
+                        continue
+                    fb_min = [float("inf")] * 3
+                    fb_max = [float("-inf")] * 3
+                    for s in shapes:
+                        try:
+                            bb = cmds.exactWorldBoundingBox(s)
+                        except Exception:
+                            continue
+                        for i in range(3):
+                            fb_min[i] = min(fb_min[i], bb[i])
+                            fb_max[i] = max(fb_max[i], bb[i + 3])
+                    if fb_min[0] != float("inf"):
+                        for cx in (fb_min[0], fb_max[0]):
+                            for cy in (fb_min[1], fb_max[1]):
+                                for cz in (fb_min[2], fb_max[2]):
+                                    geo_corners.append((cx, cy, cz))
+            finally:
+                try:
+                    cmds.currentTime(saved, edit=True)
+                except Exception:
+                    pass
+
+        cam_path = []
+        if has_cam:
+            for f in frames:
+                m = cmds.getAttr(camera + ".worldMatrix", time=f)
+                if m and isinstance(m[0], (list, tuple)):
+                    m = m[0]
+                cam_path.append((m[12], m[13], m[14]))
+
+        pts = geo_corners + cam_path
+        if not pts:
+            return None
+        bb_min = [min(p[i] for p in pts) for i in range(3)]
+        bb_max = [max(p[i] for p in pts) for i in range(3)]
+        center = tuple((bb_min[i] + bb_max[i]) / 2.0 for i in range(3))
+
+        def _reach(points):
+            r = 0.0
+            for p in points:
+                d = math.sqrt(sum((p[i] - center[i]) ** 2
+                                  for i in range(3)))
+                r = max(r, d)
+            return r
+
+        return {
+            "center": center,
+            "bbox": tuple(bb_min) + tuple(bb_max),
+            "geo_reach": _reach(geo_corners),
+            "cam_reach": _reach(cam_path),
+            "plate_depth": plate_depth,
+        }
+
+    @staticmethod
+    def _iter_surface_transforms():
+        """Yield ``(transform_fullpath, lowercased_short_name)`` for every
+        non-intermediate mesh / NURBS surface in the scene, each transform
+        once. Shared by the sky-dome name matchers."""
+        seen = set()
+        for shp in cmds.ls(type=("mesh", "nurbsSurface"), long=True) or []:
+            try:
+                if cmds.getAttr(shp + ".intermediateObject"):
+                    continue
+            except Exception:
+                continue
+            parents = cmds.listRelatives(
+                shp, parent=True, fullPath=True) or []
+            if not parents:
+                continue
+            xform = parents[0]
+            if xform in seen:
+                continue
+            seen.add(xform)
+            short = xform.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
+            yield xform, short
+
+    @staticmethod
+    def _find_skydomes():
+        """Return transforms whose short name is an unambiguous sky
+        sphere/dome (a SKYDOME_NAME_KEYWORDS match). Picks up both an
+        artist's clearly named dome and any EG_skydome from a prior run
+        (so the caller can reuse it)."""
+        return [x for x, short in Exporter._iter_surface_transforms()
+                if any(kw in short for kw in SKYDOME_NAME_KEYWORDS)]
+
+    @staticmethod
+    def _find_skydome_candidates():
+        """Return transforms whose short name only hints at a sky dome --
+        it contains an ambiguous keyword ('sky' or 'dome') but not a
+        definite one -- so the caller can confirm with the user before
+        treating them as one."""
+        out = []
+        for x, short in Exporter._iter_surface_transforms():
+            if any(kw in short for kw in SKYDOME_NAME_KEYWORDS):
+                continue
+            if any(kw in short for kw in SKYDOME_AMBIGUOUS_KEYWORDS):
+                out.append(x)
+        return out
+
+    @staticmethod
+    def _create_skydome(center, radius):
+        """Build an inward-facing sky sphere named SKYDOME_NAME at
+        *center* with *radius*, keeping Maya's default lambert. Normals
+        are reversed so the interior faces the tracked camera. History is
+        deleted so the exported node is clean. Returns the transform."""
+        dome = cmds.polySphere(
+            radius=radius,
+            subdivisionsX=SKYDOME_SUBDIV,
+            subdivisionsY=SKYDOME_SUBDIV,
+            name=SKYDOME_NAME)[0]
+        for axis, value in zip("XYZ", center):
+            cmds.setAttr(dome + ".translate" + axis, value)
+        # normalMode 0 reverses the normals, flipping the sphere inward.
+        cmds.polyNormal(dome, normalMode=0, ch=False)
+        cmds.delete(dome, constructionHistory=True)
+        return dome
 
     @staticmethod
     def _plate_name_from_path(path):
@@ -9844,7 +10100,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
     # (QSpinBox) or "color" (QPushButton carrying a ._color tuple).
     _PLAYBLAST_PRESET_FIELDS = (
         ("pb_aa16_cb", "check"),
-        ("pb_far_clip_spin", "spin"),
         ("pb_raw_playblast_cb", "check"),
         ("pb_custom_vt_cb", "check"),
         ("pb_hud_overlay_cb", "check"),
@@ -9902,7 +10157,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_aa16_cb = None
         self.pb_motion_blur_cb = None
         self.pb_hud_overlay_cb = None
-        self.pb_far_clip_spin = None
         self.pb_checker_color_btn = None
         self.pb_checker_scale_spin = None
         self.pb_checker_opacity_spin = None
@@ -10568,23 +10822,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             "Sets VP2.0 MSAA to 16 samples instead of 8.")
         gen_layout.addWidget(self.pb_aa16_cb)
 
-        # Far Clip slider
-        fc_row = QHBoxLayout()
-        fc_row.setSpacing(8)
-        fc_row.addWidget(QLabel("Far Clip:"))
-        self.pb_far_clip_spin = QSpinBox()
-        self.pb_far_clip_spin.setRange(1000, 10000000)
-        self.pb_far_clip_spin.setValue(800000)
-        self.pb_far_clip_spin.setFixedWidth(80)
-        self.pb_far_clip_spin.setToolTip("Camera far clipping plane")
-        fc_slider = QSlider(Qt.Horizontal)
-        fc_slider.setRange(10000, 2000000)
-        fc_slider.setValue(800000)
-        self.pb_far_clip_spin.valueChanged.connect(fc_slider.setValue)
-        fc_slider.valueChanged.connect(self.pb_far_clip_spin.setValue)
-        fc_row.addWidget(self.pb_far_clip_spin)
-        fc_row.addWidget(fc_slider)
-        gen_layout.addLayout(fc_row)
+        # The camera far clip is auto-fit a few units beyond the farthest
+        # object (geo, camera path and any sky dome), so there is no UI
+        # control for it -- see _playblast_far_clip.
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.HLine)
@@ -10824,7 +11064,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 buttons=["Reset", "Cancel"]) != "Reset":
             return
         self.pb_aa16_cb.setChecked(False)
-        self.pb_far_clip_spin.setValue(800000)
         self.pb_raw_playblast_cb.setChecked(False)
         self.pb_custom_vt_cb.setChecked(False)
         self.pb_hud_overlay_cb.setChecked(True)
@@ -11776,6 +12015,136 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 max_far = far
         return max_far if max_far > 0 else None
 
+    @staticmethod
+    def _extend_camera_far_clip(camera, min_far):
+        """Raise each camera shape's farClipPlane to at least *min_far* so
+        the sky dome behind the geo is not clipped in the tracked
+        camera's view. imagePlane.depth is left untouched (the plate stays
+        just beyond the real geo). Handles SynthEyes-style locked clips."""
+        if not camera or not cmds.objExists(camera):
+            return
+        for cs in (cmds.listRelatives(
+                camera, shapes=True, type="camera") or []):
+            attr = cs + ".farClipPlane"
+            try:
+                if cmds.getAttr(attr) >= min_far:
+                    continue
+            except Exception:
+                pass
+            try:
+                locked = cmds.getAttr(attr, lock=True)
+            except Exception:
+                locked = False
+            if locked:
+                try:
+                    cmds.setAttr(attr, lock=False)
+                except Exception:
+                    pass
+            try:
+                cmds.setAttr(attr, min_far)
+            except Exception:
+                pass
+            if locked:
+                try:
+                    cmds.setAttr(attr, lock=True)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _playblast_far_clip(camera):
+        """Far clip for the main playblast: the camera's current
+        farClipPlane -- already fit a few units past the farthest object
+        (geo, camera path and any sky dome) by the auto-fit and sky-dome
+        passes -- plus a small margin. Falls back to PLAYBLAST_FAR_FALLBACK
+        when the camera has no usable shape/clip (e.g. no geo configured)."""
+        far = 0.0
+        if camera and cmds.objExists(camera):
+            for cs in (cmds.listRelatives(
+                    camera, shapes=True, type="camera") or []):
+                try:
+                    far = max(far, cmds.getAttr(cs + ".farClipPlane"))
+                except Exception:
+                    pass
+        if far <= 0:
+            return PLAYBLAST_FAR_FALLBACK
+        return far + PLAYBLAST_FAR_MARGIN
+
+    def _resolve_skydomes(self):
+        """Work out which scene nodes count as an existing sky dome.
+
+        Definitely named domes (SKYDOME_NAME_KEYWORDS) are taken as-is.
+        Ambiguously named nodes ('sky' or 'dome' alone) are confirmed with
+        the user, one popup each. Returns ``(artist_domes, confirmed)``
+        where ``artist_domes`` is every existing dome EXCEPT our own
+        EG_skydome (so the caller can decide whether to build one) and
+        ``confirmed`` is the user-approved ambiguous subset the witness
+        pass must also hide (definite domes it re-finds by name)."""
+        definite = [
+            d for d in Exporter._find_skydomes()
+            if d.rsplit("|", 1)[-1].rsplit(":", 1)[-1] != SKYDOME_NAME]
+        confirmed = []
+        for cand in Exporter._find_skydome_candidates():
+            short = cand.rsplit("|", 1)[-1]
+            if self._confirm_dialog(
+                    "Sky Dome?",
+                    "'{}' might be a sky dome.\n\nTreat it as the scene's "
+                    "sky dome -- hide it from the qc render and skip "
+                    "building one?".format(short),
+                    buttons=["Yes", "No"]) == "Yes":
+                confirmed.append(cand)
+        return definite + confirmed, confirmed
+
+    def _prepare_skydome(self, geo_nodes, camera, start_frame, end_frame,
+                         artist_domes):
+        """Ensure a sky dome backs the tracked camera for the exports.
+
+        If the artist already has one (*artist_domes*, resolved by the
+        caller via _resolve_skydomes) it is left untouched -- theirs to
+        manage, and only hidden from the qc render later -- and this
+        returns None. Otherwise any stale EG_skydome is rebuilt sized to
+        enclose *geo_nodes* plus the camera path and to sit beyond the
+        image plane, the tracked camera's far clip is extended to reach it,
+        and the dome is returned so the caller can add it to the export
+        selection (it persists in the exported files but is hidden from the
+        qc render).
+        """
+        if artist_domes:
+            self._log(
+                "Sky dome present ({}); leaving it, hiding it from the "
+                "qc render.".format(artist_domes[0].rsplit("|", 1)[-1]))
+            return None
+        frames = list(range(int(start_frame), int(end_frame) + 1))
+        bounds = Exporter._geo_camera_bounds(geo_nodes, camera, frames)
+        if not bounds:
+            return None
+        radius = max(
+            bounds["geo_reach"],
+            bounds["cam_reach"] + bounds["plate_depth"],
+        ) * SKYDOME_RADIUS_MARGIN
+        if radius <= 0:
+            return None
+        # The dome is an optional backdrop; a build glitch must not abort
+        # the export, so degrade to no dome on failure.
+        try:
+            # Drop any stale EG_skydome so the size tracks the scene.
+            for d in Exporter._find_skydomes():
+                try:
+                    cmds.delete(d)
+                except Exception:
+                    pass
+            dome = Exporter._create_skydome(bounds["center"], radius)
+            self._extend_camera_far_clip(
+                camera, bounds["cam_reach"] + radius + 1.0)
+        except Exception as exc:
+            self._log("Sky dome build failed; skipping it. See "
+                      "Script Editor.")
+            sys.stderr.write(
+                LOG_PREFIX + " Sky dome build failed: {}\n".format(exc))
+            return None
+        self._log("Built sky dome '{}' (radius {:.0f}).".format(
+            SKYDOME_NAME, radius))
+        return dome
+
     # ------------------------------------------------------------------
     # Progress Bar
     # ------------------------------------------------------------------
@@ -12260,17 +12629,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         raw_pb = self.pb_raw_playblast_cb.isChecked()
         custom_vt = self.pb_custom_vt_cb.isChecked()
         aa16 = self.pb_aa16_cb.isChecked()
-        far_clip = self.pb_far_clip_spin.value()
 
         frame = int(cmds.currentTime(query=True))
 
-        # Build tab-specific keyword arguments
+        # Build tab-specific keyword arguments. far_clip is set below, once
+        # the auto-fit has pushed the camera's far plane past the geo.
         folder_name = self.export_name_field.text().strip()
         pb_kwargs = dict(
             raw_playblast=raw_pb,
             render_raw_srgb=not custom_vt,
             msaa_16=aa16,
-            far_clip=far_clip,
             png_mode=True,
             show_hud=False,
             shot_name=folder_name,
@@ -12380,14 +12748,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # Match the export handlers: push the image plane behind the
         # farthest geo (and bump the camera far clip) so the preview
         # frame doesn't get occluded by the plate. Skipped if the
-        # user hasn't configured any geo.
+        # user hasn't configured any geo. The preview has no sky dome, so
+        # the far clip only has to clear the geo.
         if autofit_geo:
-            preview_far = self._auto_fit_camera_far(
-                [camera], autofit_geo, frame, frame)
-            if preview_far is not None:
-                pb_kwargs["far_clip"] = max(
-                    pb_kwargs.get("far_clip", 0),
-                    int(preview_far) + 1)
+            self._auto_fit_camera_far([camera], autofit_geo, frame, frame)
+        pb_kwargs["far_clip"] = self._playblast_far_clip(camera)
 
         try:
             exporter = Exporter(self._log)
@@ -12493,7 +12858,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # Auto-fit each camera's far clip + image plane depth to the
         # farthest geo+tracked-object corner over the shot range, so
         # distant geometry isn't occluded by the image plane.
-        ct_far = self._auto_fit_camera_far(
+        self._auto_fit_camera_far(
             cameras, geo_roots + obj_tracks, start_frame, end_frame)
 
         folder_name = self.export_name_field.text().strip()
@@ -12721,6 +13086,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             obj_tracks = Exporter._filter_hidden_layers(obj_tracks)
             export_geo = extra_cameras + obj_tracks + geo_roots
 
+            # Build (or reuse the artist's) sky dome backdrop. A dome we
+            # create is appended to the export geo so it persists in every
+            # export; it is hidden from the witness (qc) render.
+            artist_domes, confirmed_domes = self._resolve_skydomes()
+            skydome = self._prepare_skydome(
+                geo_roots + obj_tracks, primary_camera,
+                start_frame, end_frame, artist_domes)
+            if skydome:
+                export_geo = export_geo + [skydome]
+
             if do_jsx:
                 geo_children = []
                 for gr in geo_roots + obj_tracks:
@@ -12846,9 +13221,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     custom_vt = self.pb_custom_vt_cb.isChecked()
                     wf_shader = self.pb_wireframe_shader_cb.isChecked()
                     aa16 = self.pb_aa16_cb.isChecked()
-                    far_clip = self.pb_far_clip_spin.value()
-                    if ct_far is not None:
-                        far_clip = max(far_clip, int(ct_far) + 1)
+                    far_clip = self._playblast_far_clip(primary_camera)
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     results["mov"] = exporter.export_playblast(
                         pb_path, primary_camera,
@@ -12867,14 +13240,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
                     # Witness pass -- a second, HUD-less .mp4 from a
                     # locked-off side camera. Runs AFTER the main
-                    # playblast so the cube and grid it creates cannot
-                    # leak into that render.
+                    # playblast so the measuring stick and grid it creates
+                    # cannot leak into that render.
                     results["witness"] = (
                         exporter.export_witness_playblast(
                             paths["mp4_witness"],
                             paths["mp4_witness_tmp_file"],
                             primary_camera,
-                            start_frame, end_frame))
+                            start_frame, end_frame,
+                            geo_nodes=geo_roots + obj_tracks,
+                            hide_domes=confirmed_domes))
                     if results["witness"]:
                         all_paths["witness"] = paths["mp4_witness"]
                     self._log_result("Witness Playblast",
@@ -13103,10 +13478,21 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         end_frame = self.end_frame_spin.value()
 
         # Auto-fit camera far clip + image plane depth to scene extent.
-        mm_far = self._auto_fit_camera_far(
+        self._auto_fit_camera_far(
             [camera] if camera else [],
             geo_roots + rig_roots + proxy_geos,
             start_frame, end_frame)
+
+        # Build (or reuse the artist's) sky dome backdrop. A dome we create
+        # is appended to the static geo so it persists in every export
+        # (including the snapshot-based FBX); it is hidden from the witness
+        # (qc) render.
+        artist_domes, confirmed_domes = self._resolve_skydomes()
+        skydome = self._prepare_skydome(
+            geo_roots + rig_roots + proxy_geos, camera,
+            start_frame, end_frame, artist_domes)
+        if skydome:
+            proxy_geos = proxy_geos + [skydome]
 
         tpose_start = start_frame
         if self.tpose_checkbox.isChecked():
@@ -13359,9 +13745,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     chk_opacity = self.pb_checker_opacity_spin.value()
                     aa16 = self.pb_aa16_cb.isChecked()
                     mb = self.pb_motion_blur_cb.isChecked()
-                    far_clip = self.pb_far_clip_spin.value()
-                    if mm_far is not None:
-                        far_clip = max(far_clip, int(mm_far) + 1)
+                    far_clip = self._playblast_far_clip(camera)
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     wf_overlay = (
                         self.pb_wireframe_overlay_cb.isChecked())
@@ -13398,14 +13782,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
                     # Witness pass -- a second, HUD-less .mp4 from a
                     # locked-off side camera. Runs AFTER the main
-                    # playblast so the cube and grid it creates cannot
-                    # leak into that render.
+                    # playblast so the measuring stick and grid it creates
+                    # cannot leak into that render.
                     results["witness"] = (
                         exporter.export_witness_playblast(
                             paths["mp4_witness"],
                             paths["mp4_witness_tmp_file"],
                             camera,
-                            start_frame, end_frame))
+                            start_frame, end_frame,
+                            geo_nodes=geo_roots + rig_roots + proxy_geos,
+                            hide_domes=confirmed_domes))
                     self._log_result("Witness Playblast",
                                      results["witness"])
                 self._advance_progress()
@@ -13638,7 +14024,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         ft_geo_for_far = list(face_meshes)
         if static_geo:
             ft_geo_for_far.append(static_geo)
-        ft_far = self._auto_fit_camera_far(
+        self._auto_fit_camera_far(
             [camera] if camera else [], ft_geo_for_far,
             start_frame, end_frame)
 
@@ -13878,9 +14264,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     chk_opacity = self.pb_checker_opacity_spin.value()
                     aa16 = self.pb_aa16_cb.isChecked()
                     mb = self.pb_motion_blur_cb.isChecked()
-                    far_clip = self.pb_far_clip_spin.value()
-                    if ft_far is not None:
-                        far_clip = max(far_clip, int(ft_far) + 1)
+                    far_clip = self._playblast_far_clip(camera)
                     show_hud = self.pb_hud_overlay_cb.isChecked()
                     wf_overlay = (
                         self.pb_wireframe_overlay_cb.isChecked())
