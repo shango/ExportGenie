@@ -33,7 +33,7 @@ try:
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
         QColorDialog, QSizePolicy, QFrame, QApplication, QInputDialog,
     )
-    from PySide6.QtCore import Qt, Signal, QSize
+    from PySide6.QtCore import Qt, Signal, QSize, QEventLoop
     from PySide6.QtGui import QColor, QFont, QTextCursor
     from shiboken6 import wrapInstance, isValid as _shiboken_isValid
 except ImportError:
@@ -44,7 +44,7 @@ except ImportError:
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
         QColorDialog, QSizePolicy, QFrame, QApplication, QInputDialog,
     )
-    from PySide2.QtCore import Qt, Signal, QSize
+    from PySide2.QtCore import Qt, Signal, QSize, QEventLoop
     from PySide2.QtGui import QColor, QFont, QTextCursor
     from shiboken2 import wrapInstance, isValid as _shiboken_isValid
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-3"
+TOOL_VERSION = "v19_beta-4"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -69,7 +69,7 @@ LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 # in the UI -- retune them here, not in the tool.
 WITNESS_FOCAL_LENGTH = 35.0        # mm
 WITNESS_FILM_APERTURE = (1.417, 0.945)   # inches, Maya defaults
-WITNESS_ICON_SCALE_FRAC = 0.05     # tracked-camera icon locatorScale as a
+WITNESS_ICON_SCALE_FRAC = 0.03     # tracked-camera icon locatorScale as a
                                    # fraction of the witness standoff, so the
                                    # icon reads at distance in a big scene but
                                    # stays small in a small one
@@ -803,6 +803,15 @@ class Exporter(object):
         Returns:
             str or None: Absolute path to ffmpeg if found.
         """
+        cached = getattr(Exporter, "_ffmpeg_path_cache", "unset")
+        if cached != "unset":
+            return cached
+        result = Exporter._find_ffmpeg_uncached()
+        Exporter._ffmpeg_path_cache = result
+        return result
+
+    @staticmethod
+    def _find_ffmpeg_uncached():
         if sys.platform == "win32":
             rel = os.path.join("bin", "win", "ffmpeg.exe")
         elif sys.platform == "darwin":
@@ -837,6 +846,11 @@ class Exporter(object):
         ffmpeg_path = Exporter._find_ffmpeg()
         if not ffmpeg_path:
             return False
+        cache = getattr(Exporter, "_drawtext_cache", None)
+        if cache is None:
+            cache = Exporter._drawtext_cache = {}
+        if ffmpeg_path in cache:
+            return cache[ffmpeg_path]
         try:
             result = subprocess.run(
                 [ffmpeg_path, "-hide_banner", "-filters"],
@@ -847,12 +861,26 @@ class Exporter(object):
                 creationflags=getattr(
                     subprocess, "CREATE_NO_WINDOW", 0),
             )
-            return "drawtext" in result.stdout
+            cache[ffmpeg_path] = "drawtext" in result.stdout
         except Exception:
-            return False
+            cache[ffmpeg_path] = False
+        return cache[ffmpeg_path]
 
     @staticmethod
-    def _run_ffmpeg(cmd, filter_complex=None, log_prefix="ffmpeg"):
+    def _encode_timeout(n_frames):
+        """Timeout (s) for an encode of *n_frames* frames.
+
+        A flat 600 s killed legitimate long 4K encodes; scale with
+        the sequence length instead.
+        """
+        try:
+            return max(600, int(n_frames) * 2)
+        except Exception:
+            return 600
+
+    @staticmethod
+    def _run_ffmpeg(cmd, filter_complex=None, log_prefix="ffmpeg",
+                    timeout=600):
         """Run an ffmpeg command with a filter_complex graph.
 
         On Windows, writes the filter to a temp script file and
@@ -898,7 +926,7 @@ class Exporter(object):
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=timeout,
                 creationflags=getattr(
                     subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -920,8 +948,11 @@ class Exporter(object):
         files.  Returns None on failure.
         """
         try:
+            # 64 KB covers EXR headers with large channel lists /
+            # metadata; a 1 KB read silently missed dataWindow on
+            # multi-channel production plates.
             with open(file_path, 'rb') as f:
-                header = f.read(1024)
+                header = f.read(65536)
             if len(header) < 8:
                 return None
 
@@ -1052,14 +1083,26 @@ class Exporter(object):
                     img_path = img_path.strip()
                     if not img_path:
                         continue
+                    # The glob + header read below can be slow on
+                    # network plate dirs; cache per source path.
+                    cache = getattr(
+                        Exporter, "_plate_res_cache", None)
+                    if cache is None:
+                        cache = Exporter._plate_res_cache = {}
+                    if img_path in cache:
+                        if cache[img_path]:
+                            return cache[img_path]
+                        continue
                     # Resolve frame tokens (e.g. image.####.exr)
                     # to find an actual file on disk.
                     resolved = Exporter._resolve_image_sequence_path(
                         img_path)
+                    res = None
                     if resolved and os.path.isfile(resolved):
                         res = Exporter._get_image_resolution(resolved)
-                        if res:
-                            return res
+                    cache[img_path] = res
+                    if res:
+                        return res
                 except Exception:
                     pass
         return default
@@ -1082,8 +1125,8 @@ class Exporter(object):
             resolved = re.sub(r'<[fF]\d*>', '*', resolved)
         if '*' not in resolved:
             return img_path  # already a concrete path
-        matches = sorted(_glob.glob(resolved))
-        return matches[0] if matches else None
+        matches = _glob.glob(resolved)
+        return min(matches) if matches else None
 
     @staticmethod
     def _find_hud_font():
@@ -1223,15 +1266,34 @@ class Exporter(object):
         # Each run is (focal_length, first_index, last_index) where the
         # indices are 0-based offsets into the rendered frames, matching
         # ffmpeg's frame counter `n`.
-        runs = []
-        rounded = [round(f, 1) for f in (focal_lengths or [])]
-        i = 0
-        while i < len(rounded):
-            j = i
-            while j + 1 < len(rounded) and rounded[j + 1] == rounded[i]:
-                j += 1
-            runs.append((rounded[i], i, j))
-            i = j + 1
+        # ffmpeg initializes every drawtext instance and pushes each
+        # frame through the whole chain, so a continuous zoom (one run
+        # per frame) makes encode cost O(frames x runs) and can blow
+        # the filtergraph size.  Coarsen precision, then bucket, to
+        # keep the run count bounded.
+        max_runs = 60
+
+        def group_runs(values):
+            out = []
+            i = 0
+            while i < len(values):
+                j = i
+                while j + 1 < len(values) and values[j + 1] == values[i]:
+                    j += 1
+                out.append((values[i], i, j))
+                i = j + 1
+            return out
+
+        fl = list(focal_lengths or [])
+        runs = group_runs([round(f, 1) for f in fl])
+        if len(runs) > max_runs:
+            runs = group_runs([float(round(f)) for f in fl])
+        if len(runs) > max_runs:
+            seg = -(-len(fl) // max_runs)  # ceil division
+            runs = [
+                (round(fl[s], 1), s, min(s + seg, len(fl)) - 1)
+                for s in range(0, len(fl), seg)
+            ]
         if not runs:
             runs = [(None, None, None)]
 
@@ -1295,6 +1357,10 @@ class Exporter(object):
         fps = self._get_fps()
         seq_pattern = os.path.join(
             png_dir, "{}.%04d.png".format(png_base))
+        import glob as _glob
+        n_frames = len(_glob.glob(os.path.join(
+            png_dir, "{}.*.png".format(png_base))))
+        timeout = self._encode_timeout(n_frames)
 
         cmd = [
             ffmpeg_path,
@@ -1351,7 +1417,7 @@ class Exporter(object):
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
-                        timeout=600,
+                        timeout=timeout,
                         creationflags=getattr(
                             subprocess,
                             "CREATE_NO_WINDOW", 0),
@@ -1372,7 +1438,7 @@ class Exporter(object):
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=600,
+                    timeout=timeout,
                     creationflags=getattr(
                         subprocess,
                         "CREATE_NO_WINDOW", 0),
@@ -1581,9 +1647,13 @@ class Exporter(object):
 
         self._trace("Compositing passes...")
         try:
+            import glob as _glob
+            n_frames = len(_glob.glob(os.path.join(
+                plate_dir, "{}.*.png".format(plate_base))))
             result = self._run_ffmpeg(
                 cmd, filter_complex=filter_complex,
-                log_prefix="ffmpeg composite")
+                log_prefix="ffmpeg composite",
+                timeout=self._encode_timeout(n_frames))
             if result.returncode != 0:
                 sys.stderr.write(
                     "ffmpeg composite failed (exit {}):\n{}\n".format(
@@ -1657,7 +1727,7 @@ class Exporter(object):
                 or node_long[0].startswith(ancestor_long[0] + "|"))
 
     @staticmethod
-    def _is_in_hidden_display_layer(node):
+    def _is_in_hidden_display_layer(node, _hidden_members=None):
         """Return True if *node* belongs to a display layer whose
         visibility is turned off.  Checks the node itself and all
         ancestors so that a hidden parent group also hides children.
@@ -1667,28 +1737,44 @@ class Exporter(object):
         long_names = cmds.ls(node, long=True)
         if not long_names:
             return False
-        parts = long_names[0].lstrip("|").split("|")
-        # Walk from root to leaf, checking each ancestor
-        path = ""
-        for part in parts:
-            path = path + "|" + part
-            conns = cmds.listConnections(
-                path + ".drawOverride", type="displayLayer") or []
-            for layer in conns:
-                if layer == "defaultLayer":
-                    continue
-                try:
-                    if not cmds.getAttr(layer + ".visibility"):
-                        return True
-                except Exception:
-                    pass
+        if _hidden_members is None:
+            _hidden_members = Exporter._hidden_layer_members()
+        ln = long_names[0]
+        for member in _hidden_members:
+            if ln == member or ln.startswith(member + "|"):
+                return True
         return False
+
+    @staticmethod
+    def _hidden_layer_members():
+        """Long paths of all members of hidden display layers.
+
+        One pass over the scene's display layers, so callers can
+        test many nodes by prefix match instead of issuing
+        per-ancestor listConnections queries per node.
+        """
+        hidden = []
+        for layer in cmds.ls(type="displayLayer") or []:
+            if layer == "defaultLayer":
+                continue
+            try:
+                if cmds.getAttr(layer + ".visibility"):
+                    continue
+            except Exception:
+                continue
+            members = cmds.editDisplayLayerMembers(
+                layer, query=True, fullNames=True) or []
+            hidden.extend(members)
+        return hidden
 
     @staticmethod
     def _filter_hidden_layers(nodes):
         """Remove nodes that belong to a hidden display layer."""
+        hidden = Exporter._hidden_layer_members()
+        if not hidden:
+            return list(nodes)
         return [n for n in nodes
-                if not Exporter._is_in_hidden_display_layer(n)]
+                if not Exporter._is_in_hidden_display_layer(n, hidden)]
 
     def _delete_thirdparty_plugin_nodes(self):
         """Delete all scene nodes registered by third-party plugins.
@@ -1729,31 +1815,45 @@ class Exporter(object):
                 continue
             node_types = cmds.pluginInfo(
                 plugin, query=True, dependNode=True) or []
-            for nt in node_types:
-                nodes = cmds.ls(type=nt) or []
-                for node in nodes:
-                    if cmds.objExists(node):
-                        try:
-                            cmds.lockNode(node, lock=False)
-                            cmds.delete(node)
-                        except Exception:
-                            pass
+            if not node_types:
+                continue
+            try:
+                nodes = cmds.ls(type=node_types) or []
+            except Exception:
+                nodes = []
+                for nt in node_types:
+                    nodes.extend(cmds.ls(type=nt) or [])
+            self._batch_unlock_delete(nodes)
 
         # Catch nodes whose plugin is not loaded (shows as unknown).
-        for nt in ("unknown", "unknownDag"):
-            for node in cmds.ls(type=nt) or []:
-                if cmds.objExists(node):
-                    try:
-                        cmds.lockNode(node, lock=False)
-                        cmds.delete(node)
-                    except Exception:
-                        pass
+        self._batch_unlock_delete(
+            cmds.ls(type=("unknown", "unknownDag")) or [])
 
         # Sweep orphaned shading networks / utility nodes.
         try:
             mel.eval("MLdeleteUnused")
         except Exception:
             pass
+
+    @staticmethod
+    def _batch_unlock_delete(nodes):
+        """Unlock and delete nodes in one batched call, falling back
+        to per-node deletion if the batch fails (e.g. a node that
+        vanished when a dependent was deleted)."""
+        nodes = [n for n in nodes if cmds.objExists(n)]
+        if not nodes:
+            return
+        try:
+            cmds.lockNode(nodes, lock=False)
+            cmds.delete(nodes)
+        except Exception:
+            for node in nodes:
+                if cmds.objExists(node):
+                    try:
+                        cmds.lockNode(node, lock=False)
+                        cmds.delete(node)
+                    except Exception:
+                        pass
 
     @staticmethod
     def _is_locator_only_subtree(node):
@@ -1834,6 +1934,8 @@ class Exporter(object):
             end_frame: If provided, the exported .ma file's playback
                 range is set to this end frame (then restored).
         """
+        orig_min = orig_max = orig_ast = orig_aet = None
+        _ma_cleanup_done = False
         try:
             geo_roots = geo_roots or []
             rig_roots = rig_roots or []
@@ -1861,7 +1963,6 @@ class Exporter(object):
 
             # Temporarily set the scene's playback range so the
             # exported .ma stores the correct frame range.
-            orig_min = orig_max = orig_ast = orig_aet = None
             if start_frame is not None and end_frame is not None:
                 orig_min = cmds.playbackOptions(
                     query=True, minTime=True)
@@ -1892,15 +1993,30 @@ class Exporter(object):
                         node, allDescendents=True,
                         type="mesh", fullPath=True) or []
                     all_meshes.extend(descendants)
+            meshes_to_swap = []
             for mesh in all_meshes:
                 try:
                     sgs = cmds.listConnections(
                         mesh, type="shadingEngine") or []
                     if sgs and sgs[0] != "initialShadingGroup":
-                        cmds.sets(mesh, edit=True,
-                                  forceElement="initialShadingGroup")
+                        meshes_to_swap.append(mesh)
                 except Exception:
                     pass
+            # One batched set edit instead of per-mesh edits (each
+            # edit dirties the shading graph and is replayed by the
+            # closing undo).
+            if meshes_to_swap:
+                try:
+                    cmds.sets(meshes_to_swap, edit=True,
+                              forceElement="initialShadingGroup")
+                except Exception:
+                    for mesh in meshes_to_swap:
+                        try:
+                            cmds.sets(
+                                mesh, edit=True,
+                                forceElement="initialShadingGroup")
+                        except Exception:
+                            pass
 
             # Set image plane coverage and Maya render resolution to
             # match the actual source image dimensions.
@@ -1954,38 +2070,40 @@ class Exporter(object):
                 type="string")
             sel.append(info_grp)
 
-            try:
-                cmds.select(sel, replace=True)
-                cmds.file(
-                    file_path,
-                    exportSelected=True,
-                    type="mayaAscii",
-                    force=True,
-                    preserveReferences=False,
-                    channels=True,
-                    expressions=True,
-                    constraints=True,
-                    constructionHistory=True,
-                )
-            finally:
-                # Restore original playback range
-                if orig_min is not None:
-                    cmds.playbackOptions(
-                        minTime=orig_min, maxTime=orig_max,
-                        animationStartTime=orig_ast,
-                        animationEndTime=orig_aet)
-                # Undo all pre-export scene modifications (shader
-                # swap, unknown-node cleanup, metadata group).
-                if _ma_cleanup_done:
-                    try:
-                        cmds.undoInfo(closeChunk=True)
-                        cmds.undo()
-                    except Exception:
-                        pass
+            cmds.select(sel, replace=True)
+            cmds.file(
+                file_path,
+                exportSelected=True,
+                type="mayaAscii",
+                force=True,
+                preserveReferences=False,
+                channels=True,
+                expressions=True,
+                constraints=True,
+                constructionHistory=True,
+            )
             return True
         except Exception as e:
             self._log_error("MA", e)
             return False
+        finally:
+            # Runs on success AND on exceptions raised anywhere after
+            # the playback range / undo chunk were set up, so a
+            # mid-setup failure can no longer leave the chunk open or
+            # the playback range unrestored.
+            if orig_min is not None:
+                cmds.playbackOptions(
+                    minTime=orig_min, maxTime=orig_max,
+                    animationStartTime=orig_ast,
+                    animationEndTime=orig_aet)
+            # Undo all pre-export scene modifications (shader
+            # swap, unknown-node cleanup, metadata group).
+            if _ma_cleanup_done:
+                try:
+                    cmds.undoInfo(closeChunk=True)
+                    cmds.undo()
+                except Exception:
+                    pass
 
     @staticmethod
     def _create_metadata_grp():
@@ -2045,11 +2163,17 @@ class Exporter(object):
                 pass
 
         con = cmds.parentConstraint(camera, dup, maintainOffset=False)
-        cmds.bakeResults(
-            dup, t=(int(start_frame), int(end_frame)),
-            at=["tx", "ty", "tz", "rx", "ry", "rz"],
-            simulation=True, preserveOutsideKeys=False,
-            minimizeRotation=True)
+        # Suspend viewport redraws: simulation=True steps every frame
+        # and would otherwise redraw the whole viewport per frame.
+        cmds.refresh(suspend=True)
+        try:
+            cmds.bakeResults(
+                dup, t=(int(start_frame), int(end_frame)),
+                at=["tx", "ty", "tz", "rx", "ry", "rz"],
+                simulation=True, preserveOutsideKeys=False,
+                minimizeRotation=True)
+        finally:
+            cmds.refresh(suspend=False)
         try:
             cmds.delete(con)
         except Exception:
@@ -2119,27 +2243,39 @@ class Exporter(object):
             for s in sel:
                 if s:
                     sel_long.update(cmds.ls(s, long=True) or [])
+            seen_skinclusters = set()
+            inf_root_cache = {}
+            joints_long = None
             for geo_root in geo_roots:
                 if not geo_root or not cmds.objExists(geo_root):
                     continue
-                descendants = cmds.listRelatives(
-                    geo_root, allDescendents=True, type="transform",
+                # Find mesh-bearing transforms directly from the
+                # descendant mesh shapes instead of probing every
+                # transform for shapes.
+                mesh_shapes = cmds.listRelatives(
+                    geo_root, allDescendents=True, type="mesh",
                     fullPath=True
                 ) or []
-                geo_long = (cmds.ls(geo_root, long=True)
-                            or [geo_root])
-                for desc in geo_long + descendants:
-                    shapes = cmds.listRelatives(
-                        desc, shapes=True, type="mesh",
-                        fullPath=True
-                    ) or []
-                    if not shapes:
-                        continue
+                mesh_xforms = []
+                seen_xforms = set()
+                for shp in mesh_shapes:
+                    xf = shp.rsplit("|", 1)[0]
+                    if xf and xf not in seen_xforms:
+                        seen_xforms.add(xf)
+                        mesh_xforms.append(xf)
+                for desc in mesh_xforms:
                     history = cmds.listHistory(
                         desc, pruneDagObjects=True) or []
-                    for h in history:
-                        if cmds.objectType(h) != "skinCluster":
+                    for h in cmds.ls(
+                            history, type="skinCluster") or []:
+                        # A skinCluster shared by several meshes only
+                        # needs processing once.
+                        if h in seen_skinclusters:
                             continue
+                        seen_skinclusters.add(h)
+                        if joints_long is None:
+                            joints_long = set(cmds.ls(
+                                type="joint", long=True) or [])
                         influences = cmds.skinCluster(
                             h, query=True, influence=True
                         ) or []
@@ -2148,21 +2284,25 @@ class Exporter(object):
                             p for i in influences
                             for p in (cmds.ls(i, long=True) or [i])]
                         for inf in influences:
-                            # Walk up to the topmost joint
-                            current = inf
-                            while True:
-                                parent = cmds.listRelatives(
-                                    current, parent=True,
-                                    fullPath=True
-                                )
-                                if (not parent
-                                        or cmds.objectType(
-                                            parent[0]) != "joint"):
-                                    break
-                                current = parent[0]
+                            # Walk up to the topmost joint.  Long
+                            # paths embed the ancestor chain, so test
+                            # path prefixes against the joint set
+                            # instead of per-step scene queries; all
+                            # influences of one skeleton resolve to
+                            # the same root, so memoize.
+                            current = inf_root_cache.get(inf)
+                            if current is None:
+                                current = inf
+                                parent_path = current.rsplit(
+                                    "|", 1)[0]
+                                while (parent_path
+                                       and parent_path in joints_long):
+                                    current = parent_path
+                                    parent_path = current.rsplit(
+                                        "|", 1)[0]
+                                inf_root_cache[inf] = current
                             # Check if already covered by selection
-                            long_inf = (cmds.ls(current, long=True)
-                                        or [current])[0]
+                            long_inf = current
                             covered = any(
                                 long_inf.startswith(s + "|")
                                 or long_inf == s
@@ -2449,7 +2589,26 @@ class Exporter(object):
 
     # --- USD Export ---
 
-    def _bypass_postskin_blendshapes(self, root_nodes):
+    @staticmethod
+    def _meshes_under(root_nodes):
+        """Deduplicated descendant mesh shapes (long paths) of
+        *root_nodes*.  Computed once per export and shared by the
+        USD pre-step helpers, which previously each ran their own
+        full-descendant sweep over the same roots."""
+        meshes = []
+        seen = set()
+        for root in root_nodes or []:
+            if not root or not cmds.objExists(root):
+                continue
+            for shp in cmds.listRelatives(
+                    root, allDescendents=True, type="mesh",
+                    fullPath=True) or []:
+                if shp not in seen:
+                    seen.add(shp)
+                    meshes.append(shp)
+        return meshes
+
+    def _bypass_postskin_blendshapes(self, root_nodes, meshes=None):
         """Temporarily reroute meshes whose deformer chain ends with a
         blendShape downstream of a skinCluster.
 
@@ -2468,43 +2627,35 @@ class Exporter(object):
         tuples describing each rerouting performed.
         """
         bypassed = []
-        seen = set()
-        for root in root_nodes or []:
-            if not root or not cmds.objExists(root):
+        if meshes is None:
+            meshes = self._meshes_under(root_nodes)
+        for shp in meshes:
+            bs_src = cmds.listConnections(
+                shp + ".inMesh", source=True, destination=False,
+                plugs=True, type="blendShape") or []
+            if not bs_src:
                 continue
-            meshes = cmds.listRelatives(
-                root, allDescendents=True, type="mesh",
-                fullPath=True) or []
-            for shp in meshes:
-                if shp in seen:
-                    continue
-                seen.add(shp)
-                bs_src = cmds.listConnections(
-                    shp + ".inMesh", source=True, destination=False,
-                    plugs=True, type="blendShape") or []
-                if not bs_src:
-                    continue
-                bs_plug = bs_src[0]
-                bs_node = bs_plug.split(".")[0]
-                sc_src = cmds.listConnections(
-                    bs_node + ".input[0].inputGeometry",
-                    source=True, destination=False,
-                    plugs=True, type="skinCluster") or []
-                if not sc_src:
-                    continue
-                sc_plug = sc_src[0]
-                try:
-                    cmds.disconnectAttr(bs_plug, shp + ".inMesh")
-                    cmds.connectAttr(
-                        sc_plug, shp + ".inMesh", force=True)
-                    bypassed.append((shp, bs_plug, sc_plug))
-                    sys.stderr.write(
-                        LOG_PREFIX + " USD bypass post-skin "
-                        "blendShape on {}\n".format(shp))
-                except Exception as e:
-                    sys.stderr.write(
-                        LOG_PREFIX + " USD bypass failed on "
-                        "{}: {}\n".format(shp, e))
+            bs_plug = bs_src[0]
+            bs_node = bs_plug.split(".")[0]
+            sc_src = cmds.listConnections(
+                bs_node + ".input[0].inputGeometry",
+                source=True, destination=False,
+                plugs=True, type="skinCluster") or []
+            if not sc_src:
+                continue
+            sc_plug = sc_src[0]
+            try:
+                cmds.disconnectAttr(bs_plug, shp + ".inMesh")
+                cmds.connectAttr(
+                    sc_plug, shp + ".inMesh", force=True)
+                bypassed.append((shp, bs_plug, sc_plug))
+                sys.stderr.write(
+                    LOG_PREFIX + " USD bypass post-skin "
+                    "blendShape on {}\n".format(shp))
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " USD bypass failed on "
+                    "{}: {}\n".format(shp, e))
         return bypassed
 
     def _restore_postskin_blendshapes(self, bypassed):
@@ -2521,7 +2672,8 @@ class Exporter(object):
                     LOG_PREFIX + " USD restore failed on "
                     "{}: {}\n".format(shp, e))
 
-    def _plug_is_effectively_static(self, plug, _seen=None, _depth=0):
+    def _plug_is_effectively_static(self, plug, _seen=None, _depth=0,
+                                    _cache=None):
         """True if *plug*'s value cannot vary over the frame range:
         either no incoming connection (a plain static value), or an
         upstream driver chain containing no animation / time-dependent
@@ -2535,6 +2687,12 @@ class Exporter(object):
         chain lets the freeze path recognise it as the always-on
         correction it is.
         """
+        # _cache memoizes final verdicts across sibling weight plugs
+        # of one blendShape -- their upstream driver chains are
+        # typically shared, so without it the same rig-control
+        # network is re-walked per weight.
+        if _cache is not None and plug in _cache:
+            return _cache[plug]
         if _seen is None:
             _seen = set()
         if plug in _seen:
@@ -2545,19 +2703,22 @@ class Exporter(object):
         srcs = cmds.listConnections(
             plug, source=True, destination=False, plugs=True,
             skipConversionNodes=True) or []
-        if not srcs:
-            return True
+        result = True
         for sp in srcs:
             ntype = cmds.nodeType(sp.split(".")[0])
             if (ntype.startswith("animCurve")
                     or ntype in ("expression", "time", "motionPath",
                                  "pairBlend", "clip", "clipLibrary",
                                  "character")):
-                return False
+                result = False
+                break
             if not self._plug_is_effectively_static(
-                    sp, _seen, _depth + 1):
-                return False
-        return True
+                    sp, _seen, _depth + 1, _cache):
+                result = False
+                break
+        if _cache is not None:
+            _cache[plug] = result
+        return result
 
     def _blendshape_is_static_on(self, bs):
         """True if every weight that drives blendShape *bs* resolves to
@@ -2572,8 +2733,9 @@ class Exporter(object):
         test and is left for the live UsdSkel blendShape path.
         """
         try:
+            cache = {}
             env = bs + ".envelope"
-            if not self._plug_is_effectively_static(env):
+            if not self._plug_is_effectively_static(env, _cache=cache):
                 return False
             if abs(cmds.getAttr(env)) <= 1e-6:
                 return False
@@ -2584,7 +2746,8 @@ class Exporter(object):
             any_nonzero = False
             for i in idxs:
                 wp = "{}.weight[{}]".format(bs, i)
-                if not self._plug_is_effectively_static(wp):
+                if not self._plug_is_effectively_static(
+                        wp, _cache=cache):
                     return False
                 if abs(cmds.getAttr(wp)) > 1e-6:
                     any_nonzero = True
@@ -2592,7 +2755,7 @@ class Exporter(object):
         except Exception:
             return False
 
-    def _bake_static_preskin_blendshapes(self, root_nodes):
+    def _bake_static_preskin_blendshapes(self, root_nodes, meshes=None):
         """Freeze always-on blendshapes that sit *upstream* of a
         skinCluster into the skin's input geometry, for the duration of
         the export.
@@ -2623,104 +2786,97 @@ class Exporter(object):
         """
         baked = []
         seen_bs = set()
-        for root in root_nodes or []:
-            if not root or not cmds.objExists(root):
+        if meshes is None:
+            meshes = self._meshes_under(root_nodes)
+        for shp in meshes:
+            try:
+                if cmds.getAttr(shp + ".intermediateObject"):
+                    continue
+            except Exception:
                 continue
-            meshes = cmds.listRelatives(
-                root, allDescendents=True, type="mesh",
-                fullPath=True) or []
-            for shp in meshes:
+            hist = cmds.listHistory(shp) or []
+            skins = cmds.ls(hist, type="skinCluster") or []
+            if not skins:
+                continue
+            sc = skins[0]
+            sc_hist = cmds.listHistory(sc) or []
+            for bs in cmds.ls(sc_hist, type="blendShape") or []:
+                if bs in seen_bs:
+                    continue
+                seen_bs.add(bs)
+                if not self._blendshape_is_static_on(bs):
+                    continue
+                conns = cmds.listConnections(
+                    bs + ".outputGeometry", source=False,
+                    destination=True, plugs=True,
+                    connections=True) or []
+                # connections=True -> [srcPlug, dstPlug, ...]
+                pairs = [(conns[k], conns[k + 1])
+                         for k in range(0, len(conns), 2)]
+                if len(pairs) != 1:
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD bake skipped "
+                        "(ambiguous outputs) on {}\n".format(bs))
+                    continue
+                src_plug, dst_plug = pairs[0]
+                frozen = None
+                sc_env = None
+                sc_env_prev = None
                 try:
-                    if cmds.getAttr(shp + ".intermediateObject"):
-                        continue
-                except Exception:
-                    continue
-                hist = cmds.listHistory(shp) or []
-                skins = [h for h in hist
-                         if cmds.objectType(h) == "skinCluster"]
-                if not skins:
-                    continue
-                sc = skins[0]
-                sc_hist = cmds.listHistory(sc) or []
-                for bs in sc_hist:
-                    if cmds.objectType(bs) != "blendShape":
-                        continue
-                    if bs in seen_bs:
-                        continue
-                    seen_bs.add(bs)
-                    if not self._blendshape_is_static_on(bs):
-                        continue
-                    conns = cmds.listConnections(
-                        bs + ".outputGeometry", source=False,
-                        destination=True, plugs=True,
-                        connections=True) or []
-                    # connections=True -> [srcPlug, dstPlug, ...]
-                    pairs = [(conns[k], conns[k + 1])
-                             for k in range(0, len(conns), 2)]
-                    if len(pairs) != 1:
-                        sys.stderr.write(
-                            LOG_PREFIX + " USD bake skipped "
-                            "(ambiguous outputs) on {}\n".format(bs))
-                        continue
-                    src_plug, dst_plug = pairs[0]
-                    frozen = None
+                    shp_xform = cmds.listRelatives(
+                        shp, parent=True, fullPath=True)[0]
+                    # Snapshot the morphed-but-not-skinned shape by
+                    # the proven freeze idiom (see export_obj):
+                    # zero the skinCluster so the live shape shows
+                    # exactly the blendShape output, duplicate the
+                    # transform, then delete construction history
+                    # to bake the current points into a plain
+                    # static mesh.  This is reliable across Maya
+                    # versions, unlike duplicating a mesh fed only
+                    # by a live .inMesh connection.
+                    sc_env = sc + ".envelope"
+                    sc_env_prev = cmds.getAttr(sc_env)
+                    cmds.setAttr(sc_env, 0)
+                    cmds.refresh(force=True)
+                    frozen = cmds.duplicate(
+                        shp_xform, name="_eg_bsbaked#",
+                        returnRootsOnly=True)[0]
+                    cmds.setAttr(sc_env, sc_env_prev)
                     sc_env = None
-                    sc_env_prev = None
+                    # Strip the duplicated deformer chain -> a
+                    # static mesh holding the morphed base.
+                    cmds.delete(frozen, constructionHistory=True)
                     try:
-                        shp_xform = cmds.listRelatives(
-                            shp, parent=True, fullPath=True)[0]
-                        # Snapshot the morphed-but-not-skinned shape by
-                        # the proven freeze idiom (see export_obj):
-                        # zero the skinCluster so the live shape shows
-                        # exactly the blendShape output, duplicate the
-                        # transform, then delete construction history
-                        # to bake the current points into a plain
-                        # static mesh.  This is reliable across Maya
-                        # versions, unlike duplicating a mesh fed only
-                        # by a live .inMesh connection.
-                        sc_env = sc + ".envelope"
-                        sc_env_prev = cmds.getAttr(sc_env)
-                        cmds.setAttr(sc_env, 0)
-                        cmds.refresh(force=True)
-                        frozen = cmds.duplicate(
-                            shp_xform, name="_eg_bsbaked#",
-                            returnRootsOnly=True)[0]
-                        cmds.setAttr(sc_env, sc_env_prev)
-                        sc_env = None
-                        # Strip the duplicated deformer chain -> a
-                        # static mesh holding the morphed base.
-                        cmds.delete(frozen, constructionHistory=True)
-                        try:
-                            cmds.parent(frozen, world=True)
-                        except Exception:
-                            pass
-                        frozen_s = cmds.listRelatives(
-                            frozen, shapes=True, noIntermediate=True,
-                            fullPath=True)[0]
-                        cmds.disconnectAttr(src_plug, dst_plug)
-                        cmds.connectAttr(
-                            frozen_s + ".outMesh", dst_plug,
-                            force=True)
-                        baked.append(
-                            (frozen, frozen_s, src_plug, dst_plug))
-                        sys.stderr.write(
-                            LOG_PREFIX + " USD bake static pre-skin "
-                            "blendShape {}\n".format(bs))
-                    except Exception as e:
-                        sys.stderr.write(
-                            LOG_PREFIX + " USD bake failed on "
-                            "{}: {}\n".format(bs, e))
-                        try:
-                            if sc_env is not None \
-                                    and sc_env_prev is not None:
-                                cmds.setAttr(sc_env, sc_env_prev)
-                        except Exception:
-                            pass
-                        try:
-                            if frozen and cmds.objExists(frozen):
-                                cmds.delete(frozen)
-                        except Exception:
-                            pass
+                        cmds.parent(frozen, world=True)
+                    except Exception:
+                        pass
+                    frozen_s = cmds.listRelatives(
+                        frozen, shapes=True, noIntermediate=True,
+                        fullPath=True)[0]
+                    cmds.disconnectAttr(src_plug, dst_plug)
+                    cmds.connectAttr(
+                        frozen_s + ".outMesh", dst_plug,
+                        force=True)
+                    baked.append(
+                        (frozen, frozen_s, src_plug, dst_plug))
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD bake static pre-skin "
+                        "blendShape {}\n".format(bs))
+                except Exception as e:
+                    sys.stderr.write(
+                        LOG_PREFIX + " USD bake failed on "
+                        "{}: {}\n".format(bs, e))
+                    try:
+                        if sc_env is not None \
+                                and sc_env_prev is not None:
+                            cmds.setAttr(sc_env, sc_env_prev)
+                    except Exception:
+                        pass
+                    try:
+                        if frozen and cmds.objExists(frozen):
+                            cmds.delete(frozen)
+                    except Exception:
+                        pass
         return baked
 
     def _restore_baked_preskin_blendshapes(self, baked):
@@ -2753,12 +2909,9 @@ class Exporter(object):
                 shp, pruneDagObjects=True, interestLevel=2) or []
         except Exception:
             hist = cmds.listHistory(shp) or []
-        for h in hist:
-            if cmds.objectType(h) in ("skinCluster", "blendShape"):
-                return True
-        return False
+        return bool(cmds.ls(hist, type=("skinCluster", "blendShape")))
 
-    def _disable_deforming_mesh_normals(self, root_nodes):
+    def _disable_deforming_mesh_normals(self, root_nodes, meshes=None):
         """Stop mayaUSDExport from baking frozen normals on deforming
         meshes.
 
@@ -2786,40 +2939,32 @@ class Exporter(object):
         """
         ATTR = "USD_EmitNormals"
         saved = []
-        seen = set()
-        for root in root_nodes or []:
-            if not root or not cmds.objExists(root):
+        if meshes is None:
+            meshes = self._meshes_under(root_nodes)
+        for shp in meshes:
+            if cmds.getAttr(shp + ".intermediateObject"):
                 continue
-            meshes = cmds.listRelatives(
-                root, allDescendents=True, type="mesh",
-                fullPath=True) or []
-            for shp in meshes:
-                if shp in seen:
-                    continue
-                seen.add(shp)
-                if cmds.getAttr(shp + ".intermediateObject"):
-                    continue
-                if not self._is_deforming_mesh(shp):
-                    continue
-                attr = shp + "." + ATTR
-                try:
-                    existed = cmds.attributeQuery(
-                        ATTR, node=shp, exists=True)
-                    prev = cmds.getAttr(attr) if existed else None
-                    if not existed:
-                        cmds.addAttr(
-                            shp, longName=ATTR,
-                            attributeType="bool",
-                            minValue=0, maxValue=1)
-                    cmds.setAttr(attr, 0)
-                    saved.append((shp, existed, prev))
-                    sys.stderr.write(
-                        LOG_PREFIX + " USD suppress baked normals "
-                        "on deforming mesh {}\n".format(shp))
-                except Exception as e:
-                    sys.stderr.write(
-                        LOG_PREFIX + " USD normal-suppress failed "
-                        "on {}: {}\n".format(shp, e))
+            if not self._is_deforming_mesh(shp):
+                continue
+            attr = shp + "." + ATTR
+            try:
+                existed = cmds.attributeQuery(
+                    ATTR, node=shp, exists=True)
+                prev = cmds.getAttr(attr) if existed else None
+                if not existed:
+                    cmds.addAttr(
+                        shp, longName=ATTR,
+                        attributeType="bool",
+                        minValue=0, maxValue=1)
+                cmds.setAttr(attr, 0)
+                saved.append((shp, existed, prev))
+                sys.stderr.write(
+                    LOG_PREFIX + " USD suppress baked normals "
+                    "on deforming mesh {}\n".format(shp))
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " USD normal-suppress failed "
+                    "on {}: {}\n".format(shp, e))
         return saved
 
     def _restore_deforming_mesh_normals(self, saved):
@@ -2947,8 +3092,11 @@ class Exporter(object):
             # represent post-skin blendshapes (v02 GenHuman rig's
             # body-morph F_BLN), and mayaUSDExport silently drops
             # topology when it sees that chain.
+            # One descendant-mesh sweep shared by all pre-steps below.
+            usd_meshes = self._meshes_under(select_nodes)
+
             bypassed_blendshapes = self._bypass_postskin_blendshapes(
-                select_nodes)
+                select_nodes, meshes=usd_meshes)
 
             # Bake always-on pre-skin blendshapes (e.g. the GenHuman
             # body-morph) into the skin's input geometry.  mayaUSDExport
@@ -2960,7 +3108,7 @@ class Exporter(object):
             # exporter see a plain skinned mesh whose rest pose already
             # carries the morph.  See _bake_static_preskin_blendshapes.
             baked_blendshapes = self._bake_static_preskin_blendshapes(
-                select_nodes)
+                select_nodes, meshes=usd_meshes)
 
             # Suppress baked normals on deforming meshes -- otherwise
             # the exporter freezes rest-pose faceVarying normals that
@@ -2968,22 +3116,15 @@ class Exporter(object):
             # shades as if locked in bind pose. See
             # _disable_deforming_mesh_normals.
             suppressed_normals = self._disable_deforming_mesh_normals(
-                select_nodes)
+                select_nodes, meshes=usd_meshes)
 
             # Only request blendshape export when there are
             # actual blendShape nodes in the selection  -- avoids
             # thousands of harmless but noisy USD plugin warnings.
             has_blendshapes = False
-            for node in select_nodes:
-                all_meshes = cmds.listRelatives(
-                    node, allDescendents=True,
-                    type="mesh", fullPath=True) or []
-                for m in all_meshes:
-                    if cmds.listConnections(
-                            m, type="blendShape"):
-                        has_blendshapes = True
-                        break
-                if has_blendshapes:
+            for m in usd_meshes:
+                if cmds.listConnections(m, type="blendShape"):
+                    has_blendshapes = True
                     break
 
             try:
@@ -3213,144 +3354,145 @@ class Exporter(object):
         frames = list(range(start, end + 1))
 
         original_time = cmds.currentTime(q=True)
-        # Strip namespace and DAG path for clean naming
-        short_name = src_xform.split("|")[-1].rsplit(":", 1)[-1]
-
-        self._trace("Creating blendshapes for '{}'  -- {} frames...".format(
-            short_name, len(frames)))
-
-        # Preserve hierarchy: parent base under same parent as source
-        src_parent = (cmds.listRelatives(
-            src_xform, parent=True, fullPath=True) or [None])[0]
-
-        # Create base mesh at start frame
-        cmds.currentTime(start, e=True)
-        base_name = self._unique_name(short_name + base_suffix)
-        base_mesh = cmds.duplicate(src_xform, rr=True, name=base_name)[0]
-        cmds.delete(base_mesh, ch=True)
-
-        # Re-parent only if the duplicate ended up under a different parent
-        if src_parent:
-            base_parent = (cmds.listRelatives(
-                base_mesh, parent=True, fullPath=True) or [None])[0]
-            if base_parent != src_parent:
-                try:
-                    cmds.parent(base_mesh, src_parent)
-                except Exception as exc:
-                    sys.stderr.write(
-                        LOG_PREFIX + " Could not parent base "
-                        "under {}: {}\n".format(
-                            src_parent, exc))
-
-        self._copy_rotate_order_and_pivots(src_xform, base_mesh)
-        self._bake_local_trs(src_xform, base_mesh, start, end)
-
-        # Create blendShape node on the base mesh
-        bs_name = self._unique_name(short_name + blendshape_suffix)
-        bs_node = cmds.blendShape(
-            base_mesh, name=bs_name, origin="local")[0]
-
-        # Targets group (hidden)
-        grp_name = self._unique_name(targets_group_name)
-        grp = cmds.group(em=True, name=grp_name)
+        # Viewport redraws add 50-300 ms per frame on heavy
+        # scenes; suspend them for the whole conversion (DG
+        # evaluation is unaffected).
+        cmds.refresh(suspend=True)
         try:
-            cmds.setAttr(grp + ".visibility", 0)
-        except Exception:
-            pass
+            # Strip namespace and DAG path for clean naming
+            short_name = src_xform.split("|")[-1].rsplit(":", 1)[-1]
 
-        # --- Pass 1: create all targets and add to blendShape ---
-        for i, f in enumerate(frames):
-            cmds.currentTime(f, e=True)
+            self._trace("Creating blendshapes for '{}'  -- {} frames...".format(
+                short_name, len(frames)))
 
-            tgt_name = self._unique_name(
-                "{}_f{:04d}".format(short_name, f))
-            tgt = cmds.duplicate(src_xform, rr=True, name=tgt_name)[0]
-            cmds.delete(tgt, ch=True)
+            # Preserve hierarchy: parent base under same parent as source
+            src_parent = (cmds.listRelatives(
+                src_xform, parent=True, fullPath=True) or [None])[0]
 
+            # Create base mesh at start frame
+            cmds.currentTime(start, e=True)
+            base_name = self._unique_name(short_name + base_suffix)
+            base_mesh = cmds.duplicate(src_xform, rr=True, name=base_name)[0]
+            cmds.delete(base_mesh, ch=True)
+
+            # Re-parent only if the duplicate ended up under a different parent
+            if src_parent:
+                base_parent = (cmds.listRelatives(
+                    base_mesh, parent=True, fullPath=True) or [None])[0]
+                if base_parent != src_parent:
+                    try:
+                        cmds.parent(base_mesh, src_parent)
+                    except Exception as exc:
+                        sys.stderr.write(
+                            LOG_PREFIX + " Could not parent base "
+                            "under {}: {}\n".format(
+                                src_parent, exc))
+
+            self._copy_rotate_order_and_pivots(src_xform, base_mesh)
+            self._bake_local_trs(src_xform, base_mesh, start, end)
+
+            # Create blendShape node on the base mesh
+            bs_name = self._unique_name(short_name + blendshape_suffix)
+            bs_node = cmds.blendShape(
+                base_mesh, name=bs_name, origin="local")[0]
+
+            # Targets group (hidden)
+            grp_name = self._unique_name(targets_group_name)
+            grp = cmds.group(em=True, name=grp_name)
             try:
-                cmds.parent(tgt, grp)
+                cmds.setAttr(grp + ".visibility", 0)
             except Exception:
                 pass
 
-            cmds.blendShape(
-                bs_node, e=True, t=(base_mesh, i, tgt, 1.0))
+            # --- Pass 1: create all targets and add to blendShape ---
+            for i, f in enumerate(frames):
+                cmds.currentTime(f, e=True)
 
-            if (i + 1) % 50 == 0 or (i + 1) == len(frames):
-                self._trace("  {}/{} targets created...".format(
-                    i + 1, len(frames)))
+                tgt_name = self._unique_name(
+                    "{}_f{:04d}".format(short_name, f))
+                tgt = cmds.duplicate(src_xform, rr=True, name=tgt_name)[0]
+                cmds.delete(tgt, ch=True)
 
-        # --- Pass 2: key all weights by index ---
-        # Use weight[i] indexing (guaranteed creation order) instead of
-        # alias names (which may be reordered or mangled by _unique_name
-        # collisions).
-        for i, f in enumerate(frames):
-            w = "{}.weight[{}]".format(bs_node, i)
-
-            try:
-                cmds.cutKey(w, clear=True)
-            except Exception:
-                pass
-
-            if f > start:
-                cmds.setKeyframe(w, t=f - 1, v=0.0)
-            cmds.setKeyframe(w, t=f, v=1.0)
-
-            # Step tangent on the peak key
-            try:
-                cmds.keyTangent(
-                    w, time=(f, f), itt="stepnext", ott="step")
-            except Exception:
-                pass
-
-            # Decay key at f+1 only if within the export range
-            if f < end:
-                cmds.setKeyframe(w, t=f + 1, v=0.0)
                 try:
-                    cmds.keyTangent(
-                        w, time=(f + 1, f + 1),
-                        itt="stepnext", ott="step")
+                    cmds.parent(tgt, grp)
                 except Exception:
                     pass
 
-        # Diagnostic: verify keyframes were set
-        keyed_count = 0
-        for i in range(len(frames)):
-            w = "{}.weight[{}]".format(bs_node, i)
-            kc = cmds.keyframe(w, query=True, keyframeCount=True) or 0
-            if kc > 0:
-                keyed_count += 1
-        self._trace("Keyed {}/{} blendshape weights on '{}'.".format(
-            keyed_count, len(frames), bs_node))
+                cmds.blendShape(
+                    bs_node, e=True, t=(base_mesh, i, tgt, 1.0))
 
-        # Delete target shapes and their group  -- the blendShape node
-        # stores deltas internally, so the physical targets are no
-        # longer needed.  Keeping them causes FBX InputConnections to
-        # pull them into the export as extra geometry (visible in
-        # other DCCs even though hidden in Maya).
-        if cmds.objExists(grp):
-            try:
-                cmds.delete(grp)
-            except Exception as exc:
-                sys.stderr.write(
-                    LOG_PREFIX + " WARNING: Could not delete targets "
-                    "group '{}': {}\n".format(grp, exc))
+                if (i + 1) % 50 == 0 or (i + 1) == len(frames):
+                    self._trace("  {}/{} targets created...".format(
+                        i + 1, len(frames)))
 
-        # Delete original Alembic source mesh  -- prevents the FBX
-        # exporter from including the original (still Alembic-driven)
-        # mesh via InputConnections (visual glitching / double geo).
-        if cmds.objExists(src_xform):
-            try:
-                cmds.delete(src_xform)
-            except Exception as exc:
-                sys.stderr.write(
-                    LOG_PREFIX + " WARNING: Could not delete source "
-                    "mesh '{}': {}\n".format(src_xform, exc))
+            # --- Pass 2: key all weights by index ---
+            # Use weight[i] indexing (guaranteed creation order) instead of
+            # alias names (which may be reordered or mangled by _unique_name
+            # collisions).
+            for i, f in enumerate(frames):
+                w = "{}.weight[{}]".format(bs_node, i)
 
-        self._trace("Prepared {} target(s) for FBX export.".format(
-            len(frames)))
+                if f > start:
+                    cmds.setKeyframe(w, t=f - 1, v=0.0)
+                cmds.setKeyframe(w, t=f, v=1.0)
 
-        # Restore original time
-        cmds.currentTime(original_time, e=True)
+                # Step tangent on the peak key
+                try:
+                    cmds.keyTangent(
+                        w, time=(f, f), itt="stepnext", ott="step")
+                except Exception:
+                    pass
+
+                # Decay key at f+1 only if within the export range
+                if f < end:
+                    cmds.setKeyframe(w, t=f + 1, v=0.0)
+                    try:
+                        cmds.keyTangent(
+                            w, time=(f + 1, f + 1),
+                            itt="stepnext", ott="step")
+                    except Exception:
+                        pass
+
+            # Diagnostic: verify keyframes were set
+            keyed_count = 0
+            for i in range(len(frames)):
+                w = "{}.weight[{}]".format(bs_node, i)
+                kc = cmds.keyframe(w, query=True, keyframeCount=True) or 0
+                if kc > 0:
+                    keyed_count += 1
+            self._trace("Keyed {}/{} blendshape weights on '{}'.".format(
+                keyed_count, len(frames), bs_node))
+
+            # Delete target shapes and their group  -- the blendShape node
+            # stores deltas internally, so the physical targets are no
+            # longer needed.  Keeping them causes FBX InputConnections to
+            # pull them into the export as extra geometry (visible in
+            # other DCCs even though hidden in Maya).
+            if cmds.objExists(grp):
+                try:
+                    cmds.delete(grp)
+                except Exception as exc:
+                    sys.stderr.write(
+                        LOG_PREFIX + " WARNING: Could not delete targets "
+                        "group '{}': {}\n".format(grp, exc))
+
+            # Delete original Alembic source mesh  -- prevents the FBX
+            # exporter from including the original (still Alembic-driven)
+            # mesh via InputConnections (visual glitching / double geo).
+            if cmds.objExists(src_xform):
+                try:
+                    cmds.delete(src_xform)
+                except Exception as exc:
+                    sys.stderr.write(
+                        LOG_PREFIX + " WARNING: Could not delete source "
+                        "mesh '{}': {}\n".format(src_xform, exc))
+
+            self._trace("Prepared {} target(s) for FBX export.".format(
+                len(frames)))
+        finally:
+            cmds.refresh(suspend=False)
+            # Restore original time
+            cmds.currentTime(original_time, e=True)
 
         self._trace("Blendshape conversion complete.")
         return {
@@ -3382,46 +3524,64 @@ class Exporter(object):
         return False
 
     @staticmethod
-    def _bake_transform_curves(transform, start, end):
-        """Bake TRS channels in-place on *transform* via cmds.bakeResults.
+    def _bake_transform_curves(transforms, start, end):
+        """Bake TRS channels in-place via one cmds.bakeResults call.
+
+        Accepts a single transform or a list of transforms.
+        simulation=True steps the whole timeline once per call, so
+        batching every node into one call collapses N full timeline
+        playthroughs into one.
 
         Replaces driving connections (expressions, constraints, anim layers)
-        with simple keyframe curves. Only bakes the individual transform,
-        not its parent or children.  After baking, any non-animCurve upstream
-        connections (e.g. AlembicNode) are explicitly disconnected so the FBX
-        exporter won't discover and re-export them.
+        with simple keyframe curves. Only bakes the individual transforms,
+        not their parents or children.  After baking, any non-animCurve
+        upstream connections (e.g. AlembicNode) are explicitly disconnected
+        so the FBX exporter won't discover and re-export them.
         """
+        if isinstance(transforms, str):
+            transforms = [transforms]
+        transforms = [t for t in transforms
+                      if t and cmds.objExists(t)]
+        if not transforms:
+            return
         trs = ["tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"]
-        for a in trs:
-            try:
-                cmds.setAttr("{}.{}".format(transform, a),
-                             lock=False, keyable=True, channelBox=True)
-            except Exception:
-                pass
-        cmds.bakeResults(
-            transform,
-            t=(int(start), int(end)),
-            at=trs,
-            simulation=True,
-            preserveOutsideKeys=True,
-        )
+        for transform in transforms:
+            for a in trs:
+                try:
+                    cmds.setAttr("{}.{}".format(transform, a),
+                                 lock=False, keyable=True,
+                                 channelBox=True)
+                except Exception:
+                    pass
+        cmds.refresh(suspend=True)
+        try:
+            cmds.bakeResults(
+                transforms,
+                t=(int(start), int(end)),
+                at=trs,
+                simulation=True,
+                preserveOutsideKeys=True,
+            )
+        finally:
+            cmds.refresh(suspend=False)
         # Disconnect any non-animCurve sources that survived the bake
         # (e.g. AlembicNode connections). Keeps animCurve connections
         # intact since those ARE the baked result.
-        for a in trs:
-            plug = "{}.{}".format(transform, a)
-            conns = cmds.listConnections(
-                plug, source=True, destination=False,
-                plugs=True, skipConversionNodes=True
-            ) or []
-            for src_plug in conns:
-                src_node = src_plug.split(".")[0]
-                if cmds.nodeType(src_node).startswith("animCurve"):
-                    continue
-                try:
-                    cmds.disconnectAttr(src_plug, plug)
-                except Exception:
-                    pass
+        for transform in transforms:
+            for a in trs:
+                plug = "{}.{}".format(transform, a)
+                conns = cmds.listConnections(
+                    plug, source=True, destination=False,
+                    plugs=True, skipConversionNodes=True
+                ) or []
+                for src_plug in conns:
+                    src_node = src_plug.split(".")[0]
+                    if cmds.nodeType(src_node).startswith("animCurve"):
+                        continue
+                    try:
+                        cmds.disconnectAttr(src_plug, plug)
+                    except Exception:
+                        pass
 
     def prep_for_ue5_fbx_export(self, geo_roots, rig_roots,
                                 start_frame, end_frame, camera=None,
@@ -3622,8 +3782,7 @@ class Exporter(object):
                 # Skip skinned meshes  -- they animate via skeleton
                 history = cmds.listHistory(
                     desc, pruneDagObjects=True) or []
-                if any(cmds.objectType(h) == "skinCluster"
-                       for h in history):
+                if cmds.ls(history, type="skinCluster"):
                     continue
                 nonskinned_meshes.append(desc)
 
@@ -3633,6 +3792,20 @@ class Exporter(object):
                 "transform(s)\n".format(len(nonskinned_meshes)))
 
             # --- PRE-BAKE DIAGNOSTICS ---
+            # Two timeline scrubs total (start + end) instead of two
+            # per mesh: sample all world positions in bulk, then log.
+            cmds.currentTime(int(start_frame), edit=True)
+            ws_at_start = {
+                cm: cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                for cm in nonskinned_meshes}
+            cmds.currentTime(int(end_frame), edit=True)
+            ws_at_end = {
+                cm: cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                for cm in nonskinned_meshes}
             for cm in nonskinned_meshes:
                 short = cm.split("|")[-1]
                 sys.stderr.write(
@@ -3644,21 +3817,13 @@ class Exporter(object):
                 sys.stderr.write(
                     LOG_PREFIX + "     parent: {}\n".format(
                         par[0] if par else "NONE"))
-                # World-space position at start frame
-                cmds.currentTime(int(start_frame), edit=True)
-                ws_a = cmds.xform(
-                    cm, query=True, worldSpace=True,
-                    translation=True)
+                ws_a = ws_at_start[cm]
                 sys.stderr.write(
                     LOG_PREFIX + "     world pos @ {}: "
                     "{:.3f} {:.3f} {:.3f}\n".format(
                         int(start_frame),
                         ws_a[0], ws_a[1], ws_a[2]))
-                # World-space position at end frame
-                cmds.currentTime(int(end_frame), edit=True)
-                ws_b = cmds.xform(
-                    cm, query=True, worldSpace=True,
-                    translation=True)
+                ws_b = ws_at_end[cm]
                 sys.stderr.write(
                     LOG_PREFIX + "     world pos @ {}: "
                     "{:.3f} {:.3f} {:.3f}\n".format(
@@ -3780,20 +3945,27 @@ class Exporter(object):
             sys.stderr.write(
                 LOG_PREFIX + "   Disconnected {} non-animCurve "
                 "source(s)\n".format(disconnected_count))
+            # Verify world pos still correct -- two scrubs total
+            # instead of two per mesh.
+            cmds.currentTime(int(start_frame), edit=True)
+            ws_at_start = {
+                cm: cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                for cm in nonskinned_meshes}
+            cmds.currentTime(int(end_frame), edit=True)
+            ws_at_end = {
+                cm: cmds.xform(
+                    cm, query=True, worldSpace=True,
+                    translation=True)
+                for cm in nonskinned_meshes}
             for cm in nonskinned_meshes:
                 short = cm.split("|")[-1]
                 sys.stderr.write(
                     LOG_PREFIX + "   DIAG '{}' POST-DISCONNECT"
                     ":\n".format(short))
-                # Verify world pos still correct
-                cmds.currentTime(int(start_frame), edit=True)
-                ws_a = cmds.xform(
-                    cm, query=True, worldSpace=True,
-                    translation=True)
-                cmds.currentTime(int(end_frame), edit=True)
-                ws_b = cmds.xform(
-                    cm, query=True, worldSpace=True,
-                    translation=True)
+                ws_a = ws_at_start[cm]
+                ws_b = ws_at_end[cm]
                 sys.stderr.write(
                     LOG_PREFIX + "     world pos @ {}: "
                     "{:.3f} {:.3f} {:.3f}\n".format(
@@ -3951,11 +4123,9 @@ class Exporter(object):
                         pass
 
         # --- Step 3: Check joint scale ---
+        cmds.currentTime(start_frame, edit=True)
         for jnt in all_joints:
-            cmds.currentTime(start_frame, edit=True)
-            sx = cmds.getAttr("{}.scaleX".format(jnt))
-            sy = cmds.getAttr("{}.scaleY".format(jnt))
-            sz = cmds.getAttr("{}.scaleZ".format(jnt))
+            sx, sy, sz = cmds.getAttr("{}.scale".format(jnt))[0]
             if not (abs(sx - 1.0) < 1e-4
                     and abs(sy - 1.0) < 1e-4
                     and abs(sz - 1.0) < 1e-4):
@@ -3978,11 +4148,13 @@ class Exporter(object):
                 root, allDescendents=True, type="transform",
                 fullPath=True
             ) or []
+            seen_mesh_xforms = set(all_mesh_xforms)
             for desc in [root] + descendants:
                 shapes = cmds.listRelatives(
                     desc, shapes=True, type="mesh", fullPath=True
                 ) or []
-                if shapes and desc not in all_mesh_xforms:
+                if shapes and desc not in seen_mesh_xforms:
+                    seen_mesh_xforms.add(desc)
                     all_mesh_xforms.append(desc)
 
         sys.stderr.write(
@@ -4116,14 +4288,22 @@ class Exporter(object):
         all_ns.sort(key=len, reverse=True)
 
         namespaces_stripped = 0
+        # References were force-imported at the top of this function,
+        # so the per-node referenced check can only hit if one of
+        # those imports failed.  Skip the (potentially 10k+ node)
+        # scan entirely when no reference nodes remain.
+        refs_left = [r for r in (cmds.ls(type="reference") or [])
+                     if r != "sharedReferenceNode"]
         for ns in all_ns:
             try:
-                ns_contents = cmds.namespaceInfo(
-                    ns, listNamespace=True
-                ) or []
                 has_referenced = False
-                for node in ns_contents:
-                    if cmds.objExists(node):
+                if refs_left:
+                    ns_contents = cmds.namespaceInfo(
+                        ns, listNamespace=True
+                    ) or []
+                    for node in ns_contents:
+                        if not cmds.objExists(node):
+                            continue
                         try:
                             if cmds.referenceQuery(
                                     node, isNodeReferenced=True):
@@ -4209,6 +4389,7 @@ class Exporter(object):
         geo_roots = geo_roots or []
         # Collect mesh transforms under all roots
         mesh_xforms = []
+        seen_mesh_xforms = set()
         for root in geo_roots:
             if not cmds.objExists(root):
                 continue
@@ -4225,7 +4406,8 @@ class Exporter(object):
                     s for s in shapes
                     if not cmds.getAttr(s + ".intermediateObject")
                 ]
-                if shapes and desc not in mesh_xforms:
+                if shapes and desc not in seen_mesh_xforms:
+                    seen_mesh_xforms.add(desc)
                     mesh_xforms.append(desc)
 
         # Exclude meshes driven by a skinCluster  -- their vertices move
@@ -4234,8 +4416,7 @@ class Exporter(object):
         for xform in mesh_xforms:
             history = cmds.listHistory(
                 xform, pruneDagObjects=True) or []
-            if any(cmds.objectType(h) == "skinCluster"
-                   for h in history):
+            if cmds.ls(history, type="skinCluster"):
                 skinned.add(xform)
         mesh_xforms = [m for m in mesh_xforms if m not in skinned]
 
@@ -4384,6 +4565,7 @@ class Exporter(object):
             picked_nodes, start_frame, end_frame)
 
         # Phase 2b: classify and process each leaf
+        to_bake = []
         for leaf in unique_leaves:
             long_name = cmds.ls(leaf, long=True)[0]
             short_name = leaf.split("|")[-1]
@@ -4396,13 +4578,20 @@ class Exporter(object):
                 vertex_anim_count += 1
 
             elif self._has_driven_transforms(leaf):
-                self._bake_transform_curves(leaf, start_frame, end_frame)
+                to_bake.append(leaf)
                 select_for_export.append(leaf)
                 anim_curve_count += 1
 
             else:
                 select_for_export.append(leaf)
                 static_count += 1
+
+        # One batched bake: simulation=True plays the timeline once
+        # per bakeResults call, so baking all driven leaves together
+        # avoids one full playthrough per leaf.
+        if to_bake:
+            self._bake_transform_curves(
+                to_bake, start_frame, end_frame)
 
         self._trace(
             "Classification: {} blendshape, {} animated, "
@@ -4480,6 +4669,15 @@ class Exporter(object):
         if pb_width > 1920:
             pb_height = int(round(pb_height * 1920.0 / pb_width))
             pb_width = 1920
+        # Viewport background is a global user preference, not scene
+        # state -- if a composite pass throws mid-way the normal
+        # restore path is skipped, so these sentinels let the finally
+        # below put it back.  The composite branch sets them and the
+        # in-line restore clears them back to None once handled.
+        original_bg = None
+        original_bg_top = None
+        original_bg_bottom = None
+        original_gradient = None
         try:
             # Validate format availability
             pb_format = None
@@ -4649,17 +4847,29 @@ class Exporter(object):
             # of one value for the whole clip.  getAttr(time=) reads
             # the attribute at that time without scrubbing the scene.
             hud_focal_lengths = None
-            if camera:
+            if camera and show_hud:
                 cam_shapes = cmds.listRelatives(
                     camera, shapes=True, type="camera") or []
                 if cam_shapes:
                     fl_attr = cam_shapes[0] + ".focalLength"
                     try:
-                        hud_focal_lengths = [
-                            cmds.getAttr(fl_attr, time=frame)
-                            for frame in range(int(start_frame),
-                                               int(end_frame) + 1)
-                        ]
+                        n_frames = (int(end_frame)
+                                    - int(start_frame) + 1)
+                        # Static lens (no incoming connection): one
+                        # read instead of a timed DG evaluation per
+                        # frame.
+                        if cmds.listConnections(
+                                fl_attr, source=True,
+                                destination=False):
+                            hud_focal_lengths = [
+                                cmds.getAttr(fl_attr, time=frame)
+                                for frame in range(
+                                    int(start_frame),
+                                    int(end_frame) + 1)
+                            ]
+                        else:
+                            hud_focal_lengths = (
+                                [cmds.getAttr(fl_attr)] * n_frames)
                     except Exception:
                         pass
 
@@ -5716,6 +5926,10 @@ class Exporter(object):
                             "backgroundBottom", *original_bg_bottom)
                         cmds.displayPref(
                             displayGradient=original_gradient)
+                        original_bg = None
+                        original_bg_top = None
+                        original_bg_bottom = None
+                        original_gradient = None
 
                         # Restore polymesh visibility for cleanup
                         cmds.modelEditor(
@@ -5867,11 +6081,19 @@ class Exporter(object):
             # culled in wireframe, shaded, and textured views alike.
             original_culling = {}
             if not raw_playblast:
-                for mesh in (cmds.ls(type="mesh", long=True) or []):
+                # noIntermediate: orig/intermediate shapes never draw,
+                # so toggling them only churns VP2 state.  Skip meshes
+                # already at Full -- each setAttr dirties the viewport.
+                for mesh in (cmds.ls(
+                        type="mesh", long=True,
+                        noIntermediate=True) or []):
                     try:
-                        original_culling[mesh] = cmds.getAttr(
+                        val = cmds.getAttr(
                             mesh + ".backfaceCulling")
-                        cmds.setAttr(mesh + ".backfaceCulling", 3)
+                        if val != 3:
+                            original_culling[mesh] = val
+                            cmds.setAttr(
+                                mesh + ".backfaceCulling", 3)
                     except Exception:
                         pass
 
@@ -6114,7 +6336,8 @@ class Exporter(object):
                                         stdin=subprocess.DEVNULL,
                                         capture_output=True,
                                         text=True,
-                                        timeout=600,
+                                        timeout=self._encode_timeout(
+                                            end_frame - start_frame + 1),
                                         creationflags=getattr(
                                             subprocess,
                                             "CREATE_NO_WINDOW",
@@ -6135,7 +6358,8 @@ class Exporter(object):
                                     stdin=subprocess.DEVNULL,
                                     capture_output=True,
                                     text=True,
-                                    timeout=600,
+                                    timeout=self._encode_timeout(
+                                        end_frame - start_frame + 1),
                                     creationflags=getattr(
                                         subprocess,
                                         "CREATE_NO_WINDOW", 0))
@@ -6154,7 +6378,11 @@ class Exporter(object):
                                         os.path.basename(file_path))
                                     dst = os.path.join(
                                         out_dir2, dst_name)
-                                    shutil.copy2(src, dst)
+                                    # move: same-filesystem rename
+                                    # instead of rewriting every byte
+                                    # (sources are deleted afterwards
+                                    # anyway)
+                                    shutil.move(src, dst)
                             encode_ok = True
                     else:
                         # .mov / default  -- encode to mp4 via ffmpeg
@@ -6454,6 +6682,23 @@ class Exporter(object):
         except Exception as e:
             self._log_error("Playblast", e)
             return False
+        finally:
+            # Failsafe: restore the viewport background prefs if a
+            # mid-composite exception skipped the in-line restore.
+            try:
+                if original_bg is not None:
+                    cmds.displayRGBColor("background", *original_bg)
+                if original_bg_top is not None:
+                    cmds.displayRGBColor(
+                        "backgroundTop", *original_bg_top)
+                if original_bg_bottom is not None:
+                    cmds.displayRGBColor(
+                        "backgroundBottom", *original_bg_bottom)
+                if original_gradient is not None:
+                    cmds.displayPref(
+                        displayGradient=original_gradient)
+            except Exception:
+                pass
 
     # --- Witness Camera (Camera Track + Matchmove QC) ---
 
@@ -6505,10 +6750,16 @@ class Exporter(object):
                 kw in g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
                 for kw in SKYDOME_NAME_KEYWORDS)]
 
-        # Sample the tracked camera's aim every frame for the view
-        # direction. worldMatrix is read at each time (no timeline scrub).
+        # Sample the tracked camera's aim for the view direction.
+        # worldMatrix is read at each time (no timeline scrub).  Only
+        # an average is needed, so cap the samples -- each timed read
+        # DG-evaluates the camera's whole parent chain.
+        aim_stride = max(1, len(frames) // 200)
+        aim_frames = frames[::aim_stride]
+        if aim_frames[-1] != frames[-1]:
+            aim_frames.append(frames[-1])
         aims = []
-        for frame in frames:
+        for frame in aim_frames:
             m = cmds.getAttr(camera + ".worldMatrix", time=frame)
             if m and isinstance(m[0], (list, tuple)):
                 m = m[0]
@@ -7222,15 +7473,19 @@ class Exporter(object):
                             path, ntype, len(all_descs),
                             len(shape_descs), SHAPE_TYPES))
                 candidates.extend(shape_descs)
+                # One batched query instead of a getAttr per shape.
+                try:
+                    intermediates = set(cmds.ls(
+                        candidates, long=True,
+                        intermediateObjects=True) or [])
+                except Exception:
+                    intermediates = set()
                 kept_paths = []
                 dropped_intermediate = []
                 for s in candidates:
-                    try:
-                        if cmds.getAttr(s + ".intermediateObject"):
-                            dropped_intermediate.append(s)
-                            continue
-                    except Exception:
-                        pass
+                    if s in intermediates:
+                        dropped_intermediate.append(s)
+                        continue
                     if s in seen:
                         continue
                     seen.add(s)
@@ -7243,19 +7498,11 @@ class Exporter(object):
                         "dropped.".format(
                             path, len(kept_paths),
                             len(dropped_intermediate)))
+                    # (Per-shape bbox logging removed -- it doubled
+                    # every bbox evaluation; the per-frame combined
+                    # bbox is already logged by compute_far_distance.)
                     for s in kept_paths:
-                        try:
-                            bb = cmds.exactWorldBoundingBox(s)
-                            log_fn(
-                                "  KEEP {}  bbox x[{:.1f},{:.1f}] "
-                                "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}]"
-                                .format(
-                                    s, bb[0], bb[3], bb[1], bb[4],
-                                    bb[2], bb[5]))
-                        except Exception as exc:
-                            log_fn(
-                                "  KEEP {}  bbox query failed: "
-                                "{}".format(s, exc))
+                        log_fn("  KEEP {}".format(s))
                     for s in dropped_intermediate:
                         log_fn("  DROP-INTERMEDIATE {}".format(s))
         return out
@@ -7285,8 +7532,30 @@ class Exporter(object):
         Returns ``None`` if there are no usable inputs or the farthest
         corner sits behind the camera at every sampled frame.
         """
-        if not camera or not cmds.objExists(camera):
+        if not camera:
             return None
+        result = Exporter.compute_far_distances(
+            [camera], geo_nodes, frames=frames, padding=padding,
+            log_fn=log_fn)
+        return result.get(camera)
+
+    @staticmethod
+    def compute_far_distances(cameras, geo_nodes,
+                              frames=None, padding=1.0,
+                              log_fn=None):
+        """Multi-camera variant of :meth:`compute_far_distance`.
+
+        The world-space geo bboxes are camera-independent, so each
+        sample frame is scrubbed and measured exactly once and the
+        cached bbox corners are transformed by every camera's inverse
+        matrix -- an Nx reduction in scene evaluations for N cameras.
+
+        Returns ``{camera: far or None}``.
+        """
+        cameras = [c for c in (cameras or [])
+                   if c and cmds.objExists(c)]
+        if not cameras:
+            return {}
         shapes = Exporter._expand_to_renderable_shapes(
             geo_nodes, log_fn=log_fn)
         if not shapes:
@@ -7295,7 +7564,7 @@ class Exporter(object):
                     "Auto-fit: no renderable shapes under {}; "
                     "skipping depth update.".format(
                         list(geo_nodes or [])))
-            return None
+            return {}
         if log_fn:
             log_fn(
                 "Auto-fit: measuring {} shape(s) under {} input "
@@ -7308,33 +7577,37 @@ class Exporter(object):
                 log_fn(
                     "Auto-fit: OpenMaya import failed ({}); cannot "
                     "compute local-space depth.".format(exc))
-            return None
+            return {}
 
         if not frames:
             frames = [cmds.currentTime(query=True)]
         saved = cmds.currentTime(query=True)
-        max_fwd = 0.0
+        max_fwd = {cam: 0.0 for cam in cameras}
         try:
             for f in frames:
                 try:
                     cmds.currentTime(f, edit=True)
                 except Exception:
                     continue
-                try:
-                    cam_mat = om.MMatrix(
-                        cmds.xform(
-                            camera, query=True, worldSpace=True,
-                            matrix=True))
-                    cam_inv = cam_mat.inverse()
-                except Exception as exc:
-                    if log_fn:
-                        log_fn(
-                            "Auto-fit f{}: camera matrix query "
-                            "failed: {}".format(int(f), exc))
+                cam_invs = {}
+                for cam in cameras:
+                    try:
+                        cam_mat = om.MMatrix(
+                            cmds.xform(
+                                cam, query=True, worldSpace=True,
+                                matrix=True))
+                        cam_invs[cam] = (cam_mat, cam_mat.inverse())
+                    except Exception as exc:
+                        if log_fn:
+                            log_fn(
+                                "Auto-fit f{}: camera matrix query "
+                                "failed on {}: {}".format(
+                                    int(f), cam, exc))
+                if not cam_invs:
                     continue
-                # Track max -Z (forward) across every corner of every
-                # shape after world->camera-local transform.
-                frame_max = 0.0
+                # Collect every shape's bbox corners once for this
+                # frame; the per-camera work below is pure math.
+                corners = []
                 world_bb_min = [float("inf")] * 3
                 world_bb_max = [float("-inf")] * 3
                 for s in shapes:
@@ -7350,36 +7623,46 @@ class Exporter(object):
                     for gx in (bb[0], bb[3]):
                         for gy in (bb[1], bb[4]):
                             for gz in (bb[2], bb[5]):
-                                p = om.MPoint(gx, gy, gz, 1.0)
-                                pl = p * cam_inv
-                                fwd = -pl.z
-                                if fwd > frame_max:
-                                    frame_max = fwd
-                if frame_max > max_fwd:
-                    max_fwd = frame_max
-                if log_fn:
-                    # Also surface the per-axis scale of the camera's
-                    # world matrix so the user can see how local
-                    # units relate to world units (e.g. 0.05 means
-                    # 1 local unit == 0.05 world units).
-                    sx = (cam_mat[0] ** 2 + cam_mat[1] ** 2
-                          + cam_mat[2] ** 2) ** 0.5
-                    log_fn(
-                        "Auto-fit f{}: world bbox x[{:.1f},{:.1f}] "
-                        "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}], camera "
-                        "world scale~{:.4f}, max forward depth "
-                        "(local) {:.2f}".format(
-                            int(f),
-                            world_bb_min[0], world_bb_max[0],
-                            world_bb_min[1], world_bb_max[1],
-                            world_bb_min[2], world_bb_max[2],
-                            sx, frame_max))
+                                corners.append(
+                                    om.MPoint(gx, gy, gz, 1.0))
+                # Track max -Z (forward) across every corner after
+                # world->camera-local transform, per camera.
+                for cam, (cam_mat, cam_inv) in cam_invs.items():
+                    frame_max = 0.0
+                    for p in corners:
+                        pl = p * cam_inv
+                        fwd = -pl.z
+                        if fwd > frame_max:
+                            frame_max = fwd
+                    if frame_max > max_fwd[cam]:
+                        max_fwd[cam] = frame_max
+                    if log_fn:
+                        # Also surface the per-axis scale of the
+                        # camera's world matrix so the user can see
+                        # how local units relate to world units
+                        # (e.g. 0.05 means 1 local unit == 0.05
+                        # world units).
+                        sx = (cam_mat[0] ** 2 + cam_mat[1] ** 2
+                              + cam_mat[2] ** 2) ** 0.5
+                        log_fn(
+                            "Auto-fit f{} [{}]: world bbox "
+                            "x[{:.1f},{:.1f}] "
+                            "y[{:.1f},{:.1f}] z[{:.1f},{:.1f}], camera "
+                            "world scale~{:.4f}, max forward depth "
+                            "(local) {:.2f}".format(
+                                int(f), cam,
+                                world_bb_min[0], world_bb_max[0],
+                                world_bb_min[1], world_bb_max[1],
+                                world_bb_min[2], world_bb_max[2],
+                                sx, frame_max))
         finally:
             try:
                 cmds.currentTime(saved, edit=True)
             except Exception:
                 pass
-        return (max_fwd + padding) if max_fwd > 0 else None
+        return {
+            cam: (max_fwd[cam] + padding) if max_fwd[cam] > 0 else None
+            for cam in cameras}
 
     @staticmethod
     def apply_camera_far_for_scene(camera, far_value, log_fn=None):
@@ -7573,7 +7856,15 @@ class Exporter(object):
 
         cam_path = []
         if has_cam:
-            for f in frames:
+            # Only an AABB of the path is needed, so cap the samples:
+            # each timed worldMatrix read DG-evaluates the camera's
+            # whole parent/constraint chain, and a 1000+ frame shot
+            # otherwise pays for every frame.
+            cam_stride = max(1, len(frames) // 200)
+            cam_frames = list(frames[::cam_stride])
+            if cam_frames[-1] != frames[-1]:
+                cam_frames.append(frames[-1])
+            for f in cam_frames:
                 m = cmds.getAttr(camera + ".worldMatrix", time=f)
                 if m and isinstance(m[0], (list, tuple)):
                     m = m[0]
@@ -7608,17 +7899,12 @@ class Exporter(object):
         non-intermediate mesh / NURBS surface in the scene, each transform
         once. Shared by the sky-dome name matchers."""
         seen = set()
-        for shp in cmds.ls(type=("mesh", "nurbsSurface"), long=True) or []:
-            try:
-                if cmds.getAttr(shp + ".intermediateObject"):
-                    continue
-            except Exception:
+        # noIntermediate filters at ls level -- no per-shape getAttr.
+        for shp in cmds.ls(type=("mesh", "nurbsSurface"), long=True,
+                           noIntermediate=True) or []:
+            xform = shp.rsplit("|", 1)[0]
+            if not xform:
                 continue
-            parents = cmds.listRelatives(
-                shp, parent=True, fullPath=True) or []
-            if not parents:
-                continue
-            xform = parents[0]
             if xform in seen:
                 continue
             seen.add(xform)
@@ -7719,7 +8005,8 @@ class Exporter(object):
             return []
 
     @staticmethod
-    def _world_matrix_to_ae(node, ae_scale, comp_cx, comp_cy):
+    def _world_matrix_to_ae(node, ae_scale, comp_cx, comp_cy,
+                            time=None):
         """Convert a Maya node's world-space transform to AE position + rotation.
 
         Position comes from the world matrix (correct absolute placement).
@@ -7730,10 +8017,25 @@ class Exporter(object):
         World-space scale is also returned (from the world matrix) so
         callers can account for parent scale.
 
+        When *time* is given the matrices are read with timed getAttr
+        calls, which evaluate only this node's chain -- no timeline
+        scrub, no whole-scene evaluation, no viewport redraw.
+
         Returns:
             tuple: ((x, y, z), (rx_deg, ry_deg, rz_deg), (sx, sy, sz))
         """
-        m = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+        if time is None:
+            m = cmds.xform(
+                node, query=True, worldSpace=True, matrix=True)
+            ml = cmds.xform(
+                node, query=True, objectSpace=True, matrix=True)
+        else:
+            m = cmds.getAttr(node + ".worldMatrix", time=time)
+            ml = cmds.getAttr(node + ".matrix", time=time)
+            if m and isinstance(m[0], (list, tuple)):
+                m = m[0]
+            if ml and isinstance(ml[0], (list, tuple)):
+                ml = ml[0]
 
         # Position from world matrix translation (row 3, Maya row-major)
         tx = m[12]
@@ -7749,8 +8051,6 @@ class Exporter(object):
         sz = math.sqrt(m[8] ** 2 + m[9] ** 2 + m[10] ** 2)
 
         # --- Rotation from LOCAL matrix (excludes parent group rotation) ---
-        ml = cmds.xform(node, query=True, objectSpace=True, matrix=True)
-
         lsx = math.sqrt(ml[0] ** 2 + ml[1] ** 2 + ml[2] ** 2)
         lsy = math.sqrt(ml[4] ** 2 + ml[5] ** 2 + ml[6] ** 2)
         lsz = math.sqrt(ml[8] ** 2 + ml[9] ** 2 + ml[10] ** 2)
@@ -7823,13 +8123,24 @@ class Exporter(object):
         jsx.append("var rotZArray = new Array();")
         jsx.append("var zoomArray = new Array();")
 
+        # Timed reads evaluate only the camera's own chain -- no
+        # timeline scrub / whole-scene eval per frame.  Static lens
+        # (no incoming connection) needs just one focalLength read.
+        fl_animated = bool(cmds.listConnections(
+            cam_shape + ".focalLength", source=True,
+            destination=False))
+        static_focal = (None if fl_animated
+                        else cmds.getAttr(cam_shape + ".focalLength"))
         for frame in range(int(start_frame), int(end_frame) + 1):
-            cmds.currentTime(frame)
             pos, rot, _ = self._world_matrix_to_ae(
-                camera, ae_scale, comp_cx, comp_cy
+                camera, ae_scale, comp_cx, comp_cy, time=frame
             )
 
-            focal_length = cmds.getAttr(cam_shape + ".focalLength")
+            if fl_animated:
+                focal_length = cmds.getAttr(
+                    cam_shape + ".focalLength", time=frame)
+            else:
+                focal_length = static_focal
             ae_zoom = focal_length * comp_width / h_aperture_mm
 
             time_sec = (frame - start_frame) / fps
@@ -7863,9 +8174,9 @@ class Exporter(object):
     def _read_stmap_pixels(stmap_path):
         """Read a 32-bit EXR STMap and return (width, height, pixels).
 
-        Returns a numpy array of shape (height, width, 4) with
-        float32 RGBA values.  Row 0 = top of image (standard
-        EXR scanline order, matching screen space).
+        Returns a numpy array of shape (height, width, 2) holding
+        the float32 R and G (u/v) channels.  Row 0 = top of image
+        (standard EXR scanline order, matching screen space).
         Uses only stdlib (struct, zlib) and numpy.
         """
         pixels = Exporter._read_exr_float(stmap_path)
@@ -7884,8 +8195,10 @@ class Exporter(object):
         if not path or not os.path.isfile(path):
             return None
         try:
+            # 64 KB: headers with big channel lists / metadata can
+            # push dataWindow past 4 KB, which silently returned None.
             with open(path, "rb") as f:
-                head = f.read(4096)
+                head = f.read(65536)
             magic = head[:4]
             if magic != b"\x76\x2f\x31\x01":
                 return None  # not an EXR
@@ -7914,7 +8227,7 @@ class Exporter(object):
         """Minimal OpenEXR reader for scanline float/half EXRs.
 
         Supports uncompressed, ZIP (16-line), and ZIPS (1-line)
-        compression.  Returns numpy (H, W, 4) float32 array with
+        compression.  Returns numpy (H, W, 2) float32 array with
         R in channel 0 and G in channel 1.
         """
         import zlib
@@ -8018,8 +8331,20 @@ class Exporter(object):
         r_idx = ch_index.get('R', 0)
         g_idx = ch_index.get('G', 1 if len(channels) > 1 else 0)
 
-        # Allocate output
-        pixels = np.zeros((h, w, 4), dtype=np.float32)
+        # Allocate output: only R and G are ever consumed (STMap
+        # u/v), so 2 channels -- a 4K RGBA float32 buffer would waste
+        # ~70 MB per STMap.
+        pixels = np.zeros((h, w, 2), dtype=np.float32)
+
+        # Fast path precondition: every channel shares one pixel
+        # type (the overwhelmingly common case for STMaps), so a
+        # whole chunk can be decoded with one reshape instead of
+        # per-line, per-channel byte slices.
+        ptype_set = set(ch[1] for ch in channels)
+        uniform_dtype = None
+        if len(ptype_set) == 1:
+            uniform_dtype = {0: '<u4', 1: '<f2', 2: '<f4'}[
+                ptype_set.pop()]
 
         for chunk_i in range(num_chunks):
             off = offsets[chunk_i]
@@ -8046,6 +8371,16 @@ class Exporter(object):
 
             # EXR stores channels interleaved per-scanline:
             # for each scanline: [ch0_pixels][ch1_pixels][ch2_pixels]...
+            if uniform_dtype is not None and len(raw) >= expected:
+                block = np.frombuffer(
+                    raw, dtype=uniform_dtype,
+                    count=n_lines * len(channels) * w).reshape(
+                        n_lines, len(channels), w)
+                pixels[y_start:y_start + n_lines, :, 0] = (
+                    block[:, r_idx, :])
+                pixels[y_start:y_start + n_lines, :, 1] = (
+                    block[:, g_idx, :])
+                continue
             line_bytes = w * bytes_per_pixel
             for ln in range(n_lines):
                 y_row = y_start + ln
@@ -8084,7 +8419,7 @@ class Exporter(object):
 
         Returns (u, v) from the R and G channels using bilinear
         interpolation.  Coordinates outside [0,1] are clamped.
-        ``pixels`` is a numpy array of shape (height, width, 4).
+        ``pixels`` is a numpy array of shape (height, width, 2).
         """
         fx = max(0.0, min(norm_x * (img_w - 1), img_w - 1.001))
         fy = max(0.0, min(norm_y * (img_h - 1), img_h - 1.001))
@@ -8697,9 +9032,8 @@ class Exporter(object):
             jsx.append("var scaleArray = new Array();")
 
             for frame in range(int(start_frame), int(end_frame) + 1):
-                cmds.currentTime(frame)
                 pos, rot, ws = self._world_matrix_to_ae(
-                    geo_child, ae_scale, comp_cx, comp_cy
+                    geo_child, ae_scale, comp_cx, comp_cy, time=frame
                 )
                 sx = ws[0] * scale_factor
                 sy = ws[1] * scale_factor
@@ -8782,9 +9116,9 @@ class Exporter(object):
             jsx.append("var posArray = new Array();")
 
             for frame in range(int(start_frame), int(end_frame) + 1):
-                cmds.currentTime(frame)
                 pos, _, _ = self._world_matrix_to_ae(
-                    locator_node, ae_scale, comp_cx, comp_cy
+                    locator_node, ae_scale, comp_cx, comp_cy,
+                    time=frame
                 )
                 time_sec = (frame - start_frame) / fps
 
@@ -8881,6 +9215,12 @@ class Exporter(object):
                 int(start_frame)))
             jsx_lines.append("")
 
+            # Animated layers are sampled with timed getAttr (no
+            # timeline scrub), but static geo below is read at the
+            # current time -- pin it to start_frame so results do not
+            # depend on where the user's timeline happens to sit.
+            cmds.currentTime(int(start_frame), edit=True)
+
             # Camera
             if camera:
                 cam_jsx = self._jsx_camera(
@@ -8888,9 +9228,6 @@ class Exporter(object):
                     comp_width, comp_height, ae_scale
                 )
                 jsx_lines.extend(cam_jsx)
-                # Camera scrub leaves Maya at end_frame  -- reset to
-                # start_frame so static geo is sampled correctly.
-                cmds.currentTime(int(start_frame), edit=True)
 
             # Create a project folder for geo assets
             if geo_children:
@@ -10236,12 +10573,31 @@ class CollapsibleGroupBox(QGroupBox):
         super(CollapsibleGroupBox, self).__init__(title, parent)
         self.setCheckable(True)
         self.setChecked(True)
+        self._hidden_by_collapse = []
         self.toggled.connect(self._on_toggled)
 
     def _on_toggled(self, checked):
-        for child in self.findChildren(QWidget):
-            if child.parent() == self or child.parent().parent() == self:
-                child.setVisible(checked)
+        if not checked:
+            # Collapse: remember which children WE hide, so expanding
+            # doesn't un-hide widgets that were intentionally hidden
+            # (e.g. the +/- row buttons before a second row exists).
+            # isHidden() reads the widget's own explicit flag, so the
+            # record is order-independent.
+            targets = [
+                child for child in self.findChildren(QWidget)
+                if (child.parent() == self
+                    or child.parent().parent() == self)]
+            self._hidden_by_collapse = [
+                child for child in targets if not child.isHidden()]
+            for child in targets:
+                child.setVisible(False)
+        else:
+            for child in self._hidden_by_collapse:
+                try:
+                    child.setVisible(True)
+                except Exception:
+                    pass
+            self._hidden_by_collapse = []
 
 
 # ---------------------------------------------------------------------------
@@ -10353,6 +10709,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # Render preview state
         self._preview_buttons = []
         self._last_preview_tmp = None
+        self._last_preview_comp_tmp = None
         # Progress tracking
         self._progress_total = 1
         self._progress_done = 0
@@ -10379,12 +10736,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
     def closeEvent(self, event):
         """Clean up temp files and scriptJobs on close."""
-        if self._last_preview_tmp and os.path.isdir(
-                self._last_preview_tmp):
-            try:
-                shutil.rmtree(self._last_preview_tmp)
-            except Exception:
-                pass
+        for d in (self._last_preview_tmp,
+                  self._last_preview_comp_tmp):
+            if d and os.path.isdir(d):
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
         for job_id in self._scene_jobs:
             try:
                 if cmds.scriptJob(exists=job_id):
@@ -12030,33 +12388,42 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             nodes_to_check.append(node)
 
         for n in nodes_to_check:
+            # Only the extremes matter; findKeyframe returns two
+            # scalars instead of marshalling every key time of a
+            # baked track (a key per frame on ~10 curves).
             anim_curves = cmds.listConnections(
                 n, source=True, destination=False,
                 type="animCurve") or []
-            for ac in anim_curves:
-                ac_keys = cmds.keyframe(
-                    ac, query=True, timeChange=True) or []
-                keys.extend(ac_keys)
+            if not anim_curves:
+                continue
+            try:
+                first = cmds.findKeyframe(anim_curves, which="first")
+                last = cmds.findKeyframe(anim_curves, which="last")
+                keys.extend([first, last])
+            except Exception:
+                for ac in anim_curves:
+                    ac_keys = cmds.keyframe(
+                        ac, query=True, timeChange=True) or []
+                    keys.extend(ac_keys)
 
         if not keys:
             all_descendants = cmds.listRelatives(
                 cam_xform, allDescendents=True,
                 fullPath=True) or [cam_xform]
             all_descendants.append(cam_xform)
-            for desc in all_descendants:
-                conns = cmds.listConnections(
-                    desc, source=True, type="AlembicNode") or []
-                for abc_node in conns:
-                    try:
-                        start_t = cmds.getAttr(
-                            abc_node + ".startFrame")
-                        end_t = cmds.getAttr(
-                            abc_node + ".endFrame")
-                        keys.extend([start_t, end_t])
-                    except Exception:
-                        pass
-                if keys:
-                    break
+            # One batched query instead of one per descendant.
+            conns = cmds.listConnections(
+                all_descendants, source=True,
+                type="AlembicNode") or []
+            for abc_node in conns:
+                try:
+                    start_t = cmds.getAttr(
+                        abc_node + ".startFrame")
+                    end_t = cmds.getAttr(
+                        abc_node + ".endFrame")
+                    keys.extend([start_t, end_t])
+                except Exception:
+                    pass
 
         if keys:
             first_frame = int(min(keys))
@@ -12111,13 +12478,20 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             return
         scene_path = cmds.file(query=True, sceneName=True)
         if scene_path:
-            scene_short = cmds.file(
-                query=True, sceneName=True, shortName=True)
+            scene_short = os.path.basename(scene_path)
             self.scene_info_label.setText("Scene: " + scene_short)
             # Auto-populate export folder with filename (no extension)
             clean = VersionParser._strip_increment(scene_short)
             folder_name = os.path.splitext(clean)[0]
-            self.export_name_field.setText(folder_name)
+            # Only overwrite the field when it is empty or still
+            # holds the previously auto-derived name -- this fires on
+            # every scene save, and it was clobbering user-edited
+            # folder names (which the tooltip explicitly invites).
+            current = self.export_name_field.text().strip()
+            prev_auto = getattr(self, "_auto_folder_name", None)
+            if not current or current == prev_auto:
+                self.export_name_field.setText(folder_name)
+            self._auto_folder_name = folder_name
             self.export_root_field.setPlaceholderText(folder_name)
         else:
             self.scene_info_label.setText("Scene: (unsaved scene)")
@@ -12158,10 +12532,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         mid = sf + (ef - sf) // 2
         frames = sorted(set([sf, mid, ef]))
         max_far = 0.0
+        # One shared measurement pass for all cameras -- the geo
+        # bboxes are camera-independent.
+        fars = Exporter.compute_far_distances(
+            cams, geo_nodes, frames=frames, padding=1.0,
+            log_fn=self._log)
         for cam in cams:
-            far = Exporter.compute_far_distance(
-                cam, geo_nodes, frames=frames, padding=1.0,
-                log_fn=self._log)
+            far = fars.get(cam)
             if far is None:
                 continue
             Exporter.apply_camera_far_for_scene(
@@ -12322,7 +12699,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if self._widget_alive(self.progress_label):
                 self.progress_label.setText("0%")
                 self.progress_label.setVisible(True)
-            cmds.refresh(force=True)
+            # Pump the Qt event loop so the widgets repaint;
+            # cmds.refresh(force=True) here forced a full VP2
+            # re-render per progress tick for no UI benefit.
+            QApplication.processEvents(
+                QEventLoop.ExcludeUserInputEvents)
         except Exception:
             pass
 
@@ -12336,7 +12717,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if self._widget_alive(self.progress_label):
                 self.progress_label.setText("{}%".format(
                     min(pct, 100)))
-            cmds.refresh(force=True)
+            QApplication.processEvents(
+                QEventLoop.ExcludeUserInputEvents)
         except Exception:
             pass
 
@@ -12870,8 +13252,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             # matte) matching the actual export output.  Falls
             # back to single-pass if ffmpeg is not available.
             if Exporter._find_ffmpeg():
+                # Clean up the previous preview's composite dir --
+                # export_playblast only removes it on a successful
+                # encode, so repeated preview clicks leaked temp dirs.
+                if (self._last_preview_comp_tmp and os.path.isdir(
+                        self._last_preview_comp_tmp)):
+                    try:
+                        shutil.rmtree(self._last_preview_comp_tmp)
+                    except Exception:
+                        pass
                 _comp_tmp = _tf.mkdtemp(
                     prefix="ExportGenie_comp_")
+                self._last_preview_comp_tmp = _comp_tmp
                 pb_kwargs.update(
                     composite_plate_path=os.path.join(
                         _comp_tmp, "plate", "plate"),
@@ -13069,22 +13461,20 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     continue
                 cam_shapes = cmds.listRelatives(
                     cam, shapes=True, type="camera") or []
-                abc_nodes = set()
-                for attr in ("tx", "ty", "tz", "rx", "ry", "rz",
-                             "sx", "sy", "sz"):
-                    conns = cmds.listConnections(
-                        "{}.{}".format(cam, attr),
-                        source=True, destination=False) or []
-                    for cn in conns:
-                        if cmds.nodeType(cn) == "AlembicNode":
-                            abc_nodes.add(cn)
+                # One query for all 9 TRS plugs with the type filter
+                # applied by Maya.
+                abc_nodes = set(cmds.listConnections(
+                    ["{}.{}".format(cam, attr)
+                     for attr in ("tx", "ty", "tz",
+                                  "rx", "ry", "rz",
+                                  "sx", "sy", "sz")],
+                    source=True, destination=False,
+                    type="AlembicNode") or [])
                 for shp in cam_shapes:
-                    conns = cmds.listConnections(
+                    abc_nodes.update(cmds.listConnections(
                         "{}.focalLength".format(shp),
-                        source=True, destination=False) or []
-                    for cn in conns:
-                        if cmds.nodeType(cn) == "AlembicNode":
-                            abc_nodes.add(cn)
+                        source=True, destination=False,
+                        type="AlembicNode") or [])
                 if not abc_nodes:
                     continue
                 sys.stderr.write(
@@ -13170,22 +13560,24 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 for node in nodes_to_check:
                     # Bake any node whose TRS is driven by
                     # something other than animCurves (Alembic,
-                    # constraints, expressions, etc.)
-                    has_driver = False
-                    for attr in trs:
+                    # constraints, expressions, etc.).  One query
+                    # for all 9 plugs; classify the connections in
+                    # a single batched ls instead of per-node
+                    # nodeType calls.
+                    try:
                         conns = cmds.listConnections(
-                            "{}.{}".format(node, attr),
+                            ["{}.{}".format(node, attr)
+                             for attr in trs],
                             source=True,
                             destination=False) or []
-                        for cn in conns:
-                            nt = cmds.nodeType(cn)
-                            if not nt.startswith("animCurve"):
-                                has_driver = True
-                                break
-                        if has_driver:
-                            break
-                    if has_driver:
-                        nodes_to_bake.append(node)
+                    except Exception:
+                        conns = []
+                    if conns:
+                        anim_curves = set(cmds.ls(
+                            conns, type="animCurve") or [])
+                        if any(cn not in anim_curves
+                               for cn in conns):
+                            nodes_to_bake.append(node)
 
                 if not nodes_to_bake:
                     continue
@@ -13197,38 +13589,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 cmds.undoInfo(openChunk=True)
                 baked_obj_tracks.append(obj)
 
-                for node in nodes_to_bake:
-                    for a in trs:
-                        try:
-                            cmds.setAttr(
-                                "{}.{}".format(node, a),
-                                lock=False, keyable=True,
-                                channelBox=True)
-                        except Exception:
-                            pass
-                    cmds.bakeResults(
-                        node,
-                        t=(int(start_frame), int(end_frame)),
-                        at=trs, simulation=True,
-                        preserveOutsideKeys=True)
-                    for plug in [
-                            "{}.{}".format(node, a) for a in trs]:
-                        conns = cmds.listConnections(
-                            plug, source=True,
-                            destination=False,
-                            plugs=True,
-                            skipConversionNodes=True) or []
-                        for src_plug in conns:
-                            src_node = src_plug.split(".")[0]
-                            if cmds.nodeType(
-                                    src_node).startswith(
-                                    "animCurve"):
-                                continue
-                            try:
-                                cmds.disconnectAttr(
-                                    src_plug, plug)
-                            except Exception:
-                                pass
+                # One batched bake per group -- simulation=True plays
+                # the timeline once per bakeResults call, not once
+                # per node (unlock + bake + Alembic disconnect all
+                # handled by the helper).
+                Exporter._bake_transform_curves(
+                    nodes_to_bake,
+                    int(start_frame), int(end_frame))
 
                 sys.stderr.write(
                     LOG_PREFIX + " Baked object track: {} "
@@ -13715,22 +14082,20 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if camera and cmds.objExists(camera):
                 cam_shapes = cmds.listRelatives(
                     camera, shapes=True, type="camera") or []
-                abc_nodes = set()
-                for attr in ("tx", "ty", "tz", "rx", "ry", "rz",
-                             "sx", "sy", "sz"):
-                    conns = cmds.listConnections(
-                        "{}.{}".format(camera, attr),
-                        source=True, destination=False) or []
-                    for c in conns:
-                        if cmds.nodeType(c) == "AlembicNode":
-                            abc_nodes.add(c)
+                # One query for all 9 TRS plugs with the type filter
+                # applied by Maya.
+                abc_nodes = set(cmds.listConnections(
+                    ["{}.{}".format(camera, attr)
+                     for attr in ("tx", "ty", "tz",
+                                  "rx", "ry", "rz",
+                                  "sx", "sy", "sz")],
+                    source=True, destination=False,
+                    type="AlembicNode") or [])
                 for shp in cam_shapes:
-                    conns = cmds.listConnections(
+                    abc_nodes.update(cmds.listConnections(
                         "{}.focalLength".format(shp),
-                        source=True, destination=False) or []
-                    for c in conns:
-                        if cmds.nodeType(c) == "AlembicNode":
-                            abc_nodes.add(c)
+                        source=True, destination=False,
+                        type="AlembicNode") or [])
                 if abc_nodes:
                     sys.stderr.write(
                         "{} Baking Alembic camera...\n".format(LOG_PREFIX))
@@ -13805,16 +14170,27 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             for root in _all_export_roots:
                 if not root or not cmds.objExists(root):
                     continue
-                descendants = cmds.listRelatives(
-                    root, allDescendents=True,
+                # Ask for locator shapes directly instead of probing
+                # every descendant (shapes included) for locator
+                # children.
+                loc_shapes_all = cmds.listRelatives(
+                    root, allDescendents=True, type="locator",
                     fullPath=True) or []
-                all_nodes = (
-                    cmds.ls(root, long=True) or []) + descendants
-                for node in all_nodes:
-                    loc_shapes = cmds.listRelatives(
-                        node, shapes=True, type="locator") or []
-                    if not loc_shapes:
-                        continue
+                loc_xforms = []
+                seen_loc = set()
+                for shp in loc_shapes_all:
+                    xf = shp.rsplit("|", 1)[0]
+                    if xf and xf not in seen_loc:
+                        seen_loc.add(xf)
+                        loc_xforms.append(xf)
+                # The root itself may be a locator transform.
+                root_long = (cmds.ls(root, long=True) or [root])[0]
+                if (root_long not in seen_loc
+                        and cmds.listRelatives(
+                            root_long, shapes=True,
+                            type="locator")):
+                    loc_xforms.append(root_long)
+                for node in loc_xforms:
                     for attr in _lock_attrs:
                         plug = "{}.{}".format(node, attr)
                         try:
@@ -13945,7 +14321,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             paths["mp4_witness_tmp_file"],
                             camera,
                             start_frame, end_frame,
-                            geo_nodes=geo_roots + rig_roots + proxy_geos,
+                            # QC framing distance is driven by the rig geo
+                            # plus the main camera path only -- other geo
+                            # still renders but does not push the standoff.
+                            geo_nodes=rig_roots,
                             hide_domes=confirmed_domes))
                     self._log_result("Witness Playblast",
                                      results["witness"])
@@ -14268,26 +14647,24 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     results["fbx"] = False
 
             # ---- Bake Alembic camera ----
+            cam_bake_ran = False
             if camera and cmds.objExists(camera):
                 cam_shapes = cmds.listRelatives(
                     camera, shapes=True, type="camera") or []
-                abc_nodes = set()
-                for attr in ("tx", "ty", "tz", "rx", "ry", "rz",
-                             "sx", "sy", "sz"):
-                    conns = cmds.listConnections(
-                        "{}.{}".format(camera, attr),
-                        source=True, destination=False) or []
-                    for c in conns:
-                        if cmds.nodeType(c) == "AlembicNode":
-                            abc_nodes.add(c)
+                abc_nodes = set(cmds.listConnections(
+                    ["{}.{}".format(camera, attr)
+                     for attr in ("tx", "ty", "tz",
+                                  "rx", "ry", "rz",
+                                  "sx", "sy", "sz")],
+                    source=True, destination=False,
+                    type="AlembicNode") or [])
                 for shp in cam_shapes:
-                    conns = cmds.listConnections(
+                    abc_nodes.update(cmds.listConnections(
                         "{}.focalLength".format(shp),
-                        source=True, destination=False) or []
-                    for c in conns:
-                        if cmds.nodeType(c) == "AlembicNode":
-                            abc_nodes.add(c)
+                        source=True, destination=False,
+                        type="AlembicNode") or [])
                 if abc_nodes:
+                    cam_bake_ran = True
                     sys.stderr.write(
                         "{} Baking Alembic camera...\n".format(LOG_PREFIX))
                     bake_pre = int(start_frame) - 1
@@ -14346,11 +14723,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             # exports reopen from this so they get the baked camera
             # without needing to re-bake each time.
             if tmp_scene and (do_ma or do_usd or do_fbx):
-                tmp_scene_baked = os.path.join(
-                    tmp_dir, "baked_" + scene_basename)
-                cmds.file(rename=tmp_scene_baked)
-                cmds.file(save=True, type=scene_type)
-                cmds.file(rename=scene_path)
+                if cam_bake_ran:
+                    tmp_scene_baked = os.path.join(
+                        tmp_dir, "baked_" + scene_basename)
+                    cmds.file(rename=tmp_scene_baked)
+                    cmds.file(save=True, type=scene_type)
+                    cmds.file(rename=scene_path)
+                else:
+                    # No camera bake ran, so the scene is unchanged
+                    # since the first snapshot -- reuse it instead of
+                    # writing an identical (potentially multi-minute)
+                    # second save.
+                    tmp_scene_baked = tmp_scene
 
             # ---- Bake geo transforms for playblast ----
             # Ensures motion blur on the first frame is clean
@@ -14368,26 +14752,32 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             type="transform",
                             fullPath=True) or [])
                     for xf in all_xforms:
-                        for attr in ("tx", "ty", "tz",
-                                     "rx", "ry", "rz",
-                                     "sx", "sy", "sz"):
+                        # One query for all 9 TRS plugs with the
+                        # type filter applied by Maya, instead of 9
+                        # queries + per-connection nodeType calls.
+                        try:
                             conns = cmds.listConnections(
-                                "{}.{}".format(xf, attr),
+                                ["{}.{}".format(xf, attr)
+                                 for attr in (
+                                     "tx", "ty", "tz",
+                                     "rx", "ry", "rz",
+                                     "sx", "sy", "sz")],
                                 source=True,
-                                destination=False) or []
-                            if any(cmds.nodeType(c) ==
-                                   "AlembicNode"
-                                   for c in conns):
-                                geo_to_bake.append(xf)
-                                break
+                                destination=False,
+                                type="AlembicNode") or []
+                        except Exception:
+                            conns = []
+                        if conns:
+                            geo_to_bake.append(xf)
                 if geo_to_bake:
                     self._log(
                         "Baking {} geo transform(s) for "
                         "playblast...".format(
                             len(geo_to_bake)))
-                    for xf in geo_to_bake:
-                        Exporter._bake_transform_curves(
-                            xf, bake_pre, int(end_frame))
+                    # One batched bake -- simulation=True plays the
+                    # timeline once per call, not once per node.
+                    Exporter._bake_transform_curves(
+                        geo_to_bake, bake_pre, int(end_frame))
                     sys.stderr.write(
                         LOG_PREFIX + " Baked {} geo "
                         "transform(s) for playblast.\n"
