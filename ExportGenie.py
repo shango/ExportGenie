@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-7"
+TOOL_VERSION = "v19_beta-8"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -118,6 +118,11 @@ SKYDOME_NAME = "EG_skydome"
 # with the user before being treated as one.
 SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere", "sky")
 SKYDOME_AMBIGUOUS_KEYWORDS = ("dome",)
+# Tracking-marker / reference geo (SynthEyes "chisel" markers, tracker
+# pyramids, etc.) that must never drive the witness QC standoff -- it is
+# scattered reference junk, not the scene being reviewed. Matched by the
+# same name-keyword idiom as the sky-dome filter.
+TRACKING_MARKER_KEYWORDS = ("chisel", "track")
 SKYDOME_RADIUS_MARGIN = 1.25       # grow the enclosing radius so the dome
                                    # clears the farthest geo / camera / plate
 SKYDOME_SUBDIV = 32                # sphere axis/height subdivisions
@@ -6781,25 +6786,30 @@ class Exporter(object):
             camera, shapes=True, type="camera") or [None])[0]
         frames = list(range(int(start_frame), int(end_frame) + 1))
 
-        # Never fit to a sky dome -- it encloses everything by design, so
-        # it would blow the standoff out. It is hidden from this render
-        # anyway. Exclude both unambiguously named domes (keyword match)
-        # and any dome the user confirmed for this pass (exclude_nodes),
-        # which may be ambiguously named ('sky'/'dome' alone) yet still sit
-        # in the user's selected geo. Match confirmed domes by full DAG
-        # path so a short/namespaced geo name still resolves to the node.
+        # Drop geo that must never drive the standoff:
+        #  - Sky domes: they enclose everything by design, so they would
+        #    blow the standoff out (and are hidden from this render anyway).
+        #    Exclude unambiguously named domes (keyword match) and any dome
+        #    the user confirmed for this pass (exclude_nodes), which may be
+        #    ambiguously named ('sky'/'dome' alone) yet still sit in the
+        #    user's selected geo. Confirmed domes are matched by full DAG
+        #    path so a short/namespaced geo name still resolves to the node.
+        #  - Tracking markers ('chisel'/'track'): scattered reference geo
+        #    that would pull the frame out to the farthest stray marker.
         exclude_paths = set()
         for n in (exclude_nodes or []):
             exclude_paths.update(cmds.ls(n, long=True) or [])
 
-        def _is_skydome(g):
+        def _is_excluded(g):
             short = g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
             if any(kw in short for kw in SKYDOME_NAME_KEYWORDS):
+                return True
+            if any(kw in short for kw in TRACKING_MARKER_KEYWORDS):
                 return True
             return any(p in exclude_paths
                        for p in (cmds.ls(g, long=True) or []))
 
-        geo_nodes = [g for g in (geo_nodes or []) if not _is_skydome(g)]
+        geo_nodes = [g for g in (geo_nodes or []) if not _is_excluded(g)]
 
         # Sample the tracked camera's aim for the view direction.
         # worldMatrix is read at each time (no timeline scrub).  Only
