@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-6"
+TOOL_VERSION = "v19_beta-7"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -114,10 +114,10 @@ WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
 # exported files but is hidden from the witness (qc) render.
 SKYDOME_NAME = "EG_skydome"
 # Definite matches -- an unambiguous sky-dome name; treated as a dome with
-# no prompt. Ambiguous matches ("sky" or "dome" alone, e.g. "geodome" or
-# "sky_backdrop") are confirmed with the user before being treated as one.
-SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere")
-SKYDOME_AMBIGUOUS_KEYWORDS = ("sky", "dome")
+# no prompt. Ambiguous matches ("dome" alone, e.g. "geodome") are confirmed
+# with the user before being treated as one.
+SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere", "sky")
+SKYDOME_AMBIGUOUS_KEYWORDS = ("dome",)
 SKYDOME_RADIUS_MARGIN = 1.25       # grow the enclosing radius so the dome
                                    # clears the farthest geo / camera / plate
 SKYDOME_SUBDIV = 32                # sphere axis/height subdivisions
@@ -6759,7 +6759,8 @@ class Exporter(object):
         return WITNESS_STICK_HEIGHT_FT * 30.48 / cmu
 
     @staticmethod
-    def _witness_framing(camera, start_frame, end_frame, geo_nodes=None):
+    def _witness_framing(camera, start_frame, end_frame, geo_nodes=None,
+                         exclude_nodes=None):
         """Work out where to park the locked-off witness camera.
 
         Exactly 90 degrees around world Y from the tracked camera's
@@ -6782,12 +6783,23 @@ class Exporter(object):
 
         # Never fit to a sky dome -- it encloses everything by design, so
         # it would blow the standoff out. It is hidden from this render
-        # anyway.
-        geo_nodes = [
-            g for g in (geo_nodes or [])
-            if not any(
-                kw in g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
-                for kw in SKYDOME_NAME_KEYWORDS)]
+        # anyway. Exclude both unambiguously named domes (keyword match)
+        # and any dome the user confirmed for this pass (exclude_nodes),
+        # which may be ambiguously named ('sky'/'dome' alone) yet still sit
+        # in the user's selected geo. Match confirmed domes by full DAG
+        # path so a short/namespaced geo name still resolves to the node.
+        exclude_paths = set()
+        for n in (exclude_nodes or []):
+            exclude_paths.update(cmds.ls(n, long=True) or [])
+
+        def _is_skydome(g):
+            short = g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
+            if any(kw in short for kw in SKYDOME_NAME_KEYWORDS):
+                return True
+            return any(p in exclude_paths
+                       for p in (cmds.ls(g, long=True) or []))
+
+        geo_nodes = [g for g in (geo_nodes or []) if not _is_skydome(g)]
 
         # Sample the tracked camera's aim for the view direction.
         # worldMatrix is read at each time (no timeline scrub).  Only
@@ -6958,7 +6970,8 @@ class Exporter(object):
                     pass
 
             framing = self._witness_framing(
-                camera, start_frame, end_frame, geo_nodes)
+                camera, start_frame, end_frame, geo_nodes,
+                exclude_nodes=hide_domes)
 
             # Tall thin measuring stick at the origin, a real 6 ft in the
             # scene's unit, as a scale reference in the witness view.
