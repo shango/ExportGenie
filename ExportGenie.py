@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-5"
+TOOL_VERSION = "v19_beta-6"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -1331,9 +1331,42 @@ class Exporter(object):
             chain = "{plate},{rest}".format(plate=plate_dt, rest=chain)
         return "[pre_hud]{}[out]".format(chain)
 
+    def _build_frame_overlay_drawtext(self, start_frame):
+        """Build a single large frame-number drawtext for a QC movie.
+
+        Burns the current frame (4-digit padded) into the lower-right
+        corner at a size that stays legible at review resolution.  This
+        is the witness/QC counterpart to the full metadata HUD -- it
+        carries no other burn-ins.
+
+        Returns a plain-vf drawtext fragment (no [pre_hud]/[out] stream
+        labels).
+        """
+        font_path = self._find_hud_font()
+        # Larger than the metadata HUD's 32px so the frame number reads
+        # clearly on the witness QC movie.
+        opts = (
+            "fontsize=64"
+            ":fontcolor=white"
+            ":shadowcolor=black@0.6"
+            ":shadowx=3:shadowy=3"
+        )
+        if font_path:
+            # Double-escape the colon (matches _build_hud_drawtext).
+            escaped = font_path.replace("\\", "/").replace(
+                ":", "\\\\:")
+            opts = "fontfile={}:{}".format(escaped, opts)
+        start = int(start_frame)
+        return (
+            "drawtext={opts}"
+            ":text='%{{eif\\:n+{start}\\:d\\:4}}'"
+            ":x=w-tw-30:y=h-th-30"
+        ).format(opts=opts, start=start)
+
     def _encode_mp4(self, png_dir, png_base, start_frame, output_mp4,
                     show_hud=False, focal_lengths=None,
-                    resolution=None, plate_name=None):
+                    resolution=None, plate_name=None,
+                    frame_overlay=False):
         """Encode a PNG image sequence to H.264 .mp4 via bundled ffmpeg.
 
         Args:
@@ -1344,6 +1377,9 @@ class Exporter(object):
             show_hud: If True, burn metadata text overlay via drawtext.
             focal_lengths: Per-frame camera focal lengths in mm (for
                 the HUD), one entry per rendered frame.
+            frame_overlay: If True (and show_hud is False), burn only a
+                large frame-number counter in the lower-right corner --
+                used for the HUD-less witness QC movie.
 
         Returns:
             bool: True if encoding succeeded.
@@ -1382,6 +1418,9 @@ class Exporter(object):
             # Strip stream labels  -- single-input uses plain vf
             vf_script = pad_filter + "," + hud_filters.replace(
                 "[pre_hud]", "").replace("[out]", "")
+        elif frame_overlay and self._has_drawtext():
+            vf_script = pad_filter + "," + \
+                self._build_frame_overlay_drawtext(start_frame)
         else:
             vf_script = pad_filter
 
@@ -6865,7 +6904,8 @@ class Exporter(object):
         tracked camera, showing the scene geo, a tall thin origin measuring
         stick, and a large subdivided ground plane at y=0 (all as
         wireframe), plus the tracked camera itself (icon scaled up so it
-        reads at distance). No HUD.
+        reads at distance). No metadata HUD -- only a large frame-number
+        counter burned into the lower-right corner.
 
         Everything this creates or changes -- the witness camera, the
         measuring stick, the ground plane, the tracked camera's icon scale,
@@ -7041,6 +7081,7 @@ class Exporter(object):
                 tmp_dir, os.path.basename(tmp_png_file), start_frame,
                 output_mp4,
                 show_hud=False,
+                frame_overlay=True,
                 resolution=(pb_width, pb_height))
             if encode_ok:
                 self._cleanup_temp_pngs(tmp_dir)
