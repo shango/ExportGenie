@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-9"
+TOOL_VERSION = "v19_beta-10"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -92,6 +92,22 @@ WITNESS_VERTICAL_MARGIN = 1.35     # extra vertical padding (top + bottom):
                                    # FOV is tighter than the film aperture
                                    # implies -- without this the scene top
                                    # kisses / clips the frame edge
+WITNESS_STANDOFF_FRAC = 0.9        # pull the solved standoff in by this much
+                                   # so the subject fills more of the QC
+                                   # frame. Applied BEFORE the in-front-of-
+                                   # the-nearest-corner floor, so tightening
+                                   # can never put the eye inside the bounds
+CAMERA_SCALE_TOLERANCE = 1e-3      # how far a camera's scale may drift from
+                                   # 1.0 before the QC movie calls it scaled.
+                                   # Loose enough to absorb float error in the
+                                   # world-matrix decomposition
+WITNESS_STANDOFF_GEO_KEYWORDS = ("genhuman", "genman", "lineup")
+                                   # Camera Track only: when set, ONLY assigned
+                                   # geo whose DAG path contains one of these
+                                   # drives the standoff (plus the camera path
+                                   # and the measuring stick, always). Other
+                                   # assigned geo still renders -- it just does
+                                   # not push the witness camera back
 # The witness pass draws its ground as an actual subdivided poly plane
 # (wireframe) rather than Maya's viewport grid, which renders unreliably in
 # offscreen playblasts. The plane is witness-only: built for the render and
@@ -1336,42 +1352,69 @@ class Exporter(object):
             chain = "{plate},{rest}".format(plate=plate_dt, rest=chain)
         return "[pre_hud]{}[out]".format(chain)
 
-    def _build_frame_overlay_drawtext(self, start_frame):
-        """Build a single large frame-number drawtext for a QC movie.
+    def _build_frame_overlay_drawtext(self, start_frame, shot_name=None,
+                                      warn_text=None):
+        """Build the QC movie's minimal burn-ins.
 
         Burns the current frame (4-digit padded) into the lower-right
-        corner at a size that stays legible at review resolution.  This
-        is the witness/QC counterpart to the full metadata HUD -- it
-        carries no other burn-ins.
+        corner at a size that stays legible at review resolution, plus
+        the shot name at the top-left.  This is the witness/QC
+        counterpart to the full metadata HUD -- it carries no other
+        burn-ins.
+
+        ``warn_text`` (e.g. a scaled-camera notice) burns top-right in
+        red. None -- the normal case -- draws nothing there at all.
 
         Returns a plain-vf drawtext fragment (no [pre_hud]/[out] stream
         labels).
         """
         font_path = self._find_hud_font()
-        # Larger than the metadata HUD's 32px so the frame number reads
-        # clearly on the witness QC movie.
-        opts = (
-            "fontsize=64"
-            ":fontcolor=white"
-            ":shadowcolor=black@0.6"
-            ":shadowx=3:shadowy=3"
-        )
-        if font_path:
-            # Double-escape the colon (matches _build_hud_drawtext).
-            escaped = font_path.replace("\\", "/").replace(
-                ":", "\\\\:")
-            opts = "fontfile={}:{}".format(escaped, opts)
+
+        def build_opts(fontsize, color="white"):
+            opts = (
+                "fontsize={}"
+                ":fontcolor={}"
+                ":shadowcolor=black@0.6"
+                ":shadowx=3:shadowy=3"
+            ).format(fontsize, color)
+            if font_path:
+                # Double-escape the colon (matches _build_hud_drawtext).
+                escaped = font_path.replace("\\", "/").replace(
+                    ":", "\\\\:")
+                opts = "fontfile={}:{}".format(escaped, opts)
+            return opts
+
+        # Frame number is larger than the metadata HUD's 32px so it reads
+        # clearly on the witness QC movie; the shot name sits at 32px so a
+        # long name does not run across the frame.
+        opts = build_opts(64)
         start = int(start_frame)
-        return (
+        frame_dt = (
             "drawtext={opts}"
             ":text='%{{eif\\:n+{start}\\:d\\:4}}'"
             ":x=w-tw-30:y=h-th-30"
         ).format(opts=opts, start=start)
+        # Escape ffmpeg drawtext metachars (matches _build_hud_drawtext).
+        def escape(text):
+            return text.replace("\\", "\\\\").replace(
+                ":", "\\:").replace("'", "\\'").replace("%", "\\%")
+
+        parts = []
+        if shot_name:
+            parts.append(
+                "drawtext={opts}:text='{text}':x=30:y=30".format(
+                    opts=build_opts(32), text=escape(shot_name)))
+        if warn_text:
+            parts.append(
+                "drawtext={opts}:text='{text}':x=w-tw-30:y=30".format(
+                    opts=build_opts(32, "red"), text=escape(warn_text)))
+        parts.append(frame_dt)
+        return ",".join(parts)
 
     def _encode_mp4(self, png_dir, png_base, start_frame, output_mp4,
                     show_hud=False, focal_lengths=None,
                     resolution=None, plate_name=None,
-                    frame_overlay=False):
+                    frame_overlay=False, warn_text=None):
         """Encode a PNG image sequence to H.264 .mp4 via bundled ffmpeg.
 
         Args:
@@ -1383,8 +1426,11 @@ class Exporter(object):
             focal_lengths: Per-frame camera focal lengths in mm (for
                 the HUD), one entry per rendered frame.
             frame_overlay: If True (and show_hud is False), burn only a
-                large frame-number counter in the lower-right corner --
-                used for the HUD-less witness QC movie.
+                large frame-number counter in the lower-right corner
+                plus plate_name at the top-left -- used for the
+                HUD-less witness QC movie.
+            warn_text: With frame_overlay, a warning (e.g. a scaled
+                camera) burned top-right in red. None draws nothing.
 
         Returns:
             bool: True if encoding succeeded.
@@ -1425,7 +1471,8 @@ class Exporter(object):
                 "[pre_hud]", "").replace("[out]", "")
         elif frame_overlay and self._has_drawtext():
             vf_script = pad_filter + "," + \
-                self._build_frame_overlay_drawtext(start_frame)
+                self._build_frame_overlay_drawtext(
+                    start_frame, plate_name, warn_text)
         else:
             vf_script = pad_filter
 
@@ -6747,6 +6794,104 @@ class Exporter(object):
     # --- Witness Camera (Camera Track + Matchmove QC) ---
 
     @staticmethod
+    def _camera_world_scale(camera, frame=None):
+        """Accumulated WORLD scale of a camera, as (sx, sy, sz).
+
+        Read from the worldMatrix basis-vector lengths, so this includes
+        any scale inherited from a parent group -- see
+        ``_camera_scale_text`` for why that is reported separately from
+        the camera's own scale rather than merged with it.
+
+        Basis lengths are unsigned, so an inherited mirror (-1) reads as
+        1.0 here and is NOT detected; a local mirror is, via
+        ``_camera_local_scale``.
+
+        Returns None if the matrix can't be read.
+        """
+        try:
+            if frame is None:
+                m = cmds.getAttr(camera + ".worldMatrix")
+            else:
+                m = cmds.getAttr(camera + ".worldMatrix", time=frame)
+        except Exception:
+            return None
+        if not m:
+            return None
+        if isinstance(m[0], (list, tuple)):
+            m = m[0]
+        rows = ((m[0], m[1], m[2]), (m[4], m[5], m[6]), (m[8], m[9], m[10]))
+        return tuple(math.sqrt(sum(c * c for c in r)) for r in rows)
+
+    @staticmethod
+    def _camera_local_scale(camera):
+        """The camera transform's OWN scale attrs, as (sx, sy, sz).
+
+        Returns None if they can't be read. Unlike the world scale this
+        reads signed values, so a mirrored (-1) camera is still caught.
+        """
+        try:
+            s = cmds.getAttr(camera + ".scale")
+        except Exception:
+            return None
+        if not s:
+            return None
+        if isinstance(s[0], (list, tuple)):
+            s = s[0]
+        return tuple(s[:3])
+
+    @staticmethod
+    def _camera_scale_text(camera, frame=None,
+                           tol=CAMERA_SCALE_TOLERANCE):
+        """Burn-in text for a scaled camera, or None when it is unscaled.
+
+        Local and inherited scale are reported SEPARATELY, because they
+        are different mistakes with different fixes. A camera parented
+        under a scaled group has its own scale attrs still reading
+        1,1,1 -- nobody touched the camera -- so labelling that "CAM
+        SCALE" would send the artist to fix the wrong node. Local scale
+        wins the label when both are off, since that is the one the
+        artist set directly.
+
+        None (the common case) means nothing is drawn at all -- the warning
+        only ever appears when there is something to warn about.
+        """
+        def fmt(label, scale):
+            if (abs(scale[0] - scale[1]) <= tol
+                    and abs(scale[0] - scale[2]) <= tol):
+                return "{} {:.3f}".format(label, scale[0])
+            return "{} {:.3f} {:.3f} {:.3f}".format(label, *scale)
+
+        local = Exporter._camera_local_scale(camera)
+        if local is not None and any(abs(s - 1.0) > tol for s in local):
+            return fmt("CAM SCALE", local)
+        world = Exporter._camera_world_scale(camera, frame)
+        if world is not None and any(abs(s - 1.0) > tol for s in world):
+            return fmt("PARENT SCALE", world)
+        return None
+
+    @staticmethod
+    def _scene_cameras():
+        """Transforms of every non-default camera in the scene.
+
+        Maya's startup cameras (persp/top/front/side and any orthographic)
+        are skipped -- they are never the shot camera and are always
+        present, so reporting them would bury the real ones.
+        """
+        out = []
+        for shp in cmds.ls(type="camera", long=True) or []:
+            try:
+                if cmds.camera(shp, query=True, startupCamera=True):
+                    continue
+                if cmds.getAttr(shp + ".orthographic"):
+                    continue
+            except Exception:
+                pass
+            xform = shp.rsplit("|", 1)[0]
+            if xform and xform not in out:
+                out.append(xform)
+        return out
+
+    @staticmethod
     def _witness_stick_height():
         """Height of the origin measuring stick in the scene's current
         linear unit, so it is always WITNESS_STICK_HEIGHT_FT (a real 6 ft)
@@ -6765,7 +6910,8 @@ class Exporter(object):
 
     @staticmethod
     def _witness_framing(camera, start_frame, end_frame, geo_nodes=None,
-                         exclude_nodes=None, log_fn=None):
+                         exclude_nodes=None, include_keywords=None,
+                         log_fn=None):
         """Work out where to park the locked-off witness camera.
 
         Exactly 90 degrees around world Y from the tracked camera's
@@ -6775,7 +6921,13 @@ class Exporter(object):
         measuring stick: the combined world bounds are projected onto the
         witness camera's right / up / forward axes and the standoff is
         taken from the tighter of the horizontal and vertical fields of
-        view (plus the frame margins).
+        view (plus the frame margins), then pulled in by
+        WITNESS_STANDOFF_FRAC so the subject fills more of the frame.
+
+        ``include_keywords``, when given, restricts the geo that drives the
+        standoff to shapes whose DAG path names one of the keywords; the
+        camera path and measuring stick are always included. Geo excluded
+        this way still RENDERS -- it just stops pushing the camera back.
 
         Returns:
             dict: eye (3-tuple), yaw (degrees about world Y), far_clip,
@@ -6821,15 +6973,39 @@ class Exporter(object):
             return any(path == p or path.startswith(p + "|")
                        for p in exclude_paths)
 
+        # Optional allow-list (Camera Track): keep only geo whose DAG path
+        # names one of the keywords. Tested per path SEGMENT for the same
+        # reason as the exclusions above -- the target geo is routinely a
+        # child of a generically named assigned group, so matching only the
+        # root's own name would drop it and leave nothing to frame.
+        def _is_included(path):
+            if not include_keywords:
+                return True
+            for seg in path.split("|"):
+                if not seg:
+                    continue
+                short = seg.rsplit(":", 1)[-1].lower()
+                if any(kw in short for kw in include_keywords):
+                    return True
+            return False
+
         all_shapes = Exporter._expand_to_renderable_shapes(geo_nodes)
-        geo_nodes = [s for s in all_shapes if not _is_excluded(s)]
+        geo_nodes = [s for s in all_shapes
+                     if _is_included(s) and not _is_excluded(s)]
         if log_fn:
             dropped = [s for s in all_shapes if s not in set(geo_nodes)]
             log_fn(
                 "Witness framing: {} of {} assigned geo shape(s) drive the "
-                "standoff; {} dropped as dome / tracking marker: {}".format(
+                "standoff; {} dropped as dome / tracking marker{}: {}".format(
                     len(geo_nodes), len(all_shapes), len(dropped),
+                    (" / not matching {}".format(list(include_keywords))
+                     if include_keywords else ""),
                     dropped[:20]))
+            if include_keywords and not geo_nodes:
+                log_fn(
+                    "Witness framing: NO assigned geo matched {} -- standoff "
+                    "is driven by the camera path and measuring stick "
+                    "alone.".format(list(include_keywords)))
 
         # Sample the tracked camera's aim for the view direction.
         # worldMatrix is read at each time (no timeline scrub).  Only
@@ -6917,6 +7093,8 @@ class Exporter(object):
             d = max(d,
                     abs(a_r) * WITNESS_FRAME_MARGIN / tan_h - a_f,
                     abs(a_u) * WITNESS_VERTICAL_MARGIN / tan_v - a_f)
+        # Tighten the fit a little so the subject fills more of the frame.
+        d *= WITNESS_STANDOFF_FRAC
         # Keep the eye in front of the nearest corner.
         d = max(d, -min_af + 1.0)
 
@@ -6944,7 +7122,8 @@ class Exporter(object):
     def export_witness_playblast(self, output_mp4, tmp_png_file, camera,
                                  start_frame, end_frame,
                                  geo_nodes=None, resolution=None,
-                                 hide_domes=None):
+                                 hide_domes=None, shot_name=None,
+                                 standoff_geo_keywords=None):
         """Render the witness QC movie (Camera Track and Matchmove).
 
         A second .mp4 from a locked-off camera set 90 degrees off the
@@ -6952,7 +7131,9 @@ class Exporter(object):
         stick, and a large subdivided ground plane at y=0 (all as
         wireframe), plus the tracked camera itself (icon scaled up so it
         reads at distance). No metadata HUD -- only a large frame-number
-        counter burned into the lower-right corner.
+        counter burned into the lower-right corner, the shot name at the
+        top-left, and -- only when the tracked camera or its parent
+        carries a non-unit scale -- a red scale warning at the top-right.
 
         Everything this creates or changes -- the witness camera, the
         measuring stick, the ground plane, the tracked camera's icon scale,
@@ -6972,6 +7153,23 @@ class Exporter(object):
         if pb_width > 1920:
             pb_height = int(round(pb_height * 1920.0 / pb_width))
             pb_width = 1920
+
+        # Scaled-camera check. Read BEFORE the render mutates anything, and
+        # reported for every shot camera in the scene -- a scaled camera
+        # that is not the one being rendered still breaks the export, and
+        # the log is the only place it would otherwise surface.
+        scale_warning = Exporter._camera_scale_text(camera, start_frame)
+        for cam in Exporter._scene_cameras():
+            other = Exporter._camera_scale_text(cam, start_frame)
+            if other:
+                self.log("Camera scale: {} -- {} (scale a tracked camera "
+                         "or its parent and the track no longer matches "
+                         "the plate).".format(
+                             cam.rsplit("|", 1)[-1], other))
+        if scale_warning:
+            self.log(
+                "Camera scale: burning red '{}' warning into the QC "
+                "movie.".format(scale_warning))
 
         created = []
         model_panel = None
@@ -7016,7 +7214,9 @@ class Exporter(object):
 
             framing = self._witness_framing(
                 camera, start_frame, end_frame, geo_nodes,
-                exclude_nodes=hide_domes, log_fn=self._trace)
+                exclude_nodes=hide_domes,
+                include_keywords=standoff_geo_keywords,
+                log_fn=self._trace)
 
             # Tall thin measuring stick at the origin, a real 6 ft in the
             # scene's unit, as a scale reference in the witness view.
@@ -7140,6 +7340,8 @@ class Exporter(object):
                 output_mp4,
                 show_hud=False,
                 frame_overlay=True,
+                plate_name=shot_name,
+                warn_text=scale_warning,
                 resolution=(pb_width, pb_height))
             if encode_ok:
                 self._cleanup_temp_pngs(tmp_dir)
@@ -13897,7 +14099,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             primary_camera,
                             start_frame, end_frame,
                             geo_nodes=geo_roots + obj_tracks,
-                            hide_domes=confirmed_domes))
+                            hide_domes=confirmed_domes,
+                            shot_name=folder_name,
+                            standoff_geo_keywords=(
+                                WITNESS_STANDOFF_GEO_KEYWORDS)))
                     if results["witness"]:
                         all_paths["witness"] = paths["mp4_witness"]
                     self._log_result("Witness Playblast",
@@ -14451,7 +14656,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             # plus the main camera path only -- other geo
                             # still renders but does not push the standoff.
                             geo_nodes=rig_roots,
-                            hide_domes=confirmed_domes))
+                            hide_domes=confirmed_domes,
+                            shot_name=folder_name))
                     self._log_result("Witness Playblast",
                                      results["witness"])
                 self._advance_progress()
