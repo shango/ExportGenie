@@ -122,7 +122,7 @@ SKYDOME_AMBIGUOUS_KEYWORDS = ("dome",)
 # pyramids, etc.) that must never drive the witness QC standoff -- it is
 # scattered reference junk, not the scene being reviewed. Matched by the
 # same name-keyword idiom as the sky-dome filter.
-TRACKING_MARKER_KEYWORDS = ("chisel", "track")
+TRACKING_MARKER_KEYWORDS = ("chisel", "tracker")
 SKYDOME_RADIUS_MARGIN = 1.25       # grow the enclosing radius so the dome
                                    # clears the farthest geo / camera / plate
 SKYDOME_SUBDIV = 32                # sphere axis/height subdivisions
@@ -6794,7 +6794,7 @@ class Exporter(object):
         #    ambiguously named ('sky'/'dome' alone) yet still sit in the
         #    user's selected geo. Confirmed domes are matched by full DAG
         #    path so a short/namespaced geo name still resolves to the node.
-        #  - Tracking markers ('chisel'/'track'): scattered reference geo
+        #  - Tracking markers ('chisel'/'tracker'): scattered reference geo
         #    that would pull the frame out to the farthest stray marker.
         exclude_paths = set()
         for n in (exclude_nodes or []):
@@ -6953,27 +6953,36 @@ class Exporter(object):
         original_panel = {}
         original_cam = None
         original_icon_scale = None
-        hidden_domes = []
+        hidden_vis = []
         original_sel = cmds.ls(selection=True)
         original_time = cmds.currentTime(query=True)
 
         try:
-            # Hide any sky dome so it cannot occlude the witness view;
-            # visibility is restored in the finally. The dome stays in the
-            # exported files -- only this qc render is kept clear of it.
-            # Definite domes (incl. our EG_skydome) are found by name; any
-            # ambiguously named node the user confirmed comes in via
-            # hide_domes.
-            dome_set = list(Exporter._find_skydomes())
+            # Hide, for this render only, geo that must not appear in the
+            # witness view; every original visibility is restored in the
+            # finally, so the exported files are untouched.
+            #  - Sky domes: they would occlude the witness view. Definite
+            #    domes (incl. our EG_skydome) are found by name anywhere in
+            #    the scene; any ambiguously named node the user confirmed
+            #    comes in via hide_domes.
+            #  - Tracking markers ('chisel'/'tracker'): scattered reference
+            #    junk. The name match is scoped to the user-selected geo
+            #    (geo_nodes) only, never the whole scene.
+            hide_set = list(Exporter._find_skydomes())
             for extra in (hide_domes or []):
-                if extra not in dome_set:
-                    dome_set.append(extra)
-            for dome in dome_set:
-                vis_attr = dome + ".visibility"
+                if extra not in hide_set:
+                    hide_set.append(extra)
+            for g in (geo_nodes or []):
+                short = g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
+                if any(kw in short for kw in TRACKING_MARKER_KEYWORDS) \
+                        and g not in hide_set:
+                    hide_set.append(g)
+            for node in hide_set:
+                vis_attr = node + ".visibility"
                 try:
                     if cmds.getAttr(vis_attr, lock=True):
                         continue
-                    hidden_domes.append(
+                    hidden_vis.append(
                         (vis_attr, cmds.getAttr(vis_attr)))
                     cmds.setAttr(vis_attr, False)
                 except Exception:
@@ -7138,7 +7147,7 @@ class Exporter(object):
                         original_icon_scale)
                 except Exception:
                     pass
-            for vis_attr, vis_value in hidden_domes:
+            for vis_attr, vis_value in hidden_vis:
                 try:
                     cmds.setAttr(vis_attr, vis_value)
                 except Exception:
