@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-8"
+TOOL_VERSION = "v19_beta-9"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -6765,7 +6765,7 @@ class Exporter(object):
 
     @staticmethod
     def _witness_framing(camera, start_frame, end_frame, geo_nodes=None,
-                         exclude_nodes=None):
+                         exclude_nodes=None, log_fn=None):
         """Work out where to park the locked-off witness camera.
 
         Exactly 90 degrees around world Y from the tracked camera's
@@ -6789,27 +6789,47 @@ class Exporter(object):
         # Drop geo that must never drive the standoff:
         #  - Sky domes: they enclose everything by design, so they would
         #    blow the standoff out (and are hidden from this render anyway).
-        #    Exclude unambiguously named domes (keyword match) and any dome
-        #    the user confirmed for this pass (exclude_nodes), which may be
-        #    ambiguously named ('sky'/'dome' alone) yet still sit in the
-        #    user's selected geo. Confirmed domes are matched by full DAG
-        #    path so a short/namespaced geo name still resolves to the node.
         #  - Tracking markers ('chisel'/'tracker'): scattered reference geo
         #    that would pull the frame out to the farthest stray marker.
+        #
+        # The filter runs on the EXPANDED shape list, not on the assigned
+        # roots: the bounds walk below reaches every descendant shape, and
+        # domes / marker groups almost always sit UNDER an assigned group
+        # rather than being assigned themselves. Matching only the root's
+        # own name let a nested dome drive the standoff while still being
+        # hidden from the render -- an empty-looking, miles-back witness.
+        # So every ancestor segment of each shape's DAG path is tested,
+        # and the dome / marker sets are seeded scene-wide -- the SAME
+        # nodes the render hides, so what is dropped from the standoff and
+        # what disappears from the picture can never diverge -- plus any
+        # ambiguously named dome the user confirmed.
         exclude_paths = set()
-        for n in (exclude_nodes or []):
+        for n in (list(exclude_nodes or [])
+                  + Exporter._find_skydomes()
+                  + Exporter._find_tracking_markers()):
             exclude_paths.update(cmds.ls(n, long=True) or [])
 
-        def _is_excluded(g):
-            short = g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
-            if any(kw in short for kw in SKYDOME_NAME_KEYWORDS):
-                return True
-            if any(kw in short for kw in TRACKING_MARKER_KEYWORDS):
-                return True
-            return any(p in exclude_paths
-                       for p in (cmds.ls(g, long=True) or []))
+        def _is_excluded(path):
+            for seg in path.split("|"):
+                if not seg:
+                    continue
+                short = seg.rsplit(":", 1)[-1].lower()
+                if any(kw in short for kw in SKYDOME_NAME_KEYWORDS):
+                    return True
+                if any(kw in short for kw in TRACKING_MARKER_KEYWORDS):
+                    return True
+            return any(path == p or path.startswith(p + "|")
+                       for p in exclude_paths)
 
-        geo_nodes = [g for g in (geo_nodes or []) if not _is_excluded(g)]
+        all_shapes = Exporter._expand_to_renderable_shapes(geo_nodes)
+        geo_nodes = [s for s in all_shapes if not _is_excluded(s)]
+        if log_fn:
+            dropped = [s for s in all_shapes if s not in set(geo_nodes)]
+            log_fn(
+                "Witness framing: {} of {} assigned geo shape(s) drive the "
+                "standoff; {} dropped as dome / tracking marker: {}".format(
+                    len(geo_nodes), len(all_shapes), len(dropped),
+                    dropped[:20]))
 
         # Sample the tracked camera's aim for the view direction.
         # worldMatrix is read at each time (no timeline scrub).  Only
@@ -6908,6 +6928,11 @@ class Exporter(object):
         # the measuring stick are all folded into `corners`).
         far = max(math.sqrt(sum((eye[i] - p[i]) ** 2 for i in range(3)))
                   for p in corners)
+        if log_fn:
+            log_fn(
+                "Witness framing: bounds {} .. {}, standoff {:.1f}.".format(
+                    ["{:.1f}".format(v) for v in bb_min],
+                    ["{:.1f}".format(v) for v in bb_max], d))
         return {
             "eye": eye,
             "yaw": yaw,
@@ -6966,17 +6991,18 @@ class Exporter(object):
             #    the scene; any ambiguously named node the user confirmed
             #    comes in via hide_domes.
             #  - Tracking markers ('chisel'/'tracker'): scattered reference
-            #    junk. The name match is scoped to the user-selected geo
-            #    (geo_nodes) only, never the whole scene.
+            #    junk, found scene-wide like the domes. This render is a
+            #    viewport playblast, so it shows the WHOLE scene, not just
+            #    the assigned geo -- scoping the marker match to the
+            #    assigned geo left every marker outside it on screen.
             hide_set = list(Exporter._find_skydomes())
-            for extra in (hide_domes or []):
+            for extra in (list(hide_domes or [])
+                          + Exporter._find_tracking_markers()):
                 if extra not in hide_set:
                     hide_set.append(extra)
-            for g in (geo_nodes or []):
-                short = g.rsplit("|", 1)[-1].rsplit(":", 1)[-1].lower()
-                if any(kw in short for kw in TRACKING_MARKER_KEYWORDS) \
-                        and g not in hide_set:
-                    hide_set.append(g)
+            self._trace(
+                "Witness render hiding {} node(s): {}".format(
+                    len(hide_set), hide_set))
             for node in hide_set:
                 vis_attr = node + ".visibility"
                 try:
@@ -6990,7 +7016,7 @@ class Exporter(object):
 
             framing = self._witness_framing(
                 camera, start_frame, end_frame, geo_nodes,
-                exclude_nodes=hide_domes)
+                exclude_nodes=hide_domes, log_fn=self._trace)
 
             # Tall thin measuring stick at the origin, a real 6 ft in the
             # scene's unit, as a scale reference in the witness view.
@@ -7992,6 +8018,33 @@ class Exporter(object):
         (so the caller can reuse it)."""
         return [x for x, short in Exporter._iter_surface_transforms()
                 if any(kw in short for kw in SKYDOME_NAME_KEYWORDS)]
+
+    @staticmethod
+    def _find_tracking_markers():
+        """Return the topmost transforms that are (or contain) tracking-
+        marker geo -- SynthEyes chisels, tracker pyramids and the like.
+
+        Scene-wide, mirroring _find_skydomes: markers are reference junk
+        wherever they live, and scoping the match to the user's assigned
+        geo meant markers sitting OUTSIDE it were never hidden from the
+        witness render and never dropped from the standoff. Every
+        ancestor segment of each surface's DAG path is tested, and the
+        HIGHEST match is returned, so a whole marker group goes away in
+        one setAttr instead of one per chisel.
+        """
+        out = []
+        for xform, _short in Exporter._iter_surface_transforms():
+            segs = xform.split("|")
+            for i, seg in enumerate(segs):
+                if not seg:
+                    continue
+                short = seg.rsplit(":", 1)[-1].lower()
+                if any(kw in short for kw in TRACKING_MARKER_KEYWORDS):
+                    node = "|".join(segs[:i + 1])
+                    if node and node not in out:
+                        out.append(node)
+                    break
+        return out
 
     @staticmethod
     def _find_skydome_candidates():
