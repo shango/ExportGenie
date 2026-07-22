@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19_beta-10"
+TOOL_VERSION = "v19_beta-11"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -92,11 +92,6 @@ WITNESS_VERTICAL_MARGIN = 1.35     # extra vertical padding (top + bottom):
                                    # FOV is tighter than the film aperture
                                    # implies -- without this the scene top
                                    # kisses / clips the frame edge
-WITNESS_STANDOFF_FRAC = 0.9        # pull the solved standoff in by this much
-                                   # so the subject fills more of the QC
-                                   # frame. Applied BEFORE the in-front-of-
-                                   # the-nearest-corner floor, so tightening
-                                   # can never put the eye inside the bounds
 CAMERA_SCALE_TOLERANCE = 1e-3      # how far a camera's scale may drift from
                                    # 1.0 before the QC movie calls it scaled.
                                    # Loose enough to absorb float error in the
@@ -1385,8 +1380,9 @@ class Exporter(object):
             return opts
 
         # Frame number is larger than the metadata HUD's 32px so it reads
-        # clearly on the witness QC movie; the shot name sits at 32px so a
-        # long name does not run across the frame.
+        # clearly on the witness QC movie; the shot name sits a step under
+        # it -- big enough to read at review resolution, small enough that
+        # a long name does not run across the frame.
         opts = build_opts(64)
         start = int(start_frame)
         frame_dt = (
@@ -1403,7 +1399,7 @@ class Exporter(object):
         if shot_name:
             parts.append(
                 "drawtext={opts}:text='{text}':x=30:y=30".format(
-                    opts=build_opts(32), text=escape(shot_name)))
+                    opts=build_opts(48), text=escape(shot_name)))
         if warn_text:
             parts.append(
                 "drawtext={opts}:text='{text}':x=w-tw-30:y=30".format(
@@ -6921,8 +6917,8 @@ class Exporter(object):
         measuring stick: the combined world bounds are projected onto the
         witness camera's right / up / forward axes and the standoff is
         taken from the tighter of the horizontal and vertical fields of
-        view (plus the frame margins), then pulled in by
-        WITNESS_STANDOFF_FRAC so the subject fills more of the frame.
+        view (plus the frame margins). The solved distance is used as
+        is -- nothing tightens it afterwards.
 
         ``include_keywords``, when given, restricts the geo that drives the
         standoff to shapes whose DAG path names one of the keywords; the
@@ -7093,8 +7089,6 @@ class Exporter(object):
             d = max(d,
                     abs(a_r) * WITNESS_FRAME_MARGIN / tan_h - a_f,
                     abs(a_u) * WITNESS_VERTICAL_MARGIN / tan_v - a_f)
-        # Tighten the fit a little so the subject fills more of the frame.
-        d *= WITNESS_STANDOFF_FRAC
         # Keep the eye in front of the nearest corner.
         d = max(d, -min_af + 1.0)
 
@@ -7334,6 +7328,18 @@ class Exporter(object):
                 quality=100,
                 widthHeight=[pb_width, pb_height],
             )
+
+            # The burn-ins are the only labelling this movie gets, so say
+            # so in the log when one cannot be drawn instead of shipping a
+            # nameless QC movie silently.
+            if shot_name and self._has_drawtext():
+                self.log("Witness QC burn-in shot name: {}".format(shot_name))
+            else:
+                self.log(
+                    "Witness QC burn-ins skipped -- shot name {}, "
+                    "ffmpeg drawtext {}.".format(
+                        "ok" if shot_name else "MISSING",
+                        "ok" if self._has_drawtext() else "MISSING"))
 
             encode_ok = self._encode_mp4(
                 tmp_dir, os.path.basename(tmp_png_file), start_frame,
