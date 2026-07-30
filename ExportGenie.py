@@ -63,6 +63,10 @@ ICON_FILENAME = "ExportGenie.png"
 # Prefix for Script Editor messages  -- includes version for debugging.
 LOG_PREFIX = "[ExportGenie {}]".format(TOOL_VERSION)
 
+# Vertical pitch in pixels between stacked HUD burn-in lines, sized for
+# the 32px metadata HUD font (see Exporter._build_hud_drawtext).
+HUD_LINE_SPACING = 40
+
 # Witness camera (Camera Track + Matchmove QC).  A locked-off side
 # camera rendered as a second, HUD-less .mp4 after the main playblast.
 # These framing rules are a first pass and are deliberately NOT exposed
@@ -1214,8 +1218,74 @@ class Exporter(object):
         except (IOError, OSError) as exc:
             sys.stderr.write("Could not save username: {}\n".format(exc))
 
+    # Maya's Attribute Editor "Notes" field is stored in a dynamic
+    # string attribute named `notes`.  Rigs carry their identity there
+    # as labelled lines, e.g. "Name: Daniel" / "Version: 4.0".
+    _RIG_NOTE_LABELS = ("Name", "Version")
+
+    @staticmethod
+    def _node_notes(node):
+        """Return a node's Notes text, or ``""`` when it has none.
+
+        The `notes` attribute only exists once someone has typed into
+        the Attribute Editor's Notes field, so a missing attribute is
+        the normal case, not an error.
+        """
+        try:
+            if not cmds.attributeQuery("notes", node=node, exists=True):
+                return ""
+            return cmds.getAttr(node + ".notes") or ""
+        except (RuntimeError, ValueError):
+            return ""
+
+    @classmethod
+    def _parse_rig_notes(cls, notes):
+        """Pull the labelled identity lines out of a Notes string.
+
+        Matches ``Name:`` / ``Version:`` case-insensitively and ignores
+        any other prose in the field, then re-emits them with the
+        canonical label so every rig's burn-in reads the same way.
+
+        Args:
+            notes: Raw Notes text (may be empty or None).
+
+        Returns:
+            list[str]: e.g. ``["Name: Daniel", "Version: 4.0"]``.
+                Empty when the field carries neither label.
+        """
+        found = []
+        for label in cls._RIG_NOTE_LABELS:
+            match = re.search(
+                r"^[ \t]*{}[ \t]*:[ \t]*(.+?)[ \t]*$".format(label),
+                notes or "", re.IGNORECASE | re.MULTILINE)
+            if match:
+                found.append("{}: {}".format(label, match.group(1)))
+        return found
+
+    @classmethod
+    def _read_rig_note_lines(cls, rig_roots):
+        """Read rig identity lines from each rig root's Notes field.
+
+        The notes always live on the rig's root node, so only the roots
+        the artist entered are read  -- no descendant search.
+
+        Args:
+            rig_roots: List of rig root transforms (may be empty/None).
+
+        Returns:
+            list[str]: Burn-in lines, one group per rig that has notes,
+                in the order the rigs were given.
+        """
+        lines = []
+        for root in rig_roots or []:
+            if not root or not cmds.objExists(root):
+                continue
+            lines.extend(cls._parse_rig_notes(cls._node_notes(root)))
+        return lines
+
     def _build_hud_drawtext(self, start_frame, focal_lengths=None,
-                            resolution=None, plate_name=None):
+                            resolution=None, plate_name=None,
+                            rig_lines=None):
         """Build ffmpeg drawtext filter chain for metadata overlay.
 
         Returns a filter fragment (no leading/trailing semicolons)
@@ -1232,6 +1302,9 @@ class Exporter(object):
                 to a single ungated drawtext.
             plate_name: Plate identifier (e.g. SHOT_pl01_raw_v01) to
                 burn at the top-left. Empty/None -> no plate HUD.
+            rig_lines: Rig identity lines read from the rig roots' Notes
+                fields (see _read_rig_note_lines), stacked at the
+                top-right. Empty/None -> no rig HUD.
 
         Returns:
             str: drawtext filter chain string.
@@ -1324,9 +1397,14 @@ class Exporter(object):
             meta_dts.append(meta_dt)
         meta_dt = ",".join(meta_dts)
 
-        # Top-left: plate name + artist username (escape ffmpeg
-        # drawtext metachars). The username is read from username.txt
-        # at render time so it reflects the latest saved value.
+        def escape(text):
+            """Escape ffmpeg drawtext metachars in burn-in text."""
+            return text.replace("\\", "\\\\").replace(
+                ":", "\\:").replace("'", "\\'").replace("%", "\\%")
+
+        # Top-left: plate name + artist username. The username is read
+        # from username.txt at render time so it reflects the latest
+        # saved value.
         plate_dt = None
         username = self._get_username()
         top_left = plate_name or ""
@@ -1336,15 +1414,27 @@ class Exporter(object):
                 if top_left else username
             )
         if top_left:
-            safe = top_left.replace("\\", "\\\\").replace(
-                ":", "\\:").replace("'", "\\'").replace("%", "\\%")
             plate_dt = (
                 "drawtext={opts}:text='{text}':x=30:y=30"
-            ).format(opts=font_opts, text=safe)
+            ).format(opts=font_opts, text=escape(top_left))
+
+        # Top-right: rig name / version from the rig roots' Notes,
+        # stacked one line per entry. Each line is right-aligned on its
+        # own width so the block stays flush with the frame edge.
+        rig_dts = [
+            (
+                "drawtext={opts}:text='{text}':x=w-tw-30:y={y}"
+            ).format(opts=font_opts, text=escape(line),
+                     y=30 + i * HUD_LINE_SPACING)
+            for i, line in enumerate(rig_lines or [])
+        ]
 
         chain = "{frame},{meta}".format(frame=frame_dt, meta=meta_dt)
         if plate_dt:
             chain = "{plate},{rest}".format(plate=plate_dt, rest=chain)
+        if rig_dts:
+            chain = "{rig},{rest}".format(
+                rig=",".join(rig_dts), rest=chain)
         return "[pre_hud]{}[out]".format(chain)
 
     def _build_frame_overlay_drawtext(self, start_frame, shot_name=None,
@@ -1410,7 +1500,8 @@ class Exporter(object):
     def _encode_mp4(self, png_dir, png_base, start_frame, output_mp4,
                     show_hud=False, focal_lengths=None,
                     resolution=None, plate_name=None,
-                    frame_overlay=False, warn_text=None):
+                    frame_overlay=False, warn_text=None,
+                    rig_lines=None):
         """Encode a PNG image sequence to H.264 .mp4 via bundled ffmpeg.
 
         Args:
@@ -1427,6 +1518,8 @@ class Exporter(object):
                 HUD-less witness QC movie.
             warn_text: With frame_overlay, a warning (e.g. a scaled
                 camera) burned top-right in red. None draws nothing.
+            rig_lines: With show_hud, rig identity lines burned at the
+                top-right (see _build_hud_drawtext).
 
         Returns:
             bool: True if encoding succeeded.
@@ -1461,7 +1554,7 @@ class Exporter(object):
         if show_hud and self._has_drawtext():
             hud_filters = self._build_hud_drawtext(
                 start_frame, focal_lengths, resolution=resolution,
-                plate_name=plate_name)
+                plate_name=plate_name, rig_lines=rig_lines)
             # Strip stream labels  -- single-input uses plain vf
             vf_script = pad_filter + "," + hud_filters.replace(
                 "[pre_hud]", "").replace("[out]", "")
@@ -1558,7 +1651,7 @@ class Exporter(object):
                           wireframe_dir=None, wireframe_base=None,
                           wireframe_opacity=0.9,
                           wireframe_color=(0.6, 0.1, 0.1),
-                          plate_name=None):
+                          plate_name=None, rig_lines=None):
         """Composite passes (plate, color, matte, optional crown, optional wireframe) via ffmpeg.
 
         Uses the matte as an alpha channel on the solid-color pass,
@@ -1697,7 +1790,7 @@ class Exporter(object):
         if show_hud and self._has_drawtext():
             hud_chain = self._build_hud_drawtext(
                 start_frame, focal_lengths, resolution=resolution,
-                plate_name=plate_name)
+                plate_name=plate_name, rig_lines=rig_lines)
             filter_complex = filter_complex.replace(
                 "[out]", "[pre_hud]")
             filter_complex += ";" + hud_chain
@@ -4717,7 +4810,8 @@ class Exporter(object):
                          composite_wireframe_opacity=0.9,
                          composite_wireframe_color=(0.6, 0.1, 0.1),
                          resolution=None,
-                         shot_name=None):
+                         shot_name=None,
+                         rig_roots=None):
         """Export a QC playblast.
 
         Supports H.264 .mov (via QuickTime), PNG image sequence, or
@@ -4745,6 +4839,9 @@ class Exporter(object):
                 encodes to H.264 .mp4 via bundled ffmpeg (Windows only).
             mp4_output: Full path to the output .mp4 file.  Required
                 when mp4_mode is True.
+            rig_roots: Optional list of rig root transforms.  With
+                show_hud, each rig's name and version are read from its
+                Notes field and burned in at the top-right.
         """
         matchmove_geo = [
             g for g in (matchmove_geo or []) if g and cmds.objExists(g)
@@ -4966,6 +5063,16 @@ class Exporter(object):
             # path so the HUD reflects the export context, not
             # whichever plate happens to be loaded on the camera.
             hud_plate_name = shot_name or ""
+
+            # Top-right HUD = rig name / version, read from each rig
+            # root's Notes field.  Resolved once here rather than per
+            # encode call so the scene is walked a single time.
+            hud_rig_lines = (
+                self._read_rig_note_lines(rig_roots) if show_hud else [])
+            if hud_rig_lines:
+                sys.stderr.write(
+                    LOG_PREFIX + " Rig HUD: {}\n".format(
+                        "   ".join(hud_rig_lines)))
 
             # --- HUD overlay for frame / focal length ---
             original_hud_vis = {}
@@ -6252,7 +6359,8 @@ class Exporter(object):
                             wireframe_base=c_wf_base,
                             wireframe_opacity=composite_wireframe_opacity,
                             wireframe_color=composite_wireframe_color,
-                            plate_name=hud_plate_name)
+                            plate_name=hud_plate_name,
+                            rig_lines=hud_rig_lines)
                     elif mp4_mode:
                         encode_ok = self._encode_composite(
                             plate_dir, plate_base,
@@ -6269,7 +6377,8 @@ class Exporter(object):
                             wireframe_base=c_wf_base,
                             wireframe_opacity=composite_wireframe_opacity,
                             wireframe_color=composite_wireframe_color,
-                            plate_name=hud_plate_name)
+                            plate_name=hud_plate_name,
+                            rig_lines=hud_rig_lines)
                     else:
                         # Composite output  -- use .mp4 on macOS for
                         # reliable ffmpeg encoding; .mov on Windows.
@@ -6292,7 +6401,8 @@ class Exporter(object):
                             wireframe_base=c_wf_base,
                             wireframe_opacity=composite_wireframe_opacity,
                             wireframe_color=composite_wireframe_color,
-                            plate_name=hud_plate_name)
+                            plate_name=hud_plate_name,
+                            rig_lines=hud_rig_lines)
 
                     if encode_ok:
                         # Cleanup composite temp dirs
@@ -6373,7 +6483,8 @@ class Exporter(object):
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
-                            plate_name=hud_plate_name)
+                            plate_name=hud_plate_name,
+                            rig_lines=hud_rig_lines)
                     elif png_mode:
                         # Burn HUD into PNG sequence via ffmpeg
                         out_dir = os.path.dirname(file_path)
@@ -6388,7 +6499,8 @@ class Exporter(object):
                             hud_f = self._build_hud_drawtext(
                                 start_frame, hud_focal_lengths,
                                 resolution=(pb_width, pb_height),
-                                plate_name=hud_plate_name)
+                                plate_name=hud_plate_name,
+                                rig_lines=hud_rig_lines)
                             hud_filters = hud_f.replace(
                                 "[pre_hud]", "").replace(
                                 "[out]", "")
@@ -6483,7 +6595,8 @@ class Exporter(object):
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
                             resolution=(pb_width, pb_height),
-                            plate_name=hud_plate_name)
+                            plate_name=hud_plate_name,
+                            rig_lines=hud_rig_lines)
                     if encode_ok:
                         self._cleanup_temp_pngs(ct_tmp)
                         # Camera Track routes through a system
@@ -14623,6 +14736,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
+                        rig_roots=rig_roots,
                         checker_scale=chk_scale,
                         checker_color=chk_color,
                         checker_opacity=chk_opacity,
