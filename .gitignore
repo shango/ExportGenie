@@ -8,3 +8,7 @@ Thumbs.db
 *~
 bin/win/ffmpeg.exe
 bin/mac/ffmpeg
+
+# Build artifacts and local scratch
+ExportGenie_v*.zip
+better_tangents.png

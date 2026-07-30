@@ -34,7 +34,7 @@ define_window_layout_xml {<?xml version="1.0" encoding="UTF-8"?>
 }
 Root {
  inputs 0
- name //wsl.localhost/Ubuntu-24.04/home/sgold/dev/repos/maya_multi_export/templates/qc_v01_.nk
+ name //wsl.localhost/Ubuntu-24.04/home/sgold/dev/repos/ExportGenie/templates/qc_v01_.nk
  frame 1001
  first_frame 1001
  last_frame 1158
