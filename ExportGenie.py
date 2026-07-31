@@ -4800,6 +4800,7 @@ class Exporter(object):
     def export_playblast(self, file_path, camera, start_frame, end_frame,
                          camera_track_mode=False, face_track_mode=False,
                          matchmove_geo=None,
+                         extra_isolate_nodes=None,
                          checker_scale=8, checker_color=None,
                          checker_opacity=70, raw_playblast=False,
                          render_raw_srgb=True,
@@ -4831,6 +4832,13 @@ class Exporter(object):
         Args:
             camera_track_mode: If True, applies Camera Track viewport
                 overrides (wireframe, AA).
+            extra_isolate_nodes: Optional nodes to make visible in the
+                playblast WITHOUT treating them as subject geo. Isolate
+                select hides everything not listed, so the sky dome has
+                to be named here to appear at all -- but it must stay out
+                of matchmove_geo, which is what drives the checker and
+                useBackground shader assignments. The dome is a backdrop:
+                wireframe only, no shader of ours.
             matchmove_geo: Optional list of geo root transforms for the
                 Matchmove tab.  When provided, forces display layers
                 visible, isolates only these geo roots, sets smooth
@@ -5362,6 +5370,16 @@ class Exporter(object):
                 for geo_root in matchmove_geo:
                     cmds.isolateSelect(
                         model_panel, addDagObject=geo_root)
+                # Backdrop nodes (the sky dome): visible in the shot but
+                # never shaded by us -- see extra_isolate_nodes above.
+                for extra in (extra_isolate_nodes or []):
+                    if not (extra and cmds.objExists(extra)):
+                        continue
+                    try:
+                        cmds.isolateSelect(
+                            model_panel, addDagObject=extra)
+                    except Exception:
+                        pass
                 # Add the camera and its image planes so the
                 # plate sequence is visible in the background.
                 if camera:
@@ -8373,6 +8391,15 @@ class Exporter(object):
                 if any(kw in short for kw in SKYDOME_NAME_KEYWORDS)]
 
     @staticmethod
+    def _find_eg_skydomes():
+        """Return only the domes THIS tool built (an exact SKYDOME_NAME
+        match), never an artist's own. Used where our dome gets special
+        handling -- shown in the playblast, dropped when the feature is
+        switched off."""
+        return [d for d in Exporter._find_skydomes()
+                if d.rsplit("|", 1)[-1].rsplit(":", 1)[-1] == SKYDOME_NAME]
+
+    @staticmethod
     def _find_tracking_markers():
         """Return the topmost transforms that are (or contain) tracking-
         marker geo -- SynthEyes chisels, tracker pyramids and the like.
@@ -8444,9 +8471,10 @@ class Exporter(object):
         # Draw the dome as wireframe only -- a per-object drawing override
         # (overrideShading off), the same idiom as the witness ground
         # plane. The playblast is a viewport capture, so this is what puts
-        # a backdrop GRID in the QC movie instead of a solid shell that
-        # fills the frame. Display-only: the exported geometry is
-        # untouched, and other DCCs ignore it.
+        # a backdrop GRID in the main-camera playblast instead of a solid
+        # shell that fills the frame. (The qc-cam pass hides domes
+        # outright.) Display-only: the exported geometry is untouched,
+        # and other DCCs ignore it.
         for shape in (cmds.listRelatives(
                 dome, shapes=True, fullPath=True) or []):
             try:
@@ -13190,9 +13218,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         viewport capture and would still show it. Only OUR dome is removed
         -- an artist's dome is theirs to manage.
         """
-        for dome in Exporter._find_skydomes():
-            if dome.rsplit("|", 1)[-1].rsplit(":", 1)[-1] != SKYDOME_NAME:
-                continue
+        for dome in Exporter._find_eg_skydomes():
             try:
                 cmds.delete(dome)
                 self._log("Sky dome off; removed the previous '{}'.".format(
@@ -13795,6 +13821,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 autofit_geo = list(geo_roots)
                 pb_kwargs.update(
                     matchmove_geo=geo_roots,
+                    # The preview is meant to match the export output, so
+                    # it shows the dome a previous run left in the scene.
+                    # None is built here -- previewing must not modify the
+                    # scene.
+                    extra_isolate_nodes=(
+                        Exporter._find_eg_skydomes()
+                        if self.mm_skydome_checkbox.isChecked() else []),
                     motion_blur=mb,
                     composite_wireframe_overlay=wf_overlay,
                     composite_wireframe_geo=geo_roots,
@@ -14596,6 +14629,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # ask the user about ambiguously named nodes -- definite domes are
         # still hidden from the qc render by name.
         confirmed_domes = []
+        skydome = None
         if self.mm_skydome_checkbox.isChecked():
             artist_domes, confirmed_domes = self._resolve_skydomes()
             skydome = self._prepare_skydome(
@@ -14876,6 +14910,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
+                        extra_isolate_nodes=(
+                            [skydome] if skydome else []),
                         rig_roots=rig_roots,
                         checker_scale=chk_scale,
                         checker_color=chk_color,
