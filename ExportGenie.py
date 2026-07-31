@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v19"
+TOOL_VERSION = "v20"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -141,6 +141,17 @@ TRACKING_MARKER_KEYWORDS = ("chisel", "tracker")
 SKYDOME_RADIUS_MARGIN = 1.25       # grow the enclosing radius so the dome
                                    # clears the farthest geo / camera / plate
 SKYDOME_SUBDIV = 32                # sphere axis/height subdivisions
+SKYDOME_CHECKBOX_TOOLTIP = (
+    "Build a sky dome backdrop enclosing the geo and camera path and\n"
+    "include it in the exports. Uncheck to export without one.\n"
+    "A dome the artist already made is always left alone.")
+
+# Viewport background forced behind every QC render, so a playblast reads
+# the same on any machine instead of inheriting whatever the artist has
+# set. These are Maya's factory gradient values -- the soft blue-grey top
+# falling to near black that Alt+B returns the viewport to.
+QC_BACKGROUND_TOP = (0.535, 0.617, 0.702)
+QC_BACKGROUND_BOTTOM = (0.052, 0.052, 0.052)
 
 # The playblast far clip is derived from the camera's fitted far clip (the
 # auto-fit and sky-dome passes push it a few units past the farthest object)
@@ -4862,6 +4873,11 @@ class Exporter(object):
         original_bg_top = None
         original_bg_bottom = None
         original_gradient = None
+        # The forced QC background is saved separately from the composite
+        # sentinels above: the composite branch nests INSIDE it, saving
+        # and restoring the blue we set, so sharing one set of sentinels
+        # would leave the artist's own background lost behind ours.
+        qc_bg_saved = None
         try:
             # Validate format availability
             pb_format = None
@@ -5020,6 +5036,14 @@ class Exporter(object):
                         model_panel, edit=True, grid=False)
                 except Exception:
                     pass
+
+            # Force the blue background for all QC renders, so the movie
+            # does not inherit whatever background the artist happens to
+            # be working in. Skipped under raw_playblast, whose whole
+            # promise ("Use Current Viewport Settings") is that the
+            # artist's own viewport is left alone.
+            if not raw_playblast:
+                qc_bg_saved = Exporter._apply_qc_background()
 
             # Clear selection so no highlight appears in the playblast
             original_sel = cmds.ls(selection=True)
@@ -6899,6 +6923,7 @@ class Exporter(object):
                         displayGradient=original_gradient)
             except Exception:
                 pass
+            Exporter._restore_qc_background(qc_bg_saved)
 
     # --- Witness Camera (Camera Track + Matchmove QC) ---
 
@@ -7284,10 +7309,16 @@ class Exporter(object):
         original_cam = None
         original_icon_scale = None
         hidden_vis = []
+        qc_bg_saved = None
         original_sel = cmds.ls(selection=True)
         original_time = cmds.currentTime(query=True)
 
         try:
+            # Same forced blue background as the main QC render, so the
+            # two movies match. Restored in the finally -- it is a global
+            # user preference, not scene state.
+            qc_bg_saved = Exporter._apply_qc_background()
+
             # Hide, for this render only, geo that must not appear in the
             # witness view; every original visibility is restored in the
             # finally, so the exported files are untouched.
@@ -7513,6 +7544,7 @@ class Exporter(object):
                     cmds.select(clear=True)
             except Exception:
                 pass
+            Exporter._restore_qc_background(qc_bg_saved)
 
     # --- Colour Management Helper ---
 
@@ -8409,7 +8441,66 @@ class Exporter(object):
         # normalMode 0 reverses the normals, flipping the dome inward.
         cmds.polyNormal(dome, normalMode=0, ch=False)
         cmds.delete(dome, constructionHistory=True)
+        # Draw the dome as wireframe only -- a per-object drawing override
+        # (overrideShading off), the same idiom as the witness ground
+        # plane. The playblast is a viewport capture, so this is what puts
+        # a backdrop GRID in the QC movie instead of a solid shell that
+        # fills the frame. Display-only: the exported geometry is
+        # untouched, and other DCCs ignore it.
+        for shape in (cmds.listRelatives(
+                dome, shapes=True, fullPath=True) or []):
+            try:
+                cmds.setAttr(shape + ".overrideEnabled", 1)
+                cmds.setAttr(shape + ".overrideShading", 0)
+            except Exception:
+                pass
         return dome
+
+    @staticmethod
+    def _apply_qc_background():
+        """Force Maya's factory blue-grey gradient behind a QC render.
+
+        The viewport background is a global user PREFERENCE, not scene
+        state, so the caller must hand the return value back to
+        ``_restore_qc_background`` in a finally. Returns the previous
+        ``(top, bottom, gradient)`` or None if it could not be read or
+        applied (in which case there is nothing to restore).
+        """
+        try:
+            top = cmds.displayRGBColor("backgroundTop", query=True)
+            bottom = cmds.displayRGBColor("backgroundBottom", query=True)
+            gradient = cmds.displayPref(query=True, displayGradient=True)
+        except Exception:
+            return None
+        # Maya returns None for these with no UI session (batch /
+        # standalone). With no readable original there is nothing to put
+        # back afterwards, so leave the background alone rather than
+        # strand the artist on our blue.
+        if not (top and len(top) >= 3 and bottom and len(bottom) >= 3):
+            return None
+        saved = (top, bottom, gradient)
+        try:
+            cmds.displayRGBColor("backgroundTop", *QC_BACKGROUND_TOP)
+            cmds.displayRGBColor("backgroundBottom", *QC_BACKGROUND_BOTTOM)
+            cmds.displayPref(displayGradient=True)
+        except Exception:
+            Exporter._restore_qc_background(saved)
+            return None
+        return saved
+
+    @staticmethod
+    def _restore_qc_background(saved):
+        """Put the viewport background back as _apply_qc_background found
+        it. A no-op when *saved* is None."""
+        if not saved:
+            return
+        top, bottom, gradient = saved
+        try:
+            cmds.displayRGBColor("backgroundTop", *top)
+            cmds.displayRGBColor("backgroundBottom", *bottom)
+            cmds.displayPref(displayGradient=gradient)
+        except Exception:
+            pass
 
     @staticmethod
     def _plate_name_from_path(path):
@@ -11108,6 +11199,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_usd_checkbox = None
         self.ct_mov_checkbox = None
         self.ct_nk_checkbox = None
+        self.ct_skydome_checkbox = None
         # Playblast settings
         self.pb_raw_playblast_cb = None
         self.pb_custom_vt_cb = None
@@ -11137,6 +11229,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
+        self.mm_skydome_checkbox = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -11496,6 +11589,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
+        # Sky dome
+        sep_sd = QFrame()
+        sep_sd.setFrameShape(QFrame.HLine)
+        sep_sd.setStyleSheet("color: #555;")
+        tab_layout.addWidget(sep_sd)
+
+        self.ct_skydome_checkbox = QCheckBox("  Include Skydome")
+        self.ct_skydome_checkbox.setChecked(True)
+        self.ct_skydome_checkbox.setToolTip(SKYDOME_CHECKBOX_TOOLTIP)
+        tab_layout.addWidget(self.ct_skydome_checkbox)
+
         sep_p, preview_btn = self._build_preview_button_row()
         tab_layout.addWidget(sep_p)
         tab_layout.addWidget(preview_btn)
@@ -11639,6 +11743,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         tpose_row.addWidget(self.tpose_frame_spin)
         tpose_row.addStretch()
         tab_layout.addLayout(tpose_row)
+
+        self.mm_skydome_checkbox = QCheckBox("  Include Skydome")
+        self.mm_skydome_checkbox.setChecked(True)
+        self.mm_skydome_checkbox.setToolTip(SKYDOME_CHECKBOX_TOOLTIP)
+        tab_layout.addWidget(self.mm_skydome_checkbox)
 
         sep_p, preview_btn = self._build_preview_button_row()
         tab_layout.addWidget(sep_p)
@@ -13073,6 +13182,24 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 confirmed.append(cand)
         return definite + confirmed, confirmed
 
+    def _drop_eg_skydome(self):
+        """Delete any EG_skydome left in the scene by a previous run.
+
+        Called when "Include Skydome" is off: the exports are selection
+        based so a stale dome would not reach them, but the playblast is a
+        viewport capture and would still show it. Only OUR dome is removed
+        -- an artist's dome is theirs to manage.
+        """
+        for dome in Exporter._find_skydomes():
+            if dome.rsplit("|", 1)[-1].rsplit(":", 1)[-1] != SKYDOME_NAME:
+                continue
+            try:
+                cmds.delete(dome)
+                self._log("Sky dome off; removed the previous '{}'.".format(
+                    SKYDOME_NAME))
+            except Exception:
+                pass
+
     def _prepare_skydome(self, geo_nodes, camera, start_frame, end_frame,
                          artist_domes):
         """Ensure a sky dome backs the tracked camera for the exports.
@@ -14057,13 +14184,20 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
             # Build (or reuse the artist's) sky dome backdrop. A dome we
             # create is appended to the export geo so it persists in every
-            # export; it is hidden from the witness (qc) render.
-            artist_domes, confirmed_domes = self._resolve_skydomes()
-            skydome = self._prepare_skydome(
-                geo_roots + obj_tracks, primary_camera,
-                start_frame, end_frame, artist_domes)
-            if skydome:
-                export_geo = export_geo + [skydome]
+            # export; it is hidden from the witness (qc) render. With
+            # "Include Skydome" off we neither build one nor ask the user
+            # about ambiguously named nodes -- definite domes are still
+            # hidden from the qc render by name.
+            confirmed_domes = []
+            if self.ct_skydome_checkbox.isChecked():
+                artist_domes, confirmed_domes = self._resolve_skydomes()
+                skydome = self._prepare_skydome(
+                    geo_roots + obj_tracks, primary_camera,
+                    start_frame, end_frame, artist_domes)
+                if skydome:
+                    export_geo = export_geo + [skydome]
+            else:
+                self._drop_eg_skydome()
 
             if do_jsx:
                 geo_children = []
@@ -14458,13 +14592,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # Build (or reuse the artist's) sky dome backdrop. A dome we create
         # is appended to the static geo so it persists in every export
         # (including the snapshot-based FBX); it is hidden from the witness
-        # (qc) render.
-        artist_domes, confirmed_domes = self._resolve_skydomes()
-        skydome = self._prepare_skydome(
-            geo_roots + rig_roots + proxy_geos, camera,
-            start_frame, end_frame, artist_domes)
-        if skydome:
-            proxy_geos = proxy_geos + [skydome]
+        # (qc) render. With "Include Skydome" off we neither build one nor
+        # ask the user about ambiguously named nodes -- definite domes are
+        # still hidden from the qc render by name.
+        confirmed_domes = []
+        if self.mm_skydome_checkbox.isChecked():
+            artist_domes, confirmed_domes = self._resolve_skydomes()
+            skydome = self._prepare_skydome(
+                geo_roots + rig_roots + proxy_geos, camera,
+                start_frame, end_frame, artist_domes)
+            if skydome:
+                proxy_geos = proxy_geos + [skydome]
+        else:
+            self._drop_eg_skydome()
 
         tpose_start = start_frame
         if self.tpose_checkbox.isChecked():
