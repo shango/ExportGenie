@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v20"
+TOOL_VERSION = "v21_beta-4"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -128,11 +128,15 @@ WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
 # tracked camera sees it correctly.  The created dome persists in the
 # exported files but is hidden from the witness (qc) render.
 SKYDOME_NAME = "EG_skydome"
-# Definite matches -- an unambiguous sky-dome name; treated as a dome with
-# no prompt. Ambiguous matches ("dome" alone, e.g. "geodome") are confirmed
-# with the user before being treated as one.
-SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere", "sky")
-SKYDOME_AMBIGUOUS_KEYWORDS = ("dome",)
+# Definite matches -- a sky-dome name; treated as a dome with no prompt.
+# "dome" is one of them, so a bare "dome" and anything ending in it
+# ("bg_dome", "geodome") all count.
+SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere", "sky",
+                         "dome")
+# Names that only HINT at a dome and are confirmed with the user before
+# being treated as one. Empty now that "dome" itself is definite; the
+# confirmation path stays wired up for any keyword added back here.
+SKYDOME_AMBIGUOUS_KEYWORDS = ()
 # Tracking-marker / reference geo (SynthEyes "chisel" markers, tracker
 # pyramids, etc.) that must never drive the witness QC standoff -- it is
 # scattered reference junk, not the scene being reviewed. Matched by the
@@ -7357,16 +7361,40 @@ class Exporter(object):
             self._trace(
                 "Witness render hiding {} node(s): {}".format(
                     len(hide_set), hide_set))
+            # A dome must NEVER reach this render, so a locked or driven
+            # visibility -- an artist's dome on a vis switch, a keyed one,
+            # a referenced one -- is forced rather than skipped: unlock
+            # it and disconnect its driver, both put back in the finally.
+            # Quietly giving up (the old behaviour) is what let a dome
+            # into the qc movie, so a node that still cannot be hidden is
+            # reported instead of swallowed.
             for node in hide_set:
                 vis_attr = node + ".visibility"
                 try:
-                    if cmds.getAttr(vis_attr, lock=True):
-                        continue
+                    locked = cmds.getAttr(vis_attr, lock=True)
+                    src_plug = (cmds.listConnections(
+                        vis_attr, source=True, destination=False,
+                        plugs=True, skipConversionNodes=True)
+                        or [None])[0]
+                    # Recorded BEFORE anything is changed, so the finally
+                    # restores whatever we got as far as changing.
                     hidden_vis.append(
-                        (vis_attr, cmds.getAttr(vis_attr)))
+                        (vis_attr, cmds.getAttr(vis_attr), locked,
+                         src_plug))
+                    if locked:
+                        cmds.setAttr(vis_attr, lock=False)
+                    if src_plug:
+                        cmds.disconnectAttr(src_plug, vis_attr)
                     cmds.setAttr(vis_attr, False)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.log(
+                        "Warning: could not hide '{}' from the qc "
+                        "render  -- it will be in the movie. See "
+                        "Script Editor.".format(
+                            node.rsplit("|", 1)[-1]))
+                    sys.stderr.write(
+                        LOG_PREFIX + " Witness hide failed for "
+                        "{}: {}\n".format(node, exc))
 
             framing = self._witness_framing(
                 camera, start_frame, end_frame, geo_nodes,
@@ -7543,11 +7571,23 @@ class Exporter(object):
                         original_icon_scale)
                 except Exception:
                     pass
-            for vis_attr, vis_value in hidden_vis:
+            # Undo the force-hide in the reverse order it was applied:
+            # value, then the driver connection, then the lock.
+            for vis_attr, vis_value, was_locked, src_plug in hidden_vis:
                 try:
                     cmds.setAttr(vis_attr, vis_value)
                 except Exception:
                     pass
+                if src_plug:
+                    try:
+                        cmds.connectAttr(src_plug, vis_attr, force=True)
+                    except Exception:
+                        pass
+                if was_locked:
+                    try:
+                        cmds.setAttr(vis_attr, lock=True)
+                    except Exception:
+                        pass
             for node in created:
                 try:
                     if cmds.objExists(node):
@@ -8429,9 +8469,10 @@ class Exporter(object):
     @staticmethod
     def _find_skydome_candidates():
         """Return transforms whose short name only hints at a sky dome --
-        it contains an ambiguous keyword ('sky' or 'dome') but not a
+        it contains a SKYDOME_AMBIGUOUS_KEYWORDS keyword but not a
         definite one -- so the caller can confirm with the user before
-        treating them as one."""
+        treating them as one. Returns nothing while that keyword list is
+        empty, i.e. while every dome-ish name is definite."""
         out = []
         for x, short in Exporter._iter_surface_transforms():
             if any(kw in short for kw in SKYDOME_NAME_KEYWORDS):
@@ -13188,9 +13229,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
     def _resolve_skydomes(self):
         """Work out which scene nodes count as an existing sky dome.
 
-        Definitely named domes (SKYDOME_NAME_KEYWORDS) are taken as-is.
-        Ambiguously named nodes ('sky' or 'dome' alone) are confirmed with
-        the user, one popup each. Returns ``(artist_domes, confirmed)``
+        Definitely named domes (SKYDOME_NAME_KEYWORDS, which includes a
+        bare 'dome') are taken as-is. Ambiguously named nodes are
+        confirmed with the user, one popup each -- none are ambiguous
+        while SKYDOME_AMBIGUOUS_KEYWORDS is empty, so no popup fires.
+        Returns ``(artist_domes, confirmed)``
         where ``artist_domes`` is every existing dome EXCEPT our own
         EG_skydome (so the caller can decide whether to build one) and
         ``confirmed`` is the user-approved ambiguous subset the witness
