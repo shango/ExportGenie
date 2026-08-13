@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v21_beta-4"
+TOOL_VERSION = "v21_beta-5"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -134,7 +134,10 @@ SKYDOME_NAME = "EG_skydome"
 SKYDOME_NAME_KEYWORDS = ("skydome", "skysphere", "sky_sphere", "sky",
                          "dome")
 # Names that only HINT at a dome and are confirmed with the user before
-# being treated as one. Empty now that "dome" itself is definite; the
+# being treated as one, one popup each. Deliberately empty: the obvious
+# candidate, "sphere", matches Maya's default primitive name, and artists
+# add spheres for plenty of things that are not backdrops -- prompting on
+# every pSphere1 in the scene costs more confusion than it saves. The
 # confirmation path stays wired up for any keyword added back here.
 SKYDOME_AMBIGUOUS_KEYWORDS = ()
 # Tracking-marker / reference geo (SynthEyes "chisel" markers, tracker
@@ -145,6 +148,16 @@ TRACKING_MARKER_KEYWORDS = ("chisel", "tracker")
 SKYDOME_RADIUS_MARGIN = 1.25       # grow the enclosing radius so the dome
                                    # clears the farthest geo / camera / plate
 SKYDOME_SUBDIV = 32                # sphere axis/height subdivisions
+SKYDOME_GROUND_SKIRT = 0.12        # how far below y=0 the dome's open rim
+                                   # is buried, as a fraction of the radius.
+                                   # A rim landing EXACTLY on y=0 reads as a
+                                   # floating seam: the eye sits above the
+                                   # ground, so the rim circle projects below
+                                   # the horizon and leaves a band of ground
+                                   # (or of nothing, when the ground stops
+                                   # short) above it. Hanging a skirt past
+                                   # the ground plane hides the seam from any
+                                   # camera above it. 0.0 cuts at the equator.
 SKYDOME_CHECKBOX_TOOLTIP = (
     "Build a sky dome backdrop enclosing the geo and camera path and\n"
     "include it in the exports. Uncheck to export without one.\n"
@@ -354,7 +367,7 @@ class FolderManager(object):
         mp4_tmp_dir = os.path.join(dir_path, "_tmp_mp4")
         paths["mp4_tmp_dir"] = mp4_tmp_dir
         paths["mp4_tmp_file"] = os.path.join(mp4_tmp_dir, qc_base)
-        # Witness-camera "qc" MP4 (Camera Track, Matchmove) -- a second,
+        # Witness-camera "qc" MP4 (all three tabs) -- a second,
         # HUD-less render from a locked-off side camera, sitting beside
         # the main .mp4.
         witness_base = qc_base + "_qc"
@@ -7277,8 +7290,9 @@ class Exporter(object):
                                  start_frame, end_frame,
                                  geo_nodes=None, resolution=None,
                                  hide_domes=None, shot_name=None,
-                                 standoff_geo_keywords=None):
-        """Render the witness QC movie (Camera Track and Matchmove).
+                                 standoff_geo_keywords=None,
+                                 auto_place=True):
+        """Render the witness QC movie (Camera Track, Matchmove, Face Track).
 
         A second .mp4 from a locked-off camera set 90 degrees off the
         tracked camera, showing the scene geo, a tall thin origin measuring
@@ -7288,6 +7302,12 @@ class Exporter(object):
         counter burned into the lower-right corner, the shot name at the
         top-left, and -- only when the tracked camera or its parent
         carries a non-unit scale -- a red scale warning at the top-right.
+
+        With auto_place False the "qc" camera is neither created nor
+        placed: the render looks through the scene's own ``persp`` camera
+        exactly as the artist left it, so the framing is theirs. Nothing
+        else changes -- the stick, ground plane, icon scale, hidden domes,
+        wireframe display and burn-ins are all still applied.
 
         Everything this creates or changes -- the witness camera, the
         measuring stick, the ground plane, the tracked camera's icon scale,
@@ -7330,6 +7350,8 @@ class Exporter(object):
         original_panel = {}
         original_cam = None
         original_icon_scale = None
+        original_far_clip = None
+        far_clip_attr = None
         hidden_vis = []
         qc_bg_saved = None
         original_sel = cmds.ls(selection=True)
@@ -7413,20 +7435,41 @@ class Exporter(object):
             # +half its height in Y so the base sits ON the ground plane.
             cmds.setAttr(stick + ".translateY", stick_h / 2.0)
 
-            wit_cam = cmds.camera(
-                focalLength=WITNESS_FOCAL_LENGTH,
-                horizontalFilmAperture=WITNESS_FILM_APERTURE[0],
-                verticalFilmAperture=WITNESS_FILM_APERTURE[1],
-                farClipPlane=framing["far_clip"])[0]
-            wit_cam = cmds.rename(wit_cam, "qc")
-            created.append(wit_cam)
-            eye = framing["eye"]
-            for axis, value in zip("XYZ", eye):
-                cmds.setAttr(wit_cam + ".translate" + axis, value)
-            # Level, so yaw is the whole rotation.
-            cmds.setAttr(wit_cam + ".rotateX", 0.0)
-            cmds.setAttr(wit_cam + ".rotateY", framing["yaw"])
-            cmds.setAttr(wit_cam + ".rotateZ", 0.0)
+            if auto_place:
+                wit_cam = cmds.camera(
+                    focalLength=WITNESS_FOCAL_LENGTH,
+                    horizontalFilmAperture=WITNESS_FILM_APERTURE[0],
+                    verticalFilmAperture=WITNESS_FILM_APERTURE[1],
+                    farClipPlane=framing["far_clip"])[0]
+                wit_cam = cmds.rename(wit_cam, "qc")
+                created.append(wit_cam)
+                eye = framing["eye"]
+                for axis, value in zip("XYZ", eye):
+                    cmds.setAttr(wit_cam + ".translate" + axis, value)
+                # Level, so yaw is the whole rotation.
+                cmds.setAttr(wit_cam + ".rotateX", 0.0)
+                cmds.setAttr(wit_cam + ".rotateY", framing["yaw"])
+                cmds.setAttr(wit_cam + ".rotateZ", 0.0)
+            else:
+                # The artist's own persp framing IS the shot here, so the
+                # transform is left completely alone. Only the far clip is
+                # pushed out, so the ground plane built below cannot be
+                # clipped away; restored in the finally.
+                wit_cam = "persp"
+                self.log(
+                    "QC playblast using the persp camera  -- automatic "
+                    "placement is off.")
+                persp_shape = (cmds.listRelatives(
+                    wit_cam, shapes=True, type="camera",
+                    fullPath=True) or [None])[0]
+                try:
+                    attr = persp_shape + ".farClipPlane"
+                    saved = cmds.getAttr(attr)
+                    if saved < framing["far_clip"]:
+                        cmds.setAttr(attr, framing["far_clip"])
+                        far_clip_attr, original_far_clip = attr, saved
+                except Exception:
+                    pass
 
             # Scale the tracked camera's viewport icon so it is legible
             # from the witness. locatorScale touches the icon only -- it
@@ -7569,6 +7612,11 @@ class Exporter(object):
                     cmds.setAttr(
                         framing["cam_shape"] + ".locatorScale",
                         original_icon_scale)
+                except Exception:
+                    pass
+            if original_far_clip is not None:
+                try:
+                    cmds.setAttr(far_clip_attr, original_far_clip)
                 except Exception:
                     pass
             # Undo the force-hide in the reverse order it was applied:
@@ -8483,25 +8531,31 @@ class Exporter(object):
 
     @staticmethod
     def _create_skydome(center, radius):
-        """Build an inward-facing sky DOME (upper hemisphere) named
-        SKYDOME_NAME at *center* with *radius*, keeping Maya's default
-        lambert. The lower (-Y) half of the sphere is removed, normals are
-        reversed so the interior faces the tracked camera, and history is
-        deleted so the exported node is clean. Returns the transform."""
+        """Build an inward-facing sky DOME named SKYDOME_NAME centred on
+        *center* with *radius*, keeping Maya's default lambert. Most of the
+        lower (-Y) half of the sphere is removed, normals are reversed so
+        the interior faces the tracked camera, and history is deleted so
+        the exported node is clean. Returns the transform.
+
+        The cut is SKYDOME_GROUND_SKIRT below the equator rather than on
+        it, so callers that put *center* on the ground get a rim buried
+        under the ground plane instead of a seam resting on it."""
         dome = cmds.polySphere(
             radius=radius,
             subdivisionsX=SKYDOME_SUBDIV,
             subdivisionsY=SKYDOME_SUBDIV,
             name=SKYDOME_NAME)[0]
-        # Drop the lower (-Y) hemisphere so the dome is a semi sphere. The
-        # sphere is still at the origin, so its equator sits at y=0; with an
-        # even SKYDOME_SUBDIV there is a clean edge loop there and every
-        # face lies wholly above or below it. A face whose top (bbox ymax)
-        # is at or below the equator is in the -Y half.
+        # Drop the bottom of the sphere so the dome is an open shell. The
+        # sphere is still at the origin, so local y IS the height above the
+        # equator here. Faces come in horizontal rings, so cutting at
+        # whole faces (drop one whose top -- bbox ymax -- is at or below
+        # the cut) leaves a clean, level rim on a ring boundary at or just
+        # below the cut height.
+        cut = -abs(radius) * SKYDOME_GROUND_SKIRT - 1e-4
         lower = [
             f for f in (cmds.ls(dome + ".f[*]", flatten=True) or [])
             if cmds.xform(f, query=True, boundingBox=True,
-                          worldSpace=True)[4] <= 1e-4]
+                          worldSpace=True)[4] <= cut]
         if lower:
             cmds.delete(lower)
         for axis, value in zip("XYZ", center):
@@ -11224,6 +11278,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         ("pb_wireframe_shader_cb", "check"),
         ("pb_motion_blur_cb", "check"),
         ("pb_wireframe_overlay_cb", "check"),
+        ("pb_auto_qc_cam_cb", "check"),
         ("pb_wireframe_opacity_spin", "spin"),
         ("pb_wireframe_color_btn", "color"),
         ("pb_checker_color_btn", "color"),
@@ -11276,6 +11331,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_aa16_cb = None
         self.pb_motion_blur_cb = None
         self.pb_hud_overlay_cb = None
+        self.pb_auto_qc_cam_cb = None
         self.pb_checker_color_btn = None
         self.pb_checker_scale_spin = None
         self.pb_checker_opacity_spin = None
@@ -11313,6 +11369,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ft_minus_btn = None
         self.ft_ma_checkbox = None
         self.ft_fbx_checkbox = None
+        self.ft_abc_checkbox = None
         self.ft_usd_checkbox = None
         self.ft_mov_checkbox = None
         # Render preview state
@@ -11919,6 +11976,16 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ft_ma_checkbox.setChecked(True)
         self.ft_fbx_checkbox = QCheckBox("  FBX (.fbx)")
         self.ft_fbx_checkbox.setChecked(True)
+        self.ft_abc_checkbox = QCheckBox("  Alembic (.abc)")
+        self.ft_abc_checkbox.setChecked(True)
+        self.ft_abc_checkbox.setToolTip(
+            "Head track plus the whole set, cached as one Alembic.\n\n"
+            "Unlike MA / FBX / USD this needs no blendshape conversion:\n"
+            "AbcExport samples the mesh each frame, so an Alembic-driven\n"
+            "head is re-cached as it stands.\n\n"
+            "Every Static Geo entry is included, so use the + button to\n"
+            "add set geo from the imported cache, from your own build, or\n"
+            "from a prior camera-track task.")
         self.ft_usd_checkbox = QCheckBox("  USD (.usd)")
         self.ft_usd_checkbox.setChecked(True)
 
@@ -11927,6 +11994,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         fmt_layout.addWidget(self.ft_ma_checkbox)
         fmt_layout.addWidget(self.ft_fbx_checkbox)
+        fmt_layout.addWidget(self.ft_abc_checkbox)
         fmt_layout.addWidget(self.ft_usd_checkbox)
         fmt_layout.addWidget(self.ft_mov_checkbox)
         formats.setLayout(fmt_layout)
@@ -11985,6 +12053,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_hud_overlay_cb.setToolTip(
             "Burn frame number and focal length into the playblast")
         gen_layout.addWidget(self.pb_hud_overlay_cb)
+
+        self.pb_auto_qc_cam_cb = QCheckBox("  Auto-Place QC Camera")
+        self.pb_auto_qc_cam_cb.setChecked(True)
+        self.pb_auto_qc_cam_cb.setToolTip(
+            "Place the QC camera automatically: locked off, level, and\n"
+            "90 degrees around from the tracked camera, pulled back far\n"
+            "enough to hold the geo and the whole camera path.\n\n"
+            "Uncheck to skip the automatic placement and shoot the QC\n"
+            "movie through the scene's persp camera exactly as you have\n"
+            "framed it. Everything else is unchanged -- measuring stick,\n"
+            "ground plane, wireframe and burn-ins all still apply.")
+        gen_layout.addWidget(self.pb_auto_qc_cam_cb)
 
         # Username -- burned in next to the shot name on every tab's
         # playblast. Persisted to username.txt beside the script and
@@ -12208,6 +12288,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.pb_wireframe_shader_cb.setChecked(True)
         self.pb_motion_blur_cb.setChecked(True)
         self.pb_wireframe_overlay_cb.setChecked(True)
+        self.pb_auto_qc_cam_cb.setChecked(True)
         self.pb_wireframe_opacity_spin.setValue(50)
         self.pb_wireframe_color_btn._color = (0.6, 0.1, 0.1)
         self._update_color_button(self.pb_wireframe_color_btn)
@@ -13278,7 +13359,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         manage, and only hidden from the qc render later -- and this
         returns None. Otherwise any stale EG_skydome is rebuilt sized to
         enclose *geo_nodes* plus the camera path and to sit beyond the
-        image plane, the tracked camera's far clip is extended to reach it,
+        image plane, centred on y=0 so it reads as a dome standing on the
+        ground, the tracked camera's far clip is extended,
         and the dome is returned so the caller can add it to the export
         selection (it persists in the exported files but is hidden from the
         qc render).
@@ -13292,10 +13374,20 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         bounds = Exporter._geo_camera_bounds(geo_nodes, camera, frames)
         if not bounds:
             return None
-        radius = max(
+        # Ground the dome: putting its centre (the sphere equator) on y=0
+        # stands it on the ground instead of floating it at the geo/camera
+        # bbox mid-height, and _create_skydome hangs the rim itself a
+        # SKYDOME_GROUND_SKIRT below that, out of sight under the ground
+        # plane. Only X and Z come from the bbox centre. Dropping the
+        # centre by cy moves every
+        # enclosed point up to |cy| further from it, so the reaches (which
+        # were measured from the bbox centre) grow by that much before the
+        # margin is applied.
+        cx, cy, cz = bounds["center"]
+        radius = (max(
             bounds["geo_reach"],
             bounds["cam_reach"] + bounds["plate_depth"],
-        ) * SKYDOME_RADIUS_MARGIN
+        ) + abs(cy)) * SKYDOME_RADIUS_MARGIN
         if radius <= 0:
             return None
         # The dome is an optional backdrop; a build glitch must not abort
@@ -13307,7 +13399,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     cmds.delete(d)
                 except Exception:
                     pass
-            dome = Exporter._create_skydome(bounds["center"], radius)
+            dome = Exporter._create_skydome((cx, 0.0, cz), radius)
             self._extend_camera_far_clip(
                 camera, bounds["cam_reach"] + radius + 1.0)
         except Exception as exc:
@@ -13619,9 +13711,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         do_ma = self.ft_ma_checkbox.isChecked()
         do_fbx = self.ft_fbx_checkbox.isChecked()
+        do_abc = self.ft_abc_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
         do_mov = self.ft_mov_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_usd or do_mov):
+        if not (do_ma or do_fbx or do_abc or do_usd or do_mov):
             errors.append("No export format selected.")
 
         camera = (self.ft_camera_entries[0]["field"].text().strip()
@@ -13650,6 +13743,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         if do_ma and not any(face_meshes + [camera]):
             errors.append(
                 "MA export enabled but no roles assigned (nothing to export).")
+        if do_abc:
+            if not any(face_meshes + static_geo_list + [camera]):
+                errors.append(
+                    "ABC export enabled but no roles assigned "
+                    "(nothing to export).")
+            # ABC is the only format that reads past Static Geo 1, so its
+            # extra entries are only worth validating when ABC is on --
+            # a stale entry 2 must not block an MA-only export.
+            for i, sg in enumerate(static_geo_list[1:], start=2):
+                if not cmds.objExists(sg):
+                    errors.append(
+                        "Static Geo {} '{}' no longer exists in the "
+                        "scene.".format(i, sg))
 
         for role_name, value in [
             ("Camera", camera),
@@ -14431,7 +14537,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             hide_domes=confirmed_domes,
                             shot_name=folder_name,
                             standoff_geo_keywords=(
-                                WITNESS_STANDOFF_GEO_KEYWORDS)))
+                                WITNESS_STANDOFF_GEO_KEYWORDS),
+                            auto_place=(
+                                self.pb_auto_qc_cam_cb.isChecked())))
                     if results["witness"]:
                         all_paths["witness"] = paths["mp4_witness"]
                     self._log_result("Witness Playblast",
@@ -14996,7 +15104,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             # still renders but does not push the standoff.
                             geo_nodes=rig_roots,
                             hide_domes=confirmed_domes,
-                            shot_name=folder_name))
+                            shot_name=folder_name,
+                            auto_place=(
+                                self.pb_auto_qc_cam_cb.isChecked())))
                     self._log_result("Witness Playblast",
                                      results["witness"])
                 self._advance_progress()
@@ -15217,9 +15327,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         face_meshes = Exporter._filter_hidden_layers(face_meshes)
         if static_geo and Exporter._is_in_hidden_display_layer(static_geo):
             static_geo = ""
+        # ABC ships the head track together with the whole set, so it is
+        # the one format that uses EVERY Static Geo entry rather than
+        # just the first. Set geo reaches the scene three ways -- inside
+        # the imported cache, built by the artist, or from a prior camera
+        # track -- and all three are just picked nodes by the time we get
+        # here.
+        set_geos = Exporter._filter_hidden_layers(static_geo_list)
 
         do_ma = self.ft_ma_checkbox.isChecked()
         do_fbx = self.ft_fbx_checkbox.isChecked()
+        do_abc = self.ft_abc_checkbox.isChecked()
         do_usd = self.ft_usd_checkbox.isChecked()
         do_mov = self.ft_mov_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
@@ -15259,7 +15377,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum([do_ma, do_fbx, do_usd, do_mov])
+        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -15407,6 +15525,27 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     # second save.
                     tmp_scene_baked = tmp_scene
 
+            # ---- ABC ----
+            # Runs here, on the live scene, because it is the only
+            # format that needs no destructive prep: AbcExport samples
+            # the mesh every frame, so an Alembic-driven head is
+            # re-cached as it stands and needs no blendshape conversion
+            # (prepare_face_track_for_export) and no snapshot reopen.
+            # It must still run BEFORE the playblast geo bake below,
+            # which is destructive.
+            #
+            # No static-geo freeze either: export_abc writes with
+            # -worldSpace, so a root's transform is baked into the
+            # points regardless, and freezing would mutate the scene
+            # for nothing.
+            if do_abc:
+                self._log("Exporting ABC...")
+                results["abc"] = exporter.export_abc(
+                    paths["abc"], camera, face_meshes, set_geos,
+                    start_frame, end_frame)
+                self._log_result("ABC", results["abc"])
+                self._advance_progress()
+
             # ---- Bake geo transforms for playblast ----
             # Ensures motion blur on the first frame is clean
             # (no pop from Alembic data starting abruptly).
@@ -15515,6 +15654,27 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_color=wf_color,
                         shot_name=folder_name)
                     self._log_result("Playblast", results["mov"])
+
+                    # Witness pass -- a second, HUD-less .mp4 from a
+                    # locked-off side camera. Runs AFTER the main
+                    # playblast so the measuring stick and grid it creates
+                    # cannot leak into that render.
+                    results["witness"] = (
+                        exporter.export_witness_playblast(
+                            paths["mp4_witness"],
+                            paths["mp4_witness_tmp_file"],
+                            camera,
+                            start_frame, end_frame,
+                            # QC framing distance is driven by the head
+                            # geo plus the main camera path only -- set
+                            # geo still renders but must not push the
+                            # standoff out to enclose the environment.
+                            geo_nodes=face_meshes,
+                            shot_name=folder_name,
+                            auto_place=(
+                                self.pb_auto_qc_cam_cb.isChecked())))
+                    self._log_result("Witness Playblast",
+                                     results["witness"])
                 self._advance_progress()
 
             # MA, USD, and FBX  -- all require destructive scene

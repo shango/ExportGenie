@@ -11,4 +11,6 @@ bin/mac/ffmpeg
 
 # Build artifacts and local scratch
 ExportGenie_v*.zip
+# Per-artist name written beside the script at run time
+username.txt
 better_tangents.png
