@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v21_beta-5"
+TOOL_VERSION = "v21_beta-6"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -511,17 +511,37 @@ def _qc_make_closed_curve(points, name):
     return crv
 
 
-def _qc_bbox_radius_and_center(node, pad=1.25):
-    """Return *(radius, centerXYZ, yMin, yMax)* from the world bbox."""
-    bb = cmds.exactWorldBoundingBox(node)
-    xmin, ymin, zmin, xmax, ymax, zmax = bb
-    cx = (xmin + xmax) * 0.5
-    cy = (ymin + ymax) * 0.5
-    cz = (zmin + zmax) * 0.5
-    dx = xmax - xmin
-    dz = zmax - zmin
-    radius = (max(dx, dz) * 0.5) * float(pad)
-    return radius, (cx, cy, cz), ymin, ymax
+def _qc_object_bbox(node):
+    """Return *node*'s own mesh bbox in OBJECT space as
+    ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
+
+    Read from each shape's ``.boundingBoxMin/.boundingBoxMax``, which is
+    measured in the transform's own space.  That matters for the crown:
+    the box does not inflate or shift when the head is rotated (an
+    ``exactWorldBoundingBox`` is world axis-aligned, so a head rolled 45
+    degrees measured ~40% wider and sat ~1 unit higher), it excludes the
+    transform's scale, and it covers this transform's shapes only -- so
+    hair, neck or body meshes parented under the head no longer drag the
+    centre off.  It still reflects deformation, so a blendshaped or
+    skinned head measures correctly at whatever frame it is read on.
+    """
+    shapes = [
+        s for s in (cmds.listRelatives(
+            node, shapes=True, type="mesh", fullPath=True) or [])
+        if not cmds.getAttr(s + ".intermediateObject")
+    ]
+    if not shapes:
+        raise RuntimeError(
+            "'{}' has no renderable mesh shape to measure.".format(node))
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for shp in shapes:
+        bmin = cmds.getAttr(shp + ".boundingBoxMin")[0]
+        bmax = cmds.getAttr(shp + ".boundingBoxMax")[0]
+        for i in range(3):
+            lo[i] = min(lo[i], bmin[i])
+            hi[i] = max(hi[i], bmax[i])
+    return tuple(lo) + tuple(hi)
 
 
 def create_qc_crown(name="QC_head", radius=14.0, height=0.0,
@@ -626,12 +646,22 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
     """Create a QC crown sized and constrained to the selected mesh.
 
     Select the KeenTools-tracked head mesh TRANSFORM (the animated
-    mesh) first, then call this.  The crown is positioned at the
-    upper portion of the bounding box, then point + orient
-    constrained to the mesh with maintainOffset.
+    mesh) first, then call this.
+
+    The crown is measured, built and placed entirely in the HEAD's own
+    frame: the ring lies in the head's local XZ plane, centred on its
+    local X/Z and set ``y_fraction`` of the way up its local Y.  A head
+    that is tilted on the frame this runs on therefore gets a crown
+    tilted with it, instead of a world-level ring frozen at an angle.
+
+    A single parentConstraint (not point + orient) carries it: a point
+    constraint holds its offset along WORLD axes and ignores the
+    target's rotation, so the crown used to stay parked above the head's
+    pivot while the skull turned out from under it -- measured at 7.65
+    units of slip for a 10-unit offset at 45 degrees.
 
     Returns:
-        tuple: (group, pointConstraint, orientConstraint)
+        tuple: (group, parentConstraint)
     """
     sel = cmds.ls(sl=True, long=True) or []
     if not sel:
@@ -642,12 +672,17 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
             "Select only ONE node: the tracked head mesh transform.")
 
     head = sel[0]
-    radius, center, ymin, ymax = _qc_bbox_radius_and_center(
-        head, pad=pad)
+    xmin, ymin, zmin, xmax, ymax, zmax = _qc_object_bbox(head)
+    radius = (max(xmax - xmin, zmax - zmin) * 0.5) * float(pad)
     head_h = max(1e-6, ymax - ymin)
     spike_len = max(0.05, radius * float(spike_len_ratio))
     y_fraction = max(0.0, min(1.0, float(y_fraction)))
-    crown_pos = [center[0], ymin + head_h * y_fraction, center[2]]
+    # Offset from the head's own pivot, in the head's own axes.
+    crown_offset = [
+        (xmin + xmax) * 0.5,
+        ymin + head_h * y_fraction,
+        (zmin + zmax) * 0.5,
+    ]
 
     grp = create_qc_crown(
         name=name, radius=radius, height=0.0,
@@ -658,15 +693,22 @@ def create_qc_crown_from_mesh(name="QC_head", pad=1.25,
         color_index=color_index, line_width=line_width,
         template=template)
 
-    # Position then constrain to the mesh transform.
-    # The mesh transform has animCurves on TRS from the face
-    # tracking solve  -- the constraints follow this animation.
-    cmds.xform(grp, ws=True, t=crown_pos)
-    pc = cmds.pointConstraint(head, grp, mo=True)[0]
-    oc = cmds.orientConstraint(head, grp, mo=True)[0]
+    # Land the group ON the head (its full world matrix, so the ring
+    # inherits the head's orientation and scale), then slide it up the
+    # head's own axes.  objectSpace so the offset -- which is in the
+    # unscaled object-space units the bbox was measured in -- is scaled
+    # and rotated into place by that matrix.
+    cmds.xform(grp, worldSpace=True, matrix=cmds.xform(
+        head, query=True, worldSpace=True, matrix=True))
+    cmds.xform(grp, objectSpace=True, relative=True,
+               translation=crown_offset)
+
+    # The mesh transform has animCurves on TRS from the face tracking
+    # solve -- the constraint follows this animation.
+    pac = cmds.parentConstraint(head, grp, mo=True)[0]
 
     cmds.select(grp)
-    return grp, pc, oc
+    return grp, pac
 
 
 # Exporter
@@ -4817,7 +4859,7 @@ class Exporter(object):
     def export_playblast(self, file_path, camera, start_frame, end_frame,
                          camera_track_mode=False, face_track_mode=False,
                          matchmove_geo=None,
-                         extra_isolate_nodes=None,
+                         holdout_geo=None,
                          checker_scale=8, checker_color=None,
                          checker_opacity=70, raw_playblast=False,
                          render_raw_srgb=True,
@@ -4849,17 +4891,16 @@ class Exporter(object):
         Args:
             camera_track_mode: If True, applies Camera Track viewport
                 overrides (wireframe, AA).
-            extra_isolate_nodes: Optional nodes to make visible in the
-                playblast WITHOUT treating them as subject geo. Isolate
-                select hides everything not listed, so the sky dome has
-                to be named here to appear at all -- but it must stay out
-                of matchmove_geo, which is what drives the checker and
-                useBackground shader assignments. The dome is a backdrop:
-                wireframe only, no shader of ours.
             matchmove_geo: Optional list of geo root transforms for the
                 Matchmove tab.  When provided, forces display layers
                 visible, isolates only these geo roots, sets smooth
                 shaded display, and applies a UV checker overlay.
+            holdout_geo: Optional list of static geo roots (the
+                Matchmove tab's Static Geo picks).  Rendered alongside
+                matchmove_geo with a useBackground shader, so they read
+                as the plate but still write depth -- a wall or floor
+                cuts away the character behind it.  Ignored when
+                matchmove_geo is empty or raw_playblast is on.
             raw_playblast: If True, skips ALL viewport modifications.
                 The playblast uses the user's current VP2.0 settings
                  -- only the camera is switched to cam_main.
@@ -4881,6 +4922,10 @@ class Exporter(object):
         """
         matchmove_geo = [
             g for g in (matchmove_geo or []) if g and cmds.objExists(g)
+        ]
+        holdout_geo = [
+            g for g in (holdout_geo or [])
+            if g and cmds.objExists(g) and g not in matchmove_geo
         ]
         if resolution is None:
             resolution = self._get_image_plane_resolution(camera)
@@ -5355,6 +5400,9 @@ class Exporter(object):
             original_nurbs_curves = None
             original_shadows = None
             mm_meshes = []
+            holdout_meshes = []
+            holdout_shading = {}
+            holdout_vis = {}
             composite_rendered = False
             auto_qc_crown = None
             has_crown_pass = False
@@ -5387,14 +5435,11 @@ class Exporter(object):
                 for geo_root in matchmove_geo:
                     cmds.isolateSelect(
                         model_panel, addDagObject=geo_root)
-                # Backdrop nodes (the sky dome): visible in the shot but
-                # never shaded by us -- see extra_isolate_nodes above.
-                for extra in (extra_isolate_nodes or []):
-                    if not (extra and cmds.objExists(extra)):
-                        continue
+                # Static geo rides along as a holdout (see 6b below).
+                for geo_root in holdout_geo:
                     try:
                         cmds.isolateSelect(
-                            model_panel, addDagObject=extra)
+                            model_panel, addDagObject=geo_root)
                     except Exception:
                         pass
                 # Add the camera and its image planes so the
@@ -5525,13 +5570,13 @@ class Exporter(object):
                                     container = cmds.group(
                                         em=True, name="QC_head_GRP")
                                 cmds.select(tgt, replace=True)
-                                grp, _, _ = create_qc_crown_from_mesh(
+                                grp, _ = create_qc_crown_from_mesh(
                                     name="QC_headCrown{}".format(
                                         idx + 1))
                                 # Reparent under the container; it
                                 # sits at the world origin (identity),
-                                # so the point/orient constraints keep
-                                # the crown locked to its mesh.
+                                # so the parent constraint keeps the
+                                # crown locked to its mesh.
                                 cmds.parent(grp, container)
                                 made += 1
                                 sys.stderr.write(
@@ -5635,6 +5680,64 @@ class Exporter(object):
                                 original_shading[mesh] = sgs[0]
                         except Exception:
                             pass
+
+                    # 6b. Holdout geo  -- the Static Geo picks.  A
+                    # useBackground shader makes these meshes render as
+                    # whatever is behind the viewport (the plate in the
+                    # single-pass view, black in the composite passes)
+                    # while still writing depth, so set geo in front of
+                    # the character cuts it away in BOTH the color and
+                    # the matte pass and the plate shows through.  The
+                    # per-pass shading swaps below all key off
+                    # mm_transforms, so the holdout keeps this shader
+                    # for every pass; the finally puts the original
+                    # shading engines back.
+                    for geo_root in holdout_geo:
+                        descendants = cmds.listRelatives(
+                            geo_root, allDescendents=True,
+                            type="mesh", fullPath=True) or []
+                        for m in descendants:
+                            try:
+                                if not cmds.getAttr(
+                                        m + ".intermediateObject"):
+                                    holdout_meshes.append(m)
+                            except Exception:
+                                pass
+                    if holdout_meshes:
+                        holdout_transforms = list(set(
+                            cmds.listRelatives(
+                                holdout_meshes, parent=True,
+                                fullPath=True) or []))
+                        for mesh in holdout_meshes:
+                            try:
+                                sgs = cmds.listConnections(
+                                    mesh, type="shadingEngine") or []
+                                if sgs:
+                                    holdout_shading[mesh] = sgs[0]
+                            except Exception:
+                                pass
+                        holdout_shader = cmds.shadingNode(
+                            "useBackground", asShader=True,
+                            name="mme_holdout_mtl")
+                        checker_nodes.append(holdout_shader)
+                        holdout_sg = cmds.sets(
+                            renderable=True, noSurfaceShader=True,
+                            empty=True, name="mme_holdout_SG")
+                        checker_nodes.append(holdout_sg)
+                        cmds.connectAttr(
+                            "{}.outColor".format(holdout_shader),
+                            "{}.surfaceShader".format(holdout_sg),
+                            force=True)
+                        if holdout_transforms:
+                            cmds.select(
+                                holdout_transforms, replace=True)
+                            cmds.hyperShade(assign=holdout_shader)
+                            cmds.select(clear=True)
+                        sys.stderr.write(
+                            LOG_PREFIX + " Holdout: useBackground on "
+                            "{} mesh(es) under {} static geo "
+                            "root(s)\n".format(
+                                len(holdout_meshes), len(holdout_geo)))
 
                     # Check ffmpeg + composite paths for multi-pass
                     use_composite = (
@@ -6077,6 +6180,23 @@ class Exporter(object):
                             if not os.path.exists(wf_dir):
                                 os.makedirs(wf_dir)
                             self._trace("Rendering wireframe pass...")
+                            # The holdout geo is a matte, not something
+                            # we draw: wireframeOnShaded below would put
+                            # its edges into this overlay too, so it is
+                            # hidden for this pass.  Nothing renders
+                            # after it, so visibility is restored once,
+                            # in the finally.
+                            for root in holdout_geo:
+                                vis_attr = root + ".visibility"
+                                try:
+                                    holdout_vis[vis_attr] = cmds.getAttr(
+                                        vis_attr)
+                                    cmds.setAttr(vis_attr, False)
+                                except Exception as exc:
+                                    sys.stderr.write(
+                                        LOG_PREFIX + " Could not hide "
+                                        "{} for the wireframe pass: "
+                                        "{}\n".format(root, exc))
                             # Ensure black background
                             cmds.displayRGBColor(
                                 "background", 0, 0, 0)
@@ -6740,6 +6860,20 @@ class Exporter(object):
                         if cmds.objExists(mesh) and cmds.objExists(sg):
                             cmds.sets(mesh, edit=True,
                                       forceElement=sg)
+                    except Exception:
+                        pass
+                # Holdout geo: its own shading engines and the
+                # visibility the wireframe pass switched off.
+                for mesh, sg in holdout_shading.items():
+                    try:
+                        if cmds.objExists(mesh) and cmds.objExists(sg):
+                            cmds.sets(mesh, edit=True,
+                                      forceElement=sg)
+                    except Exception:
+                        pass
+                for vis_attr, val in holdout_vis.items():
+                    try:
+                        cmds.setAttr(vis_attr, val)
                     except Exception:
                         pass
                 if original_display_textures is not None and model_panel:
@@ -11354,7 +11488,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
-        self.mm_skydome_checkbox = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -11869,11 +12002,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         tpose_row.addWidget(self.tpose_frame_spin)
         tpose_row.addStretch()
         tab_layout.addLayout(tpose_row)
-
-        self.mm_skydome_checkbox = QCheckBox("  Include Skydome")
-        self.mm_skydome_checkbox.setChecked(True)
-        self.mm_skydome_checkbox.setToolTip(SKYDOME_CHECKBOX_TOOLTIP)
-        tab_layout.addWidget(self.mm_skydome_checkbox)
 
         sep_p, preview_btn = self._build_preview_button_row()
         tab_layout.addWidget(sep_p)
@@ -13967,16 +14095,14 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     p["geo_field"].text().strip()
                     for p in self.mm_rig_geo_pairs
                     if p["geo_field"].text().strip()]
-                autofit_geo = list(geo_roots)
+                static_geo = [
+                    e["field"].text().strip()
+                    for e in self.mm_static_geo_fields
+                    if e["field"].text().strip()]
+                autofit_geo = geo_roots + static_geo
                 pb_kwargs.update(
                     matchmove_geo=geo_roots,
-                    # The preview is meant to match the export output, so
-                    # it shows the dome a previous run left in the scene.
-                    # None is built here -- previewing must not modify the
-                    # scene.
-                    extra_isolate_nodes=(
-                        Exporter._find_eg_skydomes()
-                        if self.mm_skydome_checkbox.isChecked() else []),
+                    holdout_geo=static_geo,
                     motion_blur=mb,
                     composite_wireframe_overlay=wf_overlay,
                     composite_wireframe_geo=geo_roots,
@@ -14773,23 +14899,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             geo_roots + rig_roots + proxy_geos,
             start_frame, end_frame)
 
-        # Build (or reuse the artist's) sky dome backdrop. A dome we create
-        # is appended to the static geo so it persists in every export
-        # (including the snapshot-based FBX); it is hidden from the witness
-        # (qc) render. With "Include Skydome" off we neither build one nor
-        # ask the user about ambiguously named nodes -- definite domes are
-        # still hidden from the qc render by name.
-        confirmed_domes = []
-        skydome = None
-        if self.mm_skydome_checkbox.isChecked():
-            artist_domes, confirmed_domes = self._resolve_skydomes()
-            skydome = self._prepare_skydome(
-                geo_roots + rig_roots + proxy_geos, camera,
-                start_frame, end_frame, artist_domes)
-            if skydome:
-                proxy_geos = proxy_geos + [skydome]
-        else:
-            self._drop_eg_skydome()
+        # No sky dome here. Matchmove ignores domes completely: it never
+        # builds one, never asks about ambiguously named nodes, and never
+        # touches one the artist made -- the backdrop is a Camera Track
+        # concern only. A dome left in the scene is not exported (it is
+        # only ever in the export selection if the artist picked it) and
+        # cannot reach either playblast: the main render isolates the
+        # assigned geo, and the witness (qc) render hides domes by name.
 
         tpose_start = start_frame
         if self.tpose_checkbox.isChecked():
@@ -15058,11 +15174,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     wf_opacity = (
                         self.pb_wireframe_opacity_spin.value() / 100.0)
                     wf_color = self.pb_wireframe_color_btn._color
+                    # Static geo joins the character in the main
+                    # playblast as a useBackground holdout.
+                    holdout_geo = list(proxy_geos)
                     results["mov"] = exporter.export_playblast(
                         pb_path, camera, start_frame, end_frame,
                         matchmove_geo=geo_roots,
-                        extra_isolate_nodes=(
-                            [skydome] if skydome else []),
+                        holdout_geo=holdout_geo,
                         rig_roots=rig_roots,
                         checker_scale=chk_scale,
                         checker_color=chk_color,
@@ -15103,7 +15221,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             # plus the main camera path only -- other geo
                             # still renders but does not push the standoff.
                             geo_nodes=rig_roots,
-                            hide_domes=confirmed_domes,
                             shot_name=folder_name,
                             auto_place=(
                                 self.pb_auto_qc_cam_cb.isChecked())))
