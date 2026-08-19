@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v21_beta-8"
+TOOL_VERSION = "v21_beta-9"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -2419,10 +2419,7 @@ class Exporter(object):
         for a in ("translate", "rotate", "scale"):
             for ax in "XYZ":
                 attr = "{}.{}{}".format(dup, a, ax)
-                try:
-                    cmds.setAttr(attr, lock=False, keyable=True)
-                except Exception:
-                    pass
+                Exporter._unlock_for_bake(attr)
                 try:
                     cmds.cutKey(attr, clear=True)
                 except Exception:
@@ -3598,12 +3595,10 @@ class Exporter(object):
     @staticmethod
     def _bake_local_trs(src, tgt, start, end):
         """Bake TRS onto *tgt* to match *src* via constraints, then remove them."""
-        for a in ("tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"):
-            try:
-                cmds.setAttr("{}.{}".format(tgt, a),
-                             lock=False, keyable=True, channelBox=True)
-            except Exception:
-                pass
+        Exporter._unlock_for_bake(
+            ["{}.{}".format(tgt, a)
+             for a in ("tx", "ty", "tz", "rx", "ry", "rz",
+                       "sx", "sy", "sz")])
 
         pc = cmds.parentConstraint(src, tgt, mo=True)[0]
         sc = None
@@ -3815,7 +3810,57 @@ class Exporter(object):
         return False
 
     @staticmethod
-    def _bake_transform_curves(transforms, start, end):
+    def _unlock_for_bake(plugs, log_fn=None):
+        """Unlock *plugs* so ``cmds.bakeResults`` can write to them.
+
+        The unlock and the channel-box flags go in SEPARATE setAttr calls
+        on purpose. Maya refuses to change the *keyable* state of an
+        attribute that came from a referenced file, and it rejects the
+        whole call when it refuses -- so the combined
+        ``setAttr(plug, lock=False, keyable=True, channelBox=True)`` this
+        replaces left a referenced-and-locked channel still locked. The
+        bake then wrote nothing to it and the export shipped a camera (or
+        rig) frozen at a single pose, with the error swallowed. Unlocking
+        on its own succeeds on a referenced attribute; the display flags
+        are cosmetic and stay best effort.
+
+        Anything still locked afterwards is reported rather than
+        swallowed -- a silently static camera in a delivered file is far
+        worse than a noisy export. Returns those plugs.
+        """
+        if isinstance(plugs, str):
+            plugs = [plugs]
+        stuck = []
+        for plug in plugs:
+            try:
+                cmds.setAttr(plug, lock=False)
+            except Exception:
+                pass
+            try:
+                cmds.setAttr(plug, keyable=True, channelBox=True)
+            except Exception:
+                pass
+            try:
+                if cmds.getAttr(plug, lock=True):
+                    stuck.append(plug)
+            except Exception:
+                pass
+        if stuck:
+            shown = ", ".join(p.rsplit("|", 1)[-1] for p in stuck[:6])
+            if len(stuck) > 6:
+                shown += ", ... (+{} more)".format(len(stuck) - 6)
+            sys.stderr.write(
+                LOG_PREFIX + " Could not unlock before baking: {}\n".format(
+                    shown))
+            if log_fn:
+                log_fn(
+                    "WARNING: {} channel(s) could not be unlocked for "
+                    "baking, so the export will hold a STATIC pose for "
+                    "them. See Script Editor.".format(len(stuck)))
+        return stuck
+
+    @staticmethod
+    def _bake_transform_curves(transforms, start, end, log_fn=None):
         """Bake TRS channels in-place via one cmds.bakeResults call.
 
         Accepts a single transform or a list of transforms.
@@ -3836,14 +3881,9 @@ class Exporter(object):
         if not transforms:
             return
         trs = ["tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"]
-        for transform in transforms:
-            for a in trs:
-                try:
-                    cmds.setAttr("{}.{}".format(transform, a),
-                                 lock=False, keyable=True,
-                                 channelBox=True)
-                except Exception:
-                    pass
+        Exporter._unlock_for_bake(
+            ["{}.{}".format(t, a) for t in transforms for a in trs],
+            log_fn=log_fn)
         cmds.refresh(suspend=True)
         try:
             cmds.bakeResults(
@@ -3927,13 +3967,9 @@ class Exporter(object):
 
         # --- Step 0: Bake camera animation ---
         if camera and cmds.objExists(camera):
-            for a in trs:
-                try:
-                    cmds.setAttr("{}.{}".format(camera, a),
-                                 lock=False, keyable=True,
-                                 channelBox=True)
-                except Exception:
-                    pass
+            Exporter._unlock_for_bake(
+                ["{}.{}".format(camera, a) for a in trs],
+                log_fn=self.log)
             cmds.bakeResults(
                 camera,
                 t=(int(start_frame), int(end_frame)),
@@ -4158,14 +4194,10 @@ class Exporter(object):
             cmds.currentTime(int(start_frame), edit=True)
 
             # Unlock and bake TRS
-            for cm in nonskinned_meshes:
-                for a in trs:
-                    try:
-                        cmds.setAttr(
-                            "{}.{}".format(cm, a),
-                            lock=False, keyable=True, channelBox=True)
-                    except Exception:
-                        pass
+            Exporter._unlock_for_bake(
+                ["{}.{}".format(cm, a)
+                 for cm in nonskinned_meshes for a in trs],
+                log_fn=self.log)
             cmds.bakeResults(
                 nonskinned_meshes,
                 t=(int(start_frame), int(end_frame)),
@@ -4353,14 +4385,10 @@ class Exporter(object):
                     len(all_joints), len(constrained_xforms)))
             self._trace("Baking animation...")
             # Unlock TRS channels before baking
-            for node in all_bake_nodes:
-                for a in trs:
-                    try:
-                        cmds.setAttr(
-                            "{}.{}".format(node, a),
-                            lock=False, keyable=True, channelBox=True)
-                    except Exception:
-                        pass
+            Exporter._unlock_for_bake(
+                ["{}.{}".format(node, a)
+                 for node in all_bake_nodes for a in trs],
+                log_fn=self.log)
             cmds.bakeResults(
                 all_bake_nodes,
                 t=(int(start_frame), int(end_frame)),
@@ -4882,7 +4910,7 @@ class Exporter(object):
         # avoids one full playthrough per leaf.
         if to_bake:
             self._bake_transform_curves(
-                to_bake, start_frame, end_frame)
+                to_bake, start_frame, end_frame, log_fn=self.log)
 
         self._trace(
             "Classification: {} blendshape, {} animated, "
@@ -14431,26 +14459,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 baked_abc_cams.append(cam)
                 trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                        "sx", "sy", "sz"]
-                for a in trs:
-                    try:
-                        cmds.setAttr(
-                            "{}.{}".format(cam, a),
-                            lock=False, keyable=True,
-                            channelBox=True)
-                    except Exception:
-                        pass
+                Exporter._unlock_for_bake(
+                    ["{}.{}".format(cam, a) for a in trs],
+                    log_fn=self._log)
                 cmds.bakeResults(
                     cam,
                     t=(int(start_frame), int(end_frame)),
                     at=trs, simulation=True,
                     preserveOutsideKeys=True)
                 for shp in cam_shapes:
-                    try:
-                        cmds.setAttr(
-                            "{}.focalLength".format(shp),
-                            lock=False, keyable=True)
-                    except Exception:
-                        pass
+                    Exporter._unlock_for_bake(
+                        "{}.focalLength".format(shp), log_fn=self._log)
                     cmds.bakeResults(
                         shp,
                         t=(int(start_frame), int(end_frame)),
@@ -14542,7 +14561,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 # handled by the helper).
                 Exporter._bake_transform_curves(
                     nodes_to_bake,
-                    int(start_frame), int(end_frame))
+                    int(start_frame), int(end_frame),
+                    log_fn=self._log)
 
                 sys.stderr.write(
                     LOG_PREFIX + " Baked object track: {} "
@@ -15059,14 +15079,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     baked_abc_cam = True
                     trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                            "sx", "sy", "sz"]
-                    for a in trs:
-                        try:
-                            cmds.setAttr(
-                                "{}.{}".format(camera, a),
-                                lock=False, keyable=True,
-                                channelBox=True)
-                        except Exception:
-                            pass
+                    Exporter._unlock_for_bake(
+                        ["{}.{}".format(camera, a) for a in trs],
+                        log_fn=self._log)
                     cmds.bakeResults(
                         camera,
                         t=(int(start_frame), int(end_frame)),
@@ -15075,12 +15090,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         preserveOutsideKeys=True,
                     )
                     for shp in cam_shapes:
-                        try:
-                            cmds.setAttr(
-                                "{}.focalLength".format(shp),
-                                lock=False, keyable=True)
-                        except Exception:
-                            pass
+                        Exporter._unlock_for_bake(
+                            "{}.focalLength".format(shp),
+                            log_fn=self._log)
                         cmds.bakeResults(
                             shp,
                             t=(int(start_frame), int(end_frame)),
@@ -15641,26 +15653,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     bake_pre = int(start_frame) - 1
                     trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                            "sx", "sy", "sz"]
-                    for a in trs:
-                        try:
-                            cmds.setAttr(
-                                "{}.{}".format(camera, a),
-                                lock=False, keyable=True,
-                                channelBox=True)
-                        except Exception:
-                            pass
+                    Exporter._unlock_for_bake(
+                        ["{}.{}".format(camera, a) for a in trs],
+                        log_fn=self._log)
                     cmds.bakeResults(
                         camera,
                         t=(bake_pre, int(end_frame)),
                         at=trs, simulation=True,
                         preserveOutsideKeys=True)
                     for shp in cam_shapes:
-                        try:
-                            cmds.setAttr(
-                                "{}.focalLength".format(shp),
-                                lock=False, keyable=True)
-                        except Exception:
-                            pass
+                        Exporter._unlock_for_bake(
+                            "{}.focalLength".format(shp),
+                            log_fn=self._log)
                         cmds.bakeResults(
                             shp,
                             t=(bake_pre, int(end_frame)),
@@ -15769,7 +15773,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     # One batched bake -- simulation=True plays the
                     # timeline once per call, not once per node.
                     Exporter._bake_transform_curves(
-                        geo_to_bake, bake_pre, int(end_frame))
+                        geo_to_bake, bake_pre, int(end_frame),
+                        log_fn=self._log)
                     sys.stderr.write(
                         LOG_PREFIX + " Baked {} geo "
                         "transform(s) for playblast.\n"
