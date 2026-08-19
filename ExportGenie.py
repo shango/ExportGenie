@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v21"
+TOOL_VERSION = "v21_beta-8"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -123,10 +123,12 @@ WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
                                            # plane (per-object draw override)
 
 # Skydome backdrop.  If the scene has no sky sphere the exporter builds
-# one that encloses the assigned geo and the whole camera path, sitting
-# beyond each frame's image plane, with normals flipped inward so the
-# tracked camera sees it correctly.  The created dome persists in the
-# exported files but is hidden from the witness (qc) render.
+# one that encloses the assigned geo and the whole camera path, with
+# normals flipped inward so the tracked camera sees it correctly.  The
+# camera's image plane is then re-fitted to sit behind the finished dome,
+# so the dome reads as a wireframe grid over the plate rather than being
+# hidden by it.  The created dome persists in the exported files but is
+# hidden from the witness (qc) render.
 SKYDOME_NAME = "EG_skydome"
 # Definite matches -- a sky-dome name; treated as a dome with no prompt.
 # "dome" is one of them, so a bare "dome" and anything ending in it
@@ -2169,6 +2171,53 @@ class Exporter(object):
                     "'{}': {}\n".format(geo, e))
         return count
 
+    @staticmethod
+    def _swap_to_default_shader(roots):
+        """Assign every renderable surface under *roots* to Maya's
+        default lambert.  Returns ``{shape: original shadingEngine}``.
+
+        A shading network is what carries paths to the original
+        textures into an export, so both the .ma and the .fbx strip it.
+        Collected as SHAPES, not meshes: a NURBS surface or subdiv
+        otherwise keeps its assignment, and one un-stripped surface
+        drags the whole network -- file nodes and their absolute
+        texture paths -- back into the exported file, including the
+        textures used by meshes that WERE stripped.
+        """
+        # allDescendents does NOT combine with the shapes flag -- that
+        # pairing returns None -- so descend unfiltered and sieve the
+        # shapes out with ls.
+        surfaces = []
+        for node in roots:
+            if node and cmds.objExists(node):
+                kids = cmds.listRelatives(
+                    node, allDescendents=True, fullPath=True) or []
+                surfaces.extend(
+                    cmds.ls(kids, shapes=True, long=True) or [])
+        original = {}
+        for shp in surfaces:
+            try:
+                sgs = cmds.listConnections(
+                    shp, type="shadingEngine") or []
+            except Exception:
+                continue
+            if sgs and sgs[0] != "initialShadingGroup":
+                original[shp] = sgs[0]
+        # One batched set edit instead of per-shape edits (each edit
+        # dirties the shading graph and is replayed by any undo).
+        if original:
+            try:
+                cmds.sets(list(original), edit=True,
+                          forceElement="initialShadingGroup")
+            except Exception:
+                for shp in original:
+                    try:
+                        cmds.sets(shp, edit=True,
+                                  forceElement="initialShadingGroup")
+                    except Exception:
+                        pass
+        return original
+
     def export_ma(self, file_path, camera, geo_roots, rig_roots, proxy_geos,
                   start_frame=None, end_frame=None):
         """Export selection as Maya ASCII.
@@ -2235,38 +2284,10 @@ class Exporter(object):
             _ma_cleanup_done = True
 
             # Replace all custom shaders with the default lambert so
-            # the exported .ma contains only default materials.
-            all_meshes = []
-            for node in sel:
-                if node and cmds.objExists(node):
-                    descendants = cmds.listRelatives(
-                        node, allDescendents=True,
-                        type="mesh", fullPath=True) or []
-                    all_meshes.extend(descendants)
-            meshes_to_swap = []
-            for mesh in all_meshes:
-                try:
-                    sgs = cmds.listConnections(
-                        mesh, type="shadingEngine") or []
-                    if sgs and sgs[0] != "initialShadingGroup":
-                        meshes_to_swap.append(mesh)
-                except Exception:
-                    pass
-            # One batched set edit instead of per-mesh edits (each
-            # edit dirties the shading graph and is replayed by the
-            # closing undo).
-            if meshes_to_swap:
-                try:
-                    cmds.sets(meshes_to_swap, edit=True,
-                              forceElement="initialShadingGroup")
-                except Exception:
-                    for mesh in meshes_to_swap:
-                        try:
-                            cmds.sets(
-                                mesh, edit=True,
-                                forceElement="initialShadingGroup")
-                        except Exception:
-                            pass
+            # the exported .ma contains only default materials, and no
+            # paths to the original textures.  Rolled back with the
+            # rest of the undo chunk once the export finishes.
+            Exporter._swap_to_default_shader(sel)
 
             # Set image plane coverage and Maya render resolution to
             # match the actual source image dimensions.
@@ -2675,11 +2696,27 @@ class Exporter(object):
             info_grp = self._create_metadata_grp()
             sel.append(info_grp)
 
+            # Strip custom shaders as the .ma does.  Textures are not
+            # embedded (FBXExportEmbeddedTextures is false above), so a
+            # surviving material is written into the .fbx as a path
+            # reference to the original texture on disk.  Restored in
+            # the finally: unlike the .ma path there is no undo chunk
+            # around this.
+            fbx_orig_shading = Exporter._swap_to_default_shader(sel)
+
             try:
                 cmds.select(sel, replace=True)
                 mel_path = file_path.replace("\\", "/").replace('"', '\\"')
                 mel.eval('FBXExport -f "{}" -s'.format(mel_path))
             finally:
+                for shp, shp_sg in fbx_orig_shading.items():
+                    try:
+                        if (cmds.objExists(shp)
+                                and cmds.objExists(shp_sg)):
+                            cmds.sets(shp, edit=True,
+                                      forceElement=shp_sg)
+                    except Exception:
+                        pass
                 if cmds.objExists(info_grp):
                     try:
                         cmds.delete(info_grp)
@@ -3397,6 +3434,10 @@ class Exporter(object):
                     frameRange=(int(start_frame), int(end_frame)),
                     frameStride=1.0,
                     defaultMeshScheme="none",
+                    # No materials: the default shadingMode writes a
+                    # UsdUVTexture carrying the absolute path to the
+                    # original texture on disk.
+                    shadingMode="none",
                     exportSkels="auto",
                     exportSkin="auto",
                     exportBlendShapes=has_blendshapes,
@@ -8363,9 +8404,12 @@ class Exporter(object):
         `far_value + 1.0` (2 units beyond the farthest object, given
         the +1 padding baked into `far_value`). No-op on empty inputs.
 
+        Both attributes are temporarily unlocked if the scene ships them
+        locked (SynthEyes does) and re-locked afterwards.
+
         When ``log_fn`` is provided, logs:
         - the number of camera shapes / image planes located
-        - any locked attributes (which silently block writes)
+        - any attribute that had to be unlocked, and any unlock failure
         - any setAttr exceptions (network/reference locks, etc.)
         - the actual final values of depth + farClipPlane (so the
           user can confirm the change took effect)
@@ -8437,12 +8481,25 @@ class Exporter(object):
                     ip_locked = cmds.getAttr(depth_attr, lock=True)
                 except Exception:
                     ip_locked = False
-                if ip_locked and log_fn:
-                    log_fn(
-                        "Auto-fit apply {}: {} is LOCKED; cannot set "
-                        "depth to {:.1f}.".format(
-                            camera, depth_attr, depth_value))
-                    continue
+                # Temporarily unlock the plate depth, same as the far clip
+                # above: SynthEyes-exported scenes ship it locked, and
+                # skipping it there left the plate in front of the sky dome
+                # -- which is exactly the case the dome re-fit exists to
+                # cure. Re-locked to the original state once the write
+                # lands.
+                if ip_locked:
+                    try:
+                        cmds.setAttr(depth_attr, lock=False)
+                        if log_fn:
+                            log_fn(
+                                "Auto-fit apply {}: {} was LOCKED; "
+                                "temporarily unlocking to update.".format(
+                                    camera, depth_attr))
+                    except Exception as exc:
+                        if log_fn:
+                            log_fn(
+                                "Auto-fit apply {}: failed to unlock {}: "
+                                "{}".format(camera, depth_attr, exc))
                 try:
                     cmds.setAttr(depth_attr, depth_value)
                 except Exception as exc:
@@ -8450,6 +8507,11 @@ class Exporter(object):
                         log_fn(
                             "Auto-fit apply {}: setAttr {} failed: "
                             "{}".format(camera, depth_attr, exc))
+                if ip_locked:
+                    try:
+                        cmds.setAttr(depth_attr, lock=True)
+                    except Exception:
+                        pass
 
             # ---- read-back so the log shows real values ----
             if log_fn:
@@ -13382,41 +13444,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         return max_far if max_far > 0 else None
 
     @staticmethod
-    def _extend_camera_far_clip(camera, min_far):
-        """Raise each camera shape's farClipPlane to at least *min_far* so
-        the sky dome behind the geo is not clipped in the tracked
-        camera's view. imagePlane.depth is left untouched (the plate stays
-        just beyond the real geo). Handles SynthEyes-style locked clips."""
-        if not camera or not cmds.objExists(camera):
-            return
-        for cs in (cmds.listRelatives(
-                camera, shapes=True, type="camera") or []):
-            attr = cs + ".farClipPlane"
-            try:
-                if cmds.getAttr(attr) >= min_far:
-                    continue
-            except Exception:
-                pass
-            try:
-                locked = cmds.getAttr(attr, lock=True)
-            except Exception:
-                locked = False
-            if locked:
-                try:
-                    cmds.setAttr(attr, lock=False)
-                except Exception:
-                    pass
-            try:
-                cmds.setAttr(attr, min_far)
-            except Exception:
-                pass
-            if locked:
-                try:
-                    cmds.setAttr(attr, lock=True)
-                except Exception:
-                    pass
-
-    @staticmethod
     def _playblast_far_clip(camera):
         """Far clip for the main playblast: the camera's current
         farClipPlane -- already fit a few units past the farthest object
@@ -13462,21 +13489,23 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 confirmed.append(cand)
         return definite + confirmed, confirmed
 
-    def _drop_eg_skydome(self):
-        """Delete any EG_skydome left in the scene by a previous run.
+    def _note_stale_eg_skydome(self):
+        """Report -- but do not touch -- an EG_skydome a previous run left
+        in the scene, when "Include Skydome" is off.
 
-        Called when "Include Skydome" is off: the exports are selection
-        based so a stale dome would not reach them, but the playblast is a
-        viewport capture and would still show it. Only OUR dome is removed
-        -- an artist's dome is theirs to manage.
+        This used to DELETE the dome, on the grounds that the playblast is
+        a viewport capture that would otherwise show it. It would not: the
+        plate is only pushed out past a dome when we build one, so with the
+        box unchecked a stale dome stays behind the image plane and is
+        never rendered, and the exports are selection based so it cannot
+        reach them either. Deleting nodes out of the artist's scene bought
+        nothing, so it no longer happens.
         """
         for dome in Exporter._find_eg_skydomes():
-            try:
-                cmds.delete(dome)
-                self._log("Sky dome off; removed the previous '{}'.".format(
-                    SKYDOME_NAME))
-            except Exception:
-                pass
+            self._log(
+                "Sky dome off; leaving the existing '{}' in the scene, "
+                "out of the exports.".format(SKYDOME_NAME))
+            break
 
     def _prepare_skydome(self, geo_nodes, camera, start_frame, end_frame,
                          artist_domes):
@@ -13486,12 +13515,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         caller via _resolve_skydomes) it is left untouched -- theirs to
         manage, and only hidden from the qc render later -- and this
         returns None. Otherwise any stale EG_skydome is rebuilt sized to
-        enclose *geo_nodes* plus the camera path and to sit beyond the
-        image plane, centred on y=0 so it reads as a dome standing on the
-        ground, the tracked camera's far clip is extended,
-        and the dome is returned so the caller can add it to the export
-        selection (it persists in the exported files but is hidden from the
-        qc render).
+        enclose *geo_nodes* plus the camera path, centred on y=0 so it
+        reads as a dome standing on the ground; the tracked camera's image
+        plane and far clip are then re-fitted to sit BEHIND the finished
+        dome, so it draws as a wireframe grid over the plate instead of
+        being occluded by it; and the dome is returned so the caller can
+        add it to the export selection (it persists in the exported files
+        but is hidden from the qc render).
         """
         if artist_domes:
             self._log(
@@ -13511,10 +13541,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # enclosed point up to |cy| further from it, so the reaches (which
         # were measured from the bbox centre) grow by that much before the
         # margin is applied.
+        #
+        # The radius deliberately does NOT read plate_depth. It used to,
+        # to push the dome clear of the image plane -- but the plate is now
+        # re-fitted behind the finished dome instead, so a dome sized off
+        # the plate would feed on a depth it had itself pushed out and grow
+        # by half again on every export (measured: 227 -> 490 -> 818 ->
+        # 1228 over four runs of a shot with no assigned geo, where the
+        # auto-fit pass that would otherwise reset the plate is skipped).
         cx, cy, cz = bounds["center"]
         radius = (max(
             bounds["geo_reach"],
-            bounds["cam_reach"] + bounds["plate_depth"],
+            bounds["cam_reach"],
         ) + abs(cy)) * SKYDOME_RADIUS_MARGIN
         if radius <= 0:
             return None
@@ -13522,14 +13560,41 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         # the export, so degrade to no dome on failure.
         try:
             # Drop any stale EG_skydome so the size tracks the scene.
-            for d in Exporter._find_skydomes():
+            # _find_eg_skydomes, not _find_skydomes: the artist-dome early
+            # return above means only our own dome can be standing here
+            # today, but the broad finder would happily delete an artist's
+            # dome the moment that guard moved.
+            for d in Exporter._find_eg_skydomes():
                 try:
                     cmds.delete(d)
                 except Exception:
                     pass
             dome = Exporter._create_skydome((cx, 0.0, cz), radius)
-            self._extend_camera_far_clip(
-                camera, bounds["cam_reach"] + radius + 1.0)
+            # Re-fit the plate BEHIND the dome we just built.
+            #
+            # The auto-fit pass that ran before this one put
+            # imagePlane.depth just past the farthest geo, and the dome is
+            # sized to clear that plate by at least 25% -- so with the
+            # plate left where it is the dome is always occluded by it and
+            # never reaches the main playblast, no matter the shot. Pushing
+            # the plate out past the dome's far side restores the intended
+            # read: the wireframe grid over the plate, plate behind it.
+            #
+            # cam_reach is measured from the geo/camera bbox centre, but
+            # the dome is grounded at y=0, so the eye can be up to |cy|
+            # further from the dome's centre than from that one -- hence
+            # the extra abs(cy) here.  Adding the radius gives the far side
+            # of the shell from the worst camera position.
+            #
+            # Only ever pushed OUT, never pulled in: a plate already
+            # sitting further back than the dome needs is the artist's
+            # call, and shrinking it could newly bury geo they never
+            # assigned to us behind it.
+            dome_far = bounds["cam_reach"] + abs(cy) + radius
+            Exporter.apply_camera_far_for_scene(
+                camera,
+                max(bounds["plate_depth"], dome_far + 1.0),
+                log_fn=self._log)
         except Exception as exc:
             self._log("Sky dome build failed; skipping it. See "
                       "Script Editor.")
@@ -14505,7 +14570,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 if skydome:
                     export_geo = export_geo + [skydome]
             else:
-                self._drop_eg_skydome()
+                self._note_stale_eg_skydome()
 
             if do_jsx:
                 geo_children = []
