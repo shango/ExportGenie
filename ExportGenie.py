@@ -720,6 +720,9 @@ class Exporter(object):
 
     def __init__(self, log_callback):
         self.log = log_callback
+        # One-shot latch so an unrecognized scene time unit is
+        # reported once per export, not once per _get_fps() call.
+        self._fps_warned = False
 
     def _trace(self, message):
         """Technical progress breadcrumb  -- goes to the Script Editor
@@ -1406,9 +1409,14 @@ class Exporter(object):
             ":x=30:y=h-th-30"
         ).format(opts=font_opts, start=start)
 
-        # Bottom-right: FL | resolution | version | datetime
+        # Bottom-right: FL | resolution | fps | version | datetime
         now_str = datetime.datetime.now().strftime(
             "%Y-%m-%d %H:%M")
+        # The scene rate is burned in because the show is no longer
+        # locked to 24: the movie's own playback rate is otherwise
+        # invisible in review, so a mis-set scene unit would only
+        # show up as an off-speed dailies play.
+        fps = self._get_fps()
 
         def meta_text(focal_length):
             parts = []
@@ -1416,6 +1424,7 @@ class Exporter(object):
                 parts.append("FL {:.1f}mm".format(focal_length))
             res = resolution or (1920, 1080)
             parts.append("{}x{}".format(res[0], res[1]))
+            parts.append("{:g} fps".format(fps))
             parts.append("{} {}".format(TOOL_NAME, TOOL_VERSION))
             parts.append(now_str)
             # Escape colons for ffmpeg drawtext syntax
@@ -7990,27 +7999,43 @@ class Exporter(object):
 
     # --- JSX Helper Methods ---
 
-    @staticmethod
-    def _get_fps():
-        """Map Maya's current time unit to FPS float."""
+    # Maya's named time units.  Every other unit that names a rate
+    # -- "25fps", "48fps", "119.88fps", "29.97df" -- carries the
+    # number in the string itself and is parsed by _FPS_UNIT_RE, so a
+    # scene on a custom rate exports at that rate instead of silently
+    # falling back to 24.  Only units that name no rate at all
+    # ("sec", "min", "hour", "millisec") reach the fallback.
+    _FPS_NAMED_UNITS = {
+        "game": 15.0,
+        "film": 24.0,
+        "pal": 25.0,
+        "ntsc": 30.0,
+        "show": 48.0,
+        "palf": 50.0,
+        "ntscf": 60.0,
+    }
+    _FPS_UNIT_RE = re.compile(r"^(\d+(?:\.\d+)?)(?:fps|df)$")
+
+    def _get_fps(self):
+        """Map Maya's current time unit to FPS float.
+
+        The scene's own time unit is the single source of truth --
+        ExportGenie never sets it.  An unrecognized unit falls back to
+        24 fps and says so in the tool log, so a wrong-speed playblast
+        is caught at export rather than in dailies.
+        """
         unit = cmds.currentUnit(query=True, time=True)
-        fps_map = {
-            "game": 15.0,
-            "film": 24.0,
-            "pal": 25.0,
-            "ntsc": 30.0,
-            "show": 48.0,
-            "palf": 50.0,
-            "ntscf": 60.0,
-            "23.976fps": 23.976,
-            "29.97fps": 29.97,
-            "29.97df": 29.97,
-            "47.952fps": 47.952,
-            "59.94fps": 59.94,
-            "44100fps": 44100.0,
-            "48000fps": 48000.0,
-        }
-        return fps_map.get(unit, 24.0)
+        if unit in self._FPS_NAMED_UNITS:
+            return self._FPS_NAMED_UNITS[unit]
+        match = self._FPS_UNIT_RE.match(unit or "")
+        if match:
+            return float(match.group(1))
+        if not self._fps_warned:
+            self._fps_warned = True
+            self.log(
+                "Scene time unit '{}' names no frame rate  -- "
+                "exporting at 24 fps.".format(unit))
+        return 24.0
 
     @staticmethod
     def _sanitize_jsx_var(name):
@@ -10813,7 +10838,7 @@ class Exporter(object):
                 if node_type == "Root":
                     out_lines.extend(self._rewrite_nk_root(
                         block, file_path, start_frame, end_frame,
-                        plate_width, plate_height))
+                        plate_width, plate_height, self._get_fps()))
                 elif (node_type in ("Camera3", "ReadGeo2")
                       or block_name in self._NK_NODE_TO_ASSET):
                     # Alembic-bound nodes route by node type so a
@@ -10857,7 +10882,7 @@ class Exporter(object):
                     else:
                         rel = None
                     out_lines.extend(self._rewrite_nk_write_block(
-                        block, rel))
+                        block, rel, self._get_fps()))
                 elif node_type == "TimeOffset":
                     out_lines.extend(self._rewrite_nk_time_offset_block(
                         block, start_frame))
@@ -10896,9 +10921,16 @@ class Exporter(object):
 
     @staticmethod
     def _rewrite_nk_root(block, nk_path, start_frame, end_frame,
-                         plate_w, plate_h):
-        """Rewrite Root node knobs: name, project_directory,
+                         plate_w, plate_h, fps):
+        """Rewrite Root node knobs: name, project_directory, fps,
         format, first/last_frame, frame.
+
+        ``fps`` is the host Maya scene's rate.  The templates were
+        authored on a 24 fps show and carry no ``fps`` knob at all,
+        which leaves a generated script at Nuke's own 24 default --
+        wrong project rate, and a wrong-rate QC render out of the
+        Write node, on any show that isn't 24.  The knob is written
+        unconditionally so the script always matches the scene.
 
         ``project_directory`` is forced to
         ``[python {nuke.script_directory()}]`` so every plain
@@ -10924,16 +10956,21 @@ class Exporter(object):
         proj_dir_line = (
             ' project_directory '
             '"\\[python \\{nuke.script_directory()\\}\\]"')
+        fps_line = " fps {:g}".format(fps)
         out = []
         abs_nk = os.path.abspath(nk_path).replace("\\", "/")
-        proj_dir_emitted = False
+        owned_emitted = False
         for ln in block:
             if ln.startswith(" name "):
                 out.append(" name " + abs_nk)
                 out.append(proj_dir_line)
-                proj_dir_emitted = True
+                out.append(fps_line)
+                owned_emitted = True
             elif ln.startswith(" project_directory "):
                 # Drop any template-authored value -- we own this knob.
+                continue
+            elif ln.startswith(" fps "):
+                # Same: the scene's rate wins over the template's.
                 continue
             elif ln.startswith(" format ") and plate_w and plate_h:
                 out.append(Exporter._format_line_for(plate_w, plate_h))
@@ -10947,21 +10984,33 @@ class Exporter(object):
                 continue  # strip any template-authored callback
             else:
                 out.append(ln)
-        if not proj_dir_emitted:
+        if not owned_emitted:
             # Defensive: template lacked a `name` line. Insert
             # before the closing brace, or append if absent.
             if out and out[-1].startswith("}"):
                 out.insert(len(out) - 1, proj_dir_line)
+                out.insert(len(out) - 1, fps_line)
             else:
                 out.append(proj_dir_line)
+                out.append(fps_line)
         return out
 
     @staticmethod
-    def _rewrite_nk_write_block(block, rel_path):
+    def _rewrite_nk_write_block(block, rel_path, fps):
         """Rewrite the `file` knob on a Write block to a default
         path relative to the .nk (only when rel_path is not None),
-        and strip OCIO display/view/colorspace knobs whose values
-        are tied to a specific OCIO config.
+        retime an explicit `mov64_fps` to the scene rate, and strip
+        OCIO display/view/colorspace knobs whose values are tied to
+        a specific OCIO config.
+
+        ``mov64_fps`` is rewritten only where the template already
+        carries it.  The shipped templates don't -- the writer is
+        left inheriting the Root `fps` that _rewrite_nk_root now
+        sets -- and inventing the knob here would risk the same
+        "could not find knob" complaint on load that the stripped
+        OCIO knobs and _NK_ALEMBIC_DYNAMIC_KNOBS exist to avoid.
+        Re-authoring a template with an explicit writer fps stays
+        supported: the scene's rate wins over the baked value.
 
         The template was authored with `display ACES`, `view sRGB`,
         `ocioColorspace scene_linear` baked in -- those names don't
@@ -10977,6 +11026,9 @@ class Exporter(object):
                 # Quote the value -- Tcl-expression paths contain
                 # spaces and brackets that Nuke's parser splits on.
                 out.append(' file "{}"'.format(rel_path))
+                continue
+            if ln.startswith(" mov64_fps "):
+                out.append(" mov64_fps {:g}".format(fps))
                 continue
             stripped = False
             for k in strip:
