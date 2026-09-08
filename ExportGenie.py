@@ -2129,9 +2129,13 @@ class Exporter(object):
         markers; freezing them is a no-op so they fall through to
         the normal path.
         """
-        all_shapes = cmds.listRelatives(
-            node, allDescendents=True, shapes=True,
-            fullPath=True) or []
+        # allDescendents does NOT combine with the shapes flag -- that
+        # pairing returns None whenever the node's own children are
+        # transforms, which is exactly the tracker_grp case.  Descend
+        # unfiltered and sieve the shapes out with ls instead.
+        kids = cmds.listRelatives(
+            node, allDescendents=True, fullPath=True) or []
+        all_shapes = cmds.ls(kids, shapes=True, long=True) or []
         if not all_shapes:
             return False
         for shp in all_shapes:
@@ -2143,14 +2147,21 @@ class Exporter(object):
         return True
 
     @staticmethod
-    def _freeze_static_geo_transforms(proxy_geos):
-        """Freeze TRS on each static/proxy geo so exports get identity
-        root transforms (world-space position is baked into the shape).
+    def _prep_static_geo_for_export(proxy_geos):
+        """Delete construction history on each static/proxy geo, then
+        freeze its TRS so exports get identity root transforms
+        (world-space position is baked into the shape).
+
+        History is deleted first because that is the order the freeze
+        wants: a modelling stack left on the node is dead weight in a
+        deliverable, and clearing it leaves nothing for makeIdentity to
+        push a transformGeometry through.  ``delete -ch`` descends the
+        whole subtree, so picking a group cleans everything under it.
 
         Tracking-marker transforms (those whose subtree contains only
-        locator shapes) are skipped so their world-space positions
-        survive into the export -- artists rely on them as scene-space
-        reference points.
+        locator shapes) are skipped entirely so their world-space
+        positions survive into the export -- artists rely on them as
+        scene-space reference points.
 
         Caller is responsible for reverting via an undo chunk or
         snapshot restore  -- this function does NOT preserve the
@@ -2168,6 +2179,12 @@ class Exporter(object):
                     LOG_PREFIX + " Skipping freeze on tracking "
                     "marker '{}' (locator-only subtree)\n".format(geo))
                 continue
+            try:
+                cmds.delete(geo, constructionHistory=True)
+            except Exception as e:
+                sys.stderr.write(
+                    LOG_PREFIX + " Delete history failed on "
+                    "'{}': {}\n".format(geo, e))
             try:
                 cmds.makeIdentity(
                     geo, apply=True, translate=True,
@@ -2226,6 +2243,56 @@ class Exporter(object):
                     except Exception:
                         pass
         return original
+
+    # Camera-shape attributes that define the lens but are not
+    # keyable, so a plain keyable sweep would leave them editable.
+    _CAM_LENS_ATTRS = (
+        "horizontalFilmOffset",
+        "verticalFilmOffset",
+        "nearClipPlane",
+        "farClipPlane",
+    )
+
+    @staticmethod
+    def _lock_camera_attrs(camera):
+        """Lock the camera's keyable attributes plus its lens
+        intrinsics.  Returns the number of plugs locked.
+
+        Called just before the .ma is written so the exported camera
+        arrives read-only downstream: a solved camera is a measurement,
+        and nudging it silently invalidates every element tracked to it.
+        Locked attributes still evaluate their anim curves, so playback
+        is unaffected.
+
+        Display attributes (film gate overlay, resolution gate, locator
+        scale) are deliberately left free  -- they change how the camera
+        is drawn, not what it solved to.
+
+        The .ma is the only deliverable that can carry this: FBX,
+        Alembic, USD and OBJ have no notion of a locked attribute.
+        Plugs already locked in the source scene are left alone so the
+        undo that follows the export restores the original state.
+        """
+        nodes = [camera]
+        nodes.extend(cmds.listRelatives(
+            camera, shapes=True, type="camera") or [])
+        locked = 0
+        for node in nodes:
+            attrs = list(cmds.listAttr(node, keyable=True) or [])
+            if cmds.nodeType(node) == "camera":
+                attrs.extend(Exporter._CAM_LENS_ATTRS)
+            for attr in attrs:
+                plug = "{}.{}".format(node, attr)
+                try:
+                    if cmds.getAttr(plug, lock=True):
+                        continue
+                    cmds.setAttr(plug, lock=True)
+                    locked += 1
+                except Exception:
+                    # Compound parents, missing attrs on odd camera
+                    # types -- skip rather than fail the export.
+                    pass
+        return locked
 
     def export_ma(self, file_path, camera, geo_roots, rig_roots, proxy_geos,
                   start_frame=None, end_frame=None):
@@ -2349,6 +2416,15 @@ class Exporter(object):
                     datetime.date.today().isoformat()),
                 type="string")
             sel.append(info_grp)
+
+            # Lock the camera down last, after every attribute
+            # this export writes has been set.  Rolled back with the
+            # rest of the undo chunk, so the live scene is untouched.
+            if camera and cmds.objExists(camera):
+                n_locked = Exporter._lock_camera_attrs(camera)
+                self._trace(
+                    "MA: locked {} camera attribute(s) on "
+                    "'{}'.".format(n_locked, camera))
 
             cmds.select(sel, replace=True)
             cmds.file(
@@ -15219,8 +15295,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         except Exception:
                             pass
 
-            # Freeze transforms on static/proxy geo for MA/ABC/USD
-            # so the exported files have identity root transforms.
+            # Delete history and freeze transforms on static/proxy
+            # geo for MA/ABC/USD so the exported files have clean,
+            # history-free shapes on identity root transforms.
             # Wrapped in its own undo chunk so the source scene is
             # untouched after this block finishes.  FBX runs later
             # under a separate tmp-file snapshot and freezes there.
@@ -15229,12 +15306,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 if proxy_geos and (do_ma or do_abc or do_usd):
                     cmds.undoInfo(openChunk=True)
                     freeze_chunk_open = True
-                    n = Exporter._freeze_static_geo_transforms(
+                    n = Exporter._prep_static_geo_for_export(
                         proxy_geos)
                     if n:
                         self._log(
-                            "Froze transforms on {} static "
-                            "geo.".format(n))
+                            "Cleaned {} static geo "
+                            "(history + transforms).".format(n))
 
                 if do_ma:
                     self._log("Exporting MA...")
@@ -15451,17 +15528,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                        for p in proxy_geos]
                         fbx_cam = (_resolve_name(camera)
                                    if camera else camera)
-                        # Freeze static geo transforms so the FBX has
-                        # identity roots.  Scene state is reverted by
-                        # the tmp-file reopen in the finally block.
+                        # Delete history and freeze static geo so the
+                        # FBX has clean shapes on identity roots.  Scene
+                        # state is reverted by the tmp-file reopen in
+                        # the finally block.
                         if fbx_proxies:
                             n_frozen = \
-                                Exporter._freeze_static_geo_transforms(
+                                Exporter._prep_static_geo_for_export(
                                     fbx_proxies)
                             if n_frozen:
                                 self._log(
-                                    "Froze transforms on {} static "
-                                    "geo.".format(n_frozen))
+                                    "Cleaned {} static geo "
+                                    "(history + transforms)."
+                                    .format(n_frozen))
                         results["fbx"] = exporter.export_fbx(
                             paths["fbx"], fbx_cam, fbx_geo,
                             fbx_rigs, fbx_proxies,
@@ -15997,18 +16076,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             export_nodes = ma_prep.get(
                                 "select_for_export",
                                 resolved_meshes)
-                            # Freeze static geo transforms.  Scene is
-                            # restored from tmp_scene in the outer
-                            # finally, so no explicit undo needed.
+                            # Delete history and freeze static geo.
+                            # Scene is restored from tmp_scene in the
+                            # outer finally, so no explicit undo needed.
                             if resolved_statics:
                                 n_frozen = \
-                                    Exporter._freeze_static_geo_transforms(
+                                    Exporter._prep_static_geo_for_export(
                                         resolved_statics)
                                 if n_frozen:
                                     self._log(
-                                        "Froze transforms on {} "
-                                        "static geo.".format(
-                                            n_frozen))
+                                        "Cleaned {} static geo "
+                                        "(history + transforms)."
+                                        .format(n_frozen))
                             results["ma"] = exporter.export_ma(
                                 paths["ma"], resolved_cam,
                                 export_nodes, [],
@@ -16057,17 +16136,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                 static_geos = (
                                     [static_geo]
                                     if static_geo else [])
-                                # Freeze static geo transforms; scene
-                                # restore happens in the outer finally.
+                                # Delete history and freeze static
+                                # geo; scene restore happens in the
+                                # outer finally.
                                 if static_geos:
                                     n_frozen = \
-                                        Exporter._freeze_static_geo_transforms(
+                                        Exporter._prep_static_geo_for_export(
                                             static_geos)
                                     if n_frozen:
                                         self._log(
-                                            "Froze transforms on {}"
-                                            " static geo.".format(
-                                                n_frozen))
+                                            "Cleaned {} static "
+                                            "geo (history + "
+                                            "transforms)."
+                                            .format(n_frozen))
                                 results["usd"] = \
                                     exporter.export_usd(
                                         paths["usd"], camera,
@@ -16118,17 +16199,19 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                 static_geos = (
                                     [static_geo]
                                     if static_geo else [])
-                                # Freeze static geo transforms; scene
-                                # restore happens in the outer finally.
+                                # Delete history and freeze static
+                                # geo; scene restore happens in the
+                                # outer finally.
                                 if static_geos:
                                     n_frozen = \
-                                        Exporter._freeze_static_geo_transforms(
+                                        Exporter._prep_static_geo_for_export(
                                             static_geos)
                                     if n_frozen:
                                         self._log(
-                                            "Froze transforms on {}"
-                                            " static geo.".format(
-                                                n_frozen))
+                                            "Cleaned {} static "
+                                            "geo (history + "
+                                            "transforms)."
+                                            .format(n_frozen))
                                 results["fbx"] = \
                                     exporter.export_fbx(
                                         paths["fbx"], camera,
