@@ -122,7 +122,7 @@ WITNESS_GROUND_SUBDIV = 160        # subdivisions per side; with the extent
 WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
                                            # plane (per-object draw override)
 
-# Array Cam (Matchmove).  A second .mp4 through the tracked camera with a
+# Array Cam (Camera Track).  A second .mp4 through the tracked camera with a
 # world-locked grid of wireframe triangular bipyramids posed just in front
 # of it at the start frame, so extra camera motion reads as grid drift.
 ARRAY_CAM_COUNT = 10               # bipyramids per row, per column and
@@ -393,7 +393,7 @@ class FolderManager(object):
         paths["mp4_witness_tmp_dir"] = witness_tmp_dir
         paths["mp4_witness_tmp_file"] = os.path.join(
             witness_tmp_dir, witness_base)
-        # Array Cam MP4 (Matchmove) -- the tracked camera's view with a
+        # Array Cam MP4 (Camera Track) -- the tracked camera's view with a
         # world-locked bipyramid grid in front of it.
         array_base = qc_base + "_array"
         paths["mp4_array"] = os.path.join(dir_path, array_base + ".mp4")
@@ -8043,11 +8043,15 @@ class Exporter(object):
         # start-frame world matrix and then never moves.
         cmds.xform(grp, worldSpace=True, matrix=cmds.getAttr(
             camera + ".worldMatrix", time=start_frame))
+        # Static in the scene: no constraint, parent or connection to the
+        # camera, and the pose is locked so nothing can drive it later.
+        for attr in ("translate", "rotate", "scale", "shear"):
+            cmds.setAttr(grp + "." + attr, lock=True)
         return grp
 
     def export_array_playblast(self, output_mp4, tmp_png_file, camera,
                                start_frame, end_frame, shot_name=None):
-        """Render the Array Cam movie (Matchmove).
+        """Render the Array Cam movie (Camera Track).
 
         A second .mp4 through the tracked camera showing only its plate
         and a world-locked 10 x 10 x 10 lattice of wireframe bipyramids posed
@@ -11941,6 +11945,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_abc_checkbox = None
         self.ct_usd_checkbox = None
         self.ct_mov_checkbox = None
+        self.ct_array_checkbox = None
         self.ct_nk_checkbox = None
         self.ct_skydome_checkbox = None
         # Playblast settings
@@ -11973,7 +11978,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
-        self.mm_array_checkbox = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -12321,6 +12325,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.ct_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ct_mov_checkbox.setChecked(True)
+        self.ct_array_checkbox = QCheckBox("  Array Cam")
+        self.ct_array_checkbox.setChecked(False)
+        self.ct_array_checkbox.setToolTip(
+            "Second playblast through the camera with a 10x10x10 lattice of "
+            "bipyramids locked in world space just in front of it, so "
+            "extra camera movement is obvious (_array.mp4)")
         self.ct_nk_checkbox = QCheckBox("  Nuke script (.nk)")
         self.ct_nk_checkbox.setChecked(True)
 
@@ -12330,6 +12340,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         fmt_layout.addWidget(self.ct_abc_checkbox)
         fmt_layout.addWidget(self.ct_usd_checkbox)
         fmt_layout.addWidget(self.ct_mov_checkbox)
+        fmt_layout.addWidget(self.ct_array_checkbox)
         fmt_layout.addWidget(self.ct_nk_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
@@ -12459,18 +12470,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.mm_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.mm_mov_checkbox.setChecked(True)
-        self.mm_array_checkbox = QCheckBox("  Array Cam")
-        self.mm_array_checkbox.setChecked(False)
-        self.mm_array_checkbox.setToolTip(
-            "Second playblast through the camera with a 10x10x10 lattice of "
-            "bipyramids locked in world space just in front of it, so "
-            "extra camera movement is obvious (_array.mp4)")
 
         fmt_layout.addWidget(self.mm_ma_checkbox)
         fmt_layout.addWidget(self.mm_fbx_checkbox)
         fmt_layout.addWidget(self.mm_abc_checkbox)
         fmt_layout.addWidget(self.mm_mov_checkbox)
-        fmt_layout.addWidget(self.mm_array_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -14137,9 +14141,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.ct_abc_checkbox.isChecked()
         do_usd = self.ct_usd_checkbox.isChecked()
         do_mov = self.ct_mov_checkbox.isChecked()
+        do_array = self.ct_array_checkbox.isChecked()
         do_nk = self.ct_nk_checkbox.isChecked()
         if not (do_ma or do_jsx or do_fbx or do_abc
-                or do_usd or do_mov or do_nk):
+                or do_usd or do_mov or do_array or do_nk):
             errors.append("No export format selected.")
 
         cameras = []
@@ -14247,8 +14252,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = False  # USD temporarily disabled for matchmove
         do_mov = self.mm_mov_checkbox.isChecked()
-        do_array = self.mm_array_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_abc or do_usd or do_mov or do_array):
+        if not (do_ma or do_fbx or do_abc or do_usd or do_mov):
             errors.append("No export format selected.")
 
         camera = (self.mm_camera_entries[0]["field"].text().strip()
@@ -14771,6 +14775,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.ct_abc_checkbox.isChecked()
         do_usd = self.ct_usd_checkbox.isChecked()
         do_mov = self.ct_mov_checkbox.isChecked()
+        do_array = self.ct_array_checkbox.isChecked()
         do_nk = self.ct_nk_checkbox.isChecked()
         stmap_undistort = (self.ct_stmap_undistort_field.text().strip()
                           if self.ct_stmap_undistort_field else "")
@@ -14802,7 +14807,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         results = {}
         all_paths = {}
 
-        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov, do_nk])
+        total_formats = sum(
+            [do_ma, do_fbx, do_abc, do_usd, do_mov, do_array, do_nk])
         if do_jsx:
             total_formats += 2
         self._reset_progress(total_formats)
@@ -15160,6 +15166,21 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     self._log_result("Witness Playblast",
                                      results["witness"])
                 self._advance_progress()
+            if do_array:
+                paths = FolderManager.build_export_paths(
+                    export_root, scene_base, version_str, tag="cam",
+                    folder_name=folder_name)
+                FolderManager.ensure_directories(
+                    {"mp4_array": paths["mp4_array"]})
+                self._log("Exporting Array Cam playblast...")
+                results["array"] = exporter.export_array_playblast(
+                    paths["mp4_array"], paths["mp4_array_tmp_file"],
+                    primary_camera, start_frame, end_frame,
+                    shot_name=folder_name)
+                if results["array"]:
+                    all_paths["array"] = paths["mp4_array"]
+                self._log_result("Array Cam Playblast", results["array"])
+                self._advance_progress()
             if do_nk:
                 paths = FolderManager.build_export_paths(
                     export_root, scene_base, version_str, tag="cam",
@@ -15379,7 +15400,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = False  # USD temporarily disabled for matchmove
         do_mov = self.mm_mov_checkbox.isChecked()
-        do_array = self.mm_array_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
 
@@ -15433,8 +15453,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum(
-            [do_ma, do_fbx, do_abc, do_usd, do_mov, do_array])
+        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -15710,15 +15729,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                 self.pb_auto_qc_cam_cb.isChecked())))
                     self._log_result("Witness Playblast",
                                      results["witness"])
-                self._advance_progress()
-
-            if do_array:
-                self._log("Exporting Array Cam playblast...")
-                results["array"] = exporter.export_array_playblast(
-                    paths["mp4_array"], paths["mp4_array_tmp_file"],
-                    camera, start_frame, end_frame,
-                    shot_name=folder_name)
-                self._log_result("Array Cam Playblast", results["array"])
                 self._advance_progress()
 
             # FBX is last  -- destructive prep (bake, import refs,
