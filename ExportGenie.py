@@ -122,6 +122,19 @@ WITNESS_GROUND_SUBDIV = 160        # subdivisions per side; with the extent
 WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
                                            # plane (per-object draw override)
 
+# Array Cam (Matchmove).  A second .mp4 through the tracked camera with a
+# world-locked grid of wireframe triangular bipyramids posed just in front
+# of it at the start frame, so extra camera motion reads as grid drift.
+ARRAY_CAM_COUNT = 10               # bipyramids per row and per column
+ARRAY_CAM_DISTANCE_FT = 3.0        # distance in front of the camera, in
+                                   # real feet (converted to scene units);
+                                   # pushed out to 2x the near clip if needed
+ARRAY_CAM_SPREAD = 2.0             # grid width/height as a multiple of the
+                                   # start-frame view, so a pan or push does
+                                   # not leave it behind. Item size stays
+                                   # sized to the view, not the spread
+ARRAY_CAM_COLOR = (1.0, 0.85, 0.1)  # bright yellow wireframe over the plate
+
 # Skydome backdrop.  If the scene has no sky sphere the exporter builds
 # one that encloses the assigned geo and the whole camera path, with
 # normals flipped inward so the tracked camera sees it correctly.  The
@@ -379,6 +392,12 @@ class FolderManager(object):
         paths["mp4_witness_tmp_dir"] = witness_tmp_dir
         paths["mp4_witness_tmp_file"] = os.path.join(
             witness_tmp_dir, witness_base)
+        # Array Cam MP4 (Matchmove) -- the tracked camera's view with a
+        # world-locked bipyramid grid in front of it.
+        array_base = qc_base + "_array"
+        paths["mp4_array"] = os.path.join(dir_path, array_base + ".mp4")
+        paths["mp4_array_tmp_file"] = os.path.join(
+            dir_path, "_tmp_array", array_base)
         # Composite temp dirs for multi-pass MM/FT playblasts
         composite_tmp = os.path.join(dir_path, "_tmp_composite")
         paths["composite_tmp"] = composite_tmp
@@ -7940,6 +7959,248 @@ class Exporter(object):
                 pass
             Exporter._restore_qc_background(qc_bg_saved)
 
+    @staticmethod
+    def _build_bipyramid_array(camera, start_frame, aspect):
+        """Build the Array Cam's grid of triangular bipyramids.
+
+        ARRAY_CAM_COUNT x ARRAY_CAM_COUNT bipyramids laid out over
+        ARRAY_CAM_SPREAD times the tracked camera's view, centred
+        ARRAY_CAM_DISTANCE_FT in front of it, posed at start_frame and
+        then left WORLD-LOCKED, so any later camera motion shows up as the
+        grid drifting against the plate.
+        Each bipyramid's axis follows the camera's up. Drawn as a bright
+        wireframe (overrideShading off) so the plate stays readable.
+
+        Returns:
+            str: The array's top group (delete it to tear everything down).
+        """
+        import maya.api.OpenMaya as om
+
+        cam_shape = cmds.listRelatives(
+            camera, shapes=True, type="camera", fullPath=True)[0]
+        # Same unit conversion as the witness stick: a real distance in
+        # feet, whatever the scene's linear unit.
+        units_per_ft = (Exporter._witness_stick_height()
+                        / WITNESS_STICK_HEIGHT_FT)
+        dist = max(ARRAY_CAM_DISTANCE_FT * units_per_ft,
+                   2.0 * cmds.getAttr(cam_shape + ".nearClipPlane"))
+        # Horizontal half-width of the view at that distance, from the
+        # start-frame lens (focal length may be animated). Aperture is in
+        # inches, focal length in mm.
+        focal = cmds.getAttr(cam_shape + ".focalLength", time=start_frame)
+        h_ap_mm = cmds.getAttr(cam_shape + ".horizontalFilmAperture") * 25.4
+        view_half_w = dist * (h_ap_mm / 2.0) / focal
+        view_half_h = view_half_w / aspect
+        half_w = view_half_w * ARRAY_CAM_SPREAD
+        half_h = view_half_h * ARRAY_CAM_SPREAD
+        step_x = 2.0 * half_w / ARRAY_CAM_COUNT
+        step_y = 2.0 * half_h / ARRAY_CAM_COUNT
+        # Sized as if the grid just filled the view, so spreading it out
+        # does not blow each item up.
+        size = 1.8 * min(view_half_w, view_half_h) / ARRAY_CAM_COUNT
+        radius = size * 0.25
+        tip = size * 0.4
+
+        # One bipyramid mesh: a 3-vertex equator in local XZ plus a top
+        # and bottom tip on Y, six outward-facing triangles.
+        pts = [om.MPoint(radius * math.cos(a), 0.0, radius * math.sin(a))
+               for a in (math.radians(90 + 120 * i) for i in range(3))]
+        pts += [om.MPoint(0.0, tip, 0.0), om.MPoint(0.0, -tip, 0.0)]
+        connects = []
+        for i in range(3):
+            j = (i + 1) % 3
+            connects += [j, i, 3, i, j, 4]
+        mesh_obj = om.MFnMesh().create(pts, [3] * 6, connects)
+        proto = cmds.rename(
+            om.MFnDagNode(mesh_obj).fullPathName(), "EG_array_bipyramid")
+        for shape in cmds.listRelatives(
+                proto, shapes=True, fullPath=True) or []:
+            cmds.sets(shape, edit=True, forceElement="initialShadingGroup")
+            cmds.setAttr(shape + ".overrideEnabled", 1)
+            cmds.setAttr(shape + ".overrideShading", 0)
+            cmds.setAttr(shape + ".overrideRGBColors", 1)
+            cmds.setAttr(shape + ".overrideColorRGB",
+                         *ARRAY_CAM_COLOR, type="double3")
+
+        grp = cmds.group(empty=True, name="EG_array_GRP")
+        proto = cmds.parent(proto, grp)[0]
+        items = [proto] + [
+            cmds.instance(proto)[0]
+            for _ in range(ARRAY_CAM_COUNT * ARRAY_CAM_COUNT - 1)]
+        for idx, item in enumerate(items):
+            col, row = idx % ARRAY_CAM_COUNT, idx // ARRAY_CAM_COUNT
+            cmds.xform(item, translation=(
+                -half_w + step_x * (col + 0.5),
+                -half_h + step_y * (row + 0.5),
+                -dist))
+        # Camera-local layout above; the group takes the camera's
+        # start-frame world matrix and then never moves.
+        cmds.xform(grp, worldSpace=True, matrix=cmds.getAttr(
+            camera + ".worldMatrix", time=start_frame))
+        return grp
+
+    def export_array_playblast(self, output_mp4, tmp_png_file, camera,
+                               start_frame, end_frame, shot_name=None):
+        """Render the Array Cam movie (Matchmove).
+
+        A second .mp4 through the tracked camera showing only its plate
+        and a world-locked 10 x 10 grid of wireframe bipyramids posed
+        just in front of the camera at start_frame (see
+        _build_bipyramid_array). Near geometry exaggerates parallax, so
+        any camera drift or jitter the track carries is obvious. Burn-ins
+        match the witness movie: frame counter and shot name, no HUD.
+
+        Everything this creates or changes is undone before returning.
+
+        Returns:
+            bool: True if the .mp4 was written.
+        """
+        if not self._find_ffmpeg():
+            self.log("Array Cam playblast skipped  -- ffmpeg not found.")
+            return False
+        if not camera or not cmds.objExists(camera):
+            self.log("Array Cam playblast skipped  -- no camera.")
+            return False
+        pb_width, pb_height = self._get_image_plane_resolution(camera)
+        if pb_width > 1920:
+            pb_height = int(round(pb_height * 1920.0 / pb_width))
+            pb_width = 1920
+
+        grp = None
+        model_panel = None
+        original_panel = {}
+        original_cam = None
+        original_isolate = None
+        qc_bg_saved = None
+        original_sel = cmds.ls(selection=True)
+        original_time = cmds.currentTime(query=True)
+
+        try:
+            qc_bg_saved = Exporter._apply_qc_background()
+            grp = Exporter._build_bipyramid_array(
+                camera, start_frame, float(pb_width) / pb_height)
+
+            for panel in (cmds.getPanel(visiblePanels=True) or []):
+                if cmds.getPanel(typeOf=panel) == "modelPanel":
+                    model_panel = panel
+                    break
+            if not model_panel:
+                panels = cmds.getPanel(type="modelPanel") or []
+                if panels:
+                    model_panel = panels[0]
+            if not model_panel:
+                self.log("Array Cam playblast skipped  -- no model panel.")
+                return False
+
+            for flag in ("grid", "cameras", "imagePlane",
+                         "displayAppearance", "wireframeOnShaded"):
+                original_panel[flag] = cmds.modelEditor(
+                    model_panel, query=True, **{flag: True})
+            cmds.modelEditor(
+                model_panel, edit=True, grid=False, cameras=False,
+                imagePlane=True, displayAppearance="smoothShaded",
+                wireframeOnShaded=False)
+
+            # Isolate the array plus the camera and its image planes, so
+            # only the plate and the grid are in frame.
+            original_isolate = cmds.isolateSelect(
+                model_panel, query=True, state=True)
+            cmds.isolateSelect(model_panel, state=True)
+            cmds.isolateSelect(model_panel, addDagObject=grp)
+            cmds.isolateSelect(model_panel, addDagObject=camera)
+            for cs in (cmds.listRelatives(
+                    camera, shapes=True, type="camera") or []):
+                for ip in (cmds.listConnections(
+                        cs + ".imagePlane", type="imagePlane") or []):
+                    try:
+                        cmds.isolateSelect(model_panel, addDagObject=ip)
+                    except Exception:
+                        pass
+
+            original_cam = cmds.modelPanel(
+                model_panel, query=True, camera=True)
+            cmds.lookThru(model_panel, camera)
+            try:
+                cmds.setFocus(model_panel)
+            except Exception:
+                pass
+
+            cmds.select(clear=True)
+            self._trace("Rendering Array Cam pass...")
+            tmp_dir = os.path.dirname(tmp_png_file)
+            if not os.path.exists(tmp_dir):
+                os.makedirs(tmp_dir)
+            cmds.refresh(force=True)
+            cmds.playblast(
+                filename=tmp_png_file,
+                format="image",
+                compression="png",
+                startTime=start_frame,
+                endTime=end_frame,
+                forceOverwrite=True,
+                sequenceTime=False,
+                clearCache=True,
+                viewer=False,
+                showOrnaments=False,
+                framePadding=4,
+                percent=100,
+                quality=100,
+                widthHeight=[pb_width, pb_height],
+            )
+
+            encode_ok = self._encode_mp4(
+                tmp_dir, os.path.basename(tmp_png_file), start_frame,
+                output_mp4,
+                show_hud=False,
+                frame_overlay=True,
+                plate_name=shot_name,
+                resolution=(pb_width, pb_height))
+            if encode_ok:
+                self._cleanup_temp_pngs(tmp_dir)
+            else:
+                self.log(
+                    "Array Cam encode failed  -- temp PNGs kept at "
+                    "{}".format(tmp_dir))
+            return encode_ok
+
+        except Exception as e:
+            self._log_error("Array Cam playblast", e)
+            return False
+
+        finally:
+            if model_panel:
+                if original_isolate is not None:
+                    try:
+                        cmds.isolateSelect(
+                            model_panel, state=original_isolate)
+                    except Exception:
+                        pass
+                for flag, value in original_panel.items():
+                    try:
+                        cmds.modelEditor(
+                            model_panel, edit=True, **{flag: value})
+                    except Exception:
+                        pass
+                if original_cam:
+                    try:
+                        cmds.lookThru(model_panel, original_cam)
+                    except Exception:
+                        pass
+            if grp and cmds.objExists(grp):
+                try:
+                    cmds.delete(grp)
+                except Exception:
+                    pass
+            try:
+                cmds.currentTime(original_time)
+                if original_sel:
+                    cmds.select(original_sel, replace=True)
+                else:
+                    cmds.select(clear=True)
+            except Exception:
+                pass
+            Exporter._restore_qc_background(qc_bg_saved)
+
     # --- Colour Management Helper ---
 
     def _ensure_playblast_raw_srgb(self):
@@ -11706,6 +11967,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_abc_checkbox = None
         self.mm_usd_checkbox = None
         self.mm_mov_checkbox = None
+        self.mm_array_checkbox = None
         # Face Track tab (ft_)
         self.ft_camera_entries = []
         self.ft_camera_layout = None
@@ -12191,11 +12453,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         self.mm_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.mm_mov_checkbox.setChecked(True)
+        self.mm_array_checkbox = QCheckBox("  Array Cam")
+        self.mm_array_checkbox.setChecked(False)
+        self.mm_array_checkbox.setToolTip(
+            "Second playblast through the camera with a 10x10 grid of "
+            "bipyramids locked in world space just in front of it, so "
+            "extra camera movement is obvious (_array.mp4)")
 
         fmt_layout.addWidget(self.mm_ma_checkbox)
         fmt_layout.addWidget(self.mm_fbx_checkbox)
         fmt_layout.addWidget(self.mm_abc_checkbox)
         fmt_layout.addWidget(self.mm_mov_checkbox)
+        fmt_layout.addWidget(self.mm_array_checkbox)
         formats.setLayout(fmt_layout)
         tab_layout.addWidget(formats)
 
@@ -13972,7 +14241,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = False  # USD temporarily disabled for matchmove
         do_mov = self.mm_mov_checkbox.isChecked()
-        if not (do_ma or do_fbx or do_abc or do_usd or do_mov):
+        do_array = self.mm_array_checkbox.isChecked()
+        if not (do_ma or do_fbx or do_abc or do_usd or do_mov or do_array):
             errors.append("No export format selected.")
 
         camera = (self.mm_camera_entries[0]["field"].text().strip()
@@ -15103,6 +15373,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         do_abc = self.mm_abc_checkbox.isChecked()
         do_usd = False  # USD temporarily disabled for matchmove
         do_mov = self.mm_mov_checkbox.isChecked()
+        do_array = self.mm_array_checkbox.isChecked()
         start_frame = self.start_frame_spin.value()
         end_frame = self.end_frame_spin.value()
 
@@ -15146,7 +15417,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                           "mp4_tmp_dir", "mp4_tmp_file",
                           "composite_tmp", "composite_plate",
                           "composite_color", "composite_matte",
-                          "composite_crown")})
+                          "composite_crown", "mp4_array_tmp_file")})
 
 
         dir_path = os.path.dirname(
@@ -15156,7 +15427,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         exporter = Exporter(self._log)
         results = {}
 
-        total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
+        total_formats = sum(
+            [do_ma, do_fbx, do_abc, do_usd, do_mov, do_array])
         self._reset_progress(total_formats)
 
         renamed_cam = None
@@ -15434,6 +15706,15 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                      results["witness"])
                 self._advance_progress()
 
+            if do_array:
+                self._log("Exporting Array Cam playblast...")
+                results["array"] = exporter.export_array_playblast(
+                    paths["mp4_array"], paths["mp4_array_tmp_file"],
+                    camera, start_frame, end_frame,
+                    shot_name=folder_name)
+                self._log_result("Array Cam Playblast", results["array"])
+                self._advance_progress()
+
             # FBX is last  -- destructive prep (bake, import refs,
             # strip namespaces) cannot be reliably undone, so we
             # save the scene to a temp file, run the prep + export,
@@ -15692,7 +15973,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                           "mp4_tmp_dir", "mp4_tmp_file",
                           "composite_tmp", "composite_plate",
                           "composite_color", "composite_matte",
-                          "composite_crown")})
+                          "composite_crown", "mp4_array_tmp_file")})
 
 
         dir_path = os.path.dirname(
