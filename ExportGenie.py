@@ -125,8 +125,9 @@ WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
 # Array Cam (Matchmove).  A second .mp4 through the tracked camera with a
 # world-locked grid of wireframe triangular bipyramids posed just in front
 # of it at the start frame, so extra camera motion reads as grid drift.
-ARRAY_CAM_COUNT = 10               # bipyramids per row and per column
-ARRAY_CAM_DISTANCE_FT = 3.0        # distance in front of the camera, in
+ARRAY_CAM_COUNT = 10               # bipyramids per row, per column and
+                                   # per depth layer (a 10x10x10 lattice)
+ARRAY_CAM_DISTANCE_FT = 3.0        # front layer's distance from the camera, in
                                    # real feet (converted to scene units);
                                    # pushed out to 2x the near clip if needed
 ARRAY_CAM_SPREAD = 2.0             # grid width/height as a multiple of the
@@ -7963,9 +7964,11 @@ class Exporter(object):
     def _build_bipyramid_array(camera, start_frame, aspect):
         """Build the Array Cam's grid of triangular bipyramids.
 
-        ARRAY_CAM_COUNT x ARRAY_CAM_COUNT bipyramids laid out over
-        ARRAY_CAM_SPREAD times the tracked camera's view, centred
-        ARRAY_CAM_DISTANCE_FT in front of it, posed at start_frame and
+        ARRAY_CAM_COUNT^3 bipyramids: ARRAY_CAM_COUNT x ARRAY_CAM_COUNT
+        layers laid out over ARRAY_CAM_SPREAD times the tracked camera's
+        view, the front layer ARRAY_CAM_DISTANCE_FT in front of it and
+        ARRAY_CAM_COUNT layers stepping away from it at the column
+        spacing (square cells in plan). Posed at start_frame and
         then left WORLD-LOCKED, so any later camera motion shows up as the
         grid drifting against the plate.
         Each bipyramid's axis follows the camera's up. Drawn as a bright
@@ -7995,6 +7998,7 @@ class Exporter(object):
         half_h = view_half_h * ARRAY_CAM_SPREAD
         step_x = 2.0 * half_w / ARRAY_CAM_COUNT
         step_y = 2.0 * half_h / ARRAY_CAM_COUNT
+        step_z = step_x
         # Sized as if the grid just filled the view, so spreading it out
         # does not blow each item up.
         size = 1.8 * min(view_half_w, view_half_h) / ARRAY_CAM_COUNT
@@ -8026,13 +8030,15 @@ class Exporter(object):
         proto = cmds.parent(proto, grp)[0]
         items = [proto] + [
             cmds.instance(proto)[0]
-            for _ in range(ARRAY_CAM_COUNT * ARRAY_CAM_COUNT - 1)]
+            for _ in range(ARRAY_CAM_COUNT ** 3 - 1)]
         for idx, item in enumerate(items):
-            col, row = idx % ARRAY_CAM_COUNT, idx // ARRAY_CAM_COUNT
+            col = idx % ARRAY_CAM_COUNT
+            row = (idx // ARRAY_CAM_COUNT) % ARRAY_CAM_COUNT
+            layer = idx // (ARRAY_CAM_COUNT * ARRAY_CAM_COUNT)
             cmds.xform(item, translation=(
                 -half_w + step_x * (col + 0.5),
                 -half_h + step_y * (row + 0.5),
-                -dist))
+                -(dist + step_z * layer)))
         # Camera-local layout above; the group takes the camera's
         # start-frame world matrix and then never moves.
         cmds.xform(grp, worldSpace=True, matrix=cmds.getAttr(
@@ -8044,7 +8050,7 @@ class Exporter(object):
         """Render the Array Cam movie (Matchmove).
 
         A second .mp4 through the tracked camera showing only its plate
-        and a world-locked 10 x 10 grid of wireframe bipyramids posed
+        and a world-locked 10 x 10 x 10 lattice of wireframe bipyramids posed
         just in front of the camera at start_frame (see
         _build_bipyramid_array). Near geometry exaggerates parallax, so
         any camera drift or jitter the track carries is obvious. Burn-ins
@@ -12456,7 +12462,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.mm_array_checkbox = QCheckBox("  Array Cam")
         self.mm_array_checkbox.setChecked(False)
         self.mm_array_checkbox.setToolTip(
-            "Second playblast through the camera with a 10x10 grid of "
+            "Second playblast through the camera with a 10x10x10 lattice of "
             "bipyramids locked in world space just in front of it, so "
             "extra camera movement is obvious (_array.mp4)")
 
