@@ -123,17 +123,17 @@ WITNESS_GROUND_COLOR = (0.8, 0.35, 0.35)   # soft red wireframe for the ground
                                            # plane (per-object draw override)
 
 # Array Cam (Camera Track).  A second .mp4 through the tracked camera with a
-# world-locked grid of wireframe triangular bipyramids posed just in front
-# of it at the start frame, so extra camera motion reads as grid drift.
+# static, scene-axis-aligned lattice of wireframe triangular bipyramids
+# placed just in front of it at the start frame, so extra camera motion
+# reads as lattice drift. Only the placement comes from the camera.
 ARRAY_CAM_COUNT = 10               # bipyramids per row, per column and
                                    # per depth layer (a 10x10x10 lattice)
-ARRAY_CAM_DISTANCE_FT = 3.0        # front layer's distance from the camera, in
+ARRAY_CAM_DISTANCE_FT = 3.0        # lattice's near face from the camera, in
                                    # real feet (converted to scene units);
                                    # pushed out to 2x the near clip if needed
-ARRAY_CAM_SPREAD = 2.0             # grid width/height as a multiple of the
-                                   # start-frame view, so a pan or push does
-                                   # not leave it behind. Item size stays
-                                   # sized to the view, not the spread
+ARRAY_CAM_SPACING_FT = 0.6         # centre-to-centre spacing on every axis,
+                                   # in real feet (a 6 ft cube at 10)
+ARRAY_CAM_ITEM_FT = 0.15           # each bipyramid's size, in real feet
 ARRAY_CAM_COLOR = (1.0, 0.85, 0.1)  # bright yellow wireframe over the plate
 
 # Skydome backdrop.  If the scene has no sky sphere the exporter builds
@@ -7961,18 +7961,19 @@ class Exporter(object):
             Exporter._restore_qc_background(qc_bg_saved)
 
     @staticmethod
-    def _build_bipyramid_array(camera, start_frame, aspect):
+    def _build_bipyramid_array(camera, start_frame):
         """Build the Array Cam's grid of triangular bipyramids.
 
-        ARRAY_CAM_COUNT^3 bipyramids: ARRAY_CAM_COUNT x ARRAY_CAM_COUNT
-        layers laid out over ARRAY_CAM_SPREAD times the tracked camera's
-        view, the front layer ARRAY_CAM_DISTANCE_FT in front of it and
-        ARRAY_CAM_COUNT layers stepping away from it at the column
-        spacing (square cells in plan). Posed at start_frame and
-        then left WORLD-LOCKED, so any later camera motion shows up as the
-        grid drifting against the plate.
-        Each bipyramid's axis follows the camera's up. Drawn as a bright
-        wireframe (overrideShading off) so the plate stays readable.
+        ARRAY_CAM_COUNT^3 bipyramids in a lattice aligned to the scene
+        axes: columns along world X, rows along world Y and depth layers
+        along world Z, ARRAY_CAM_SPACING_FT apart. Fixed real-world sizes,
+        so the lens has no say; the camera only sets the placement: the
+        lattice is centred on its start_frame view axis,
+        ARRAY_CAM_DISTANCE_FT plus half the lattice depth in front of it.
+        Then left WORLD-LOCKED, so any later camera motion shows up as the
+        lattice drifting against the plate.
+        Each bipyramid's axis is world Y. Drawn as a bright wireframe
+        (overrideShading off) so the plate stays readable.
 
         Returns:
             str: The array's top group (delete it to tear everything down).
@@ -7987,21 +7988,9 @@ class Exporter(object):
                         / WITNESS_STICK_HEIGHT_FT)
         dist = max(ARRAY_CAM_DISTANCE_FT * units_per_ft,
                    2.0 * cmds.getAttr(cam_shape + ".nearClipPlane"))
-        # Horizontal half-width of the view at that distance, from the
-        # start-frame lens (focal length may be animated). Aperture is in
-        # inches, focal length in mm.
-        focal = cmds.getAttr(cam_shape + ".focalLength", time=start_frame)
-        h_ap_mm = cmds.getAttr(cam_shape + ".horizontalFilmAperture") * 25.4
-        view_half_w = dist * (h_ap_mm / 2.0) / focal
-        view_half_h = view_half_w / aspect
-        half_w = view_half_w * ARRAY_CAM_SPREAD
-        half_h = view_half_h * ARRAY_CAM_SPREAD
-        step_x = 2.0 * half_w / ARRAY_CAM_COUNT
-        step_y = 2.0 * half_h / ARRAY_CAM_COUNT
-        step_z = step_x
-        # Sized as if the grid just filled the view, so spreading it out
-        # does not blow each item up.
-        size = 1.8 * min(view_half_w, view_half_h) / ARRAY_CAM_COUNT
+        step = ARRAY_CAM_SPACING_FT * units_per_ft
+        half = step * ARRAY_CAM_COUNT / 2.0
+        size = ARRAY_CAM_ITEM_FT * units_per_ft
         radius = size * 0.25
         tip = size * 0.4
 
@@ -8036,13 +8025,19 @@ class Exporter(object):
             row = (idx // ARRAY_CAM_COUNT) % ARRAY_CAM_COUNT
             layer = idx // (ARRAY_CAM_COUNT * ARRAY_CAM_COUNT)
             cmds.xform(item, translation=(
-                -half_w + step_x * (col + 0.5),
-                -half_h + step_y * (row + 0.5),
-                -(dist + step_z * layer)))
-        # Camera-local layout above; the group takes the camera's
-        # start-frame world matrix and then never moves.
-        cmds.xform(grp, worldSpace=True, matrix=cmds.getAttr(
+                -half + step * (col + 0.5),
+                -half + step * (row + 0.5),
+                -half + step * (layer + 0.5)))
+        # Scene-axis layout above; the group only takes a translation, to
+        # the start-frame point dist + half down the camera's view axis
+        # (normalised, so camera scale cannot move it), and never moves.
+        cam_mtx = om.MMatrix(cmds.getAttr(
             camera + ".worldMatrix", time=start_frame))
+        view_dir = (om.MVector(0.0, 0.0, -1.0) * cam_mtx).normal()
+        centre = (om.MPoint(0.0, 0.0, 0.0) * cam_mtx
+                  + view_dir * (dist + half))
+        cmds.xform(grp, worldSpace=True,
+                   translation=(centre.x, centre.y, centre.z))
         # Static in the scene: no constraint, parent or connection to the
         # camera, and the pose is locked so nothing can drive it later.
         for attr in ("translate", "rotate", "scale", "shear"):
@@ -8082,13 +8077,45 @@ class Exporter(object):
         original_cam = None
         original_isolate = None
         qc_bg_saved = None
+        saved_attrs = {}
         original_sel = cmds.ls(selection=True)
         original_time = cmds.currentTime(query=True)
 
         try:
             qc_bg_saved = Exporter._apply_qc_background()
-            grp = Exporter._build_bipyramid_array(
-                camera, start_frame, float(pb_width) / pb_height)
+            grp = Exporter._build_bipyramid_array(camera, start_frame)
+
+            # The array must sit inside the far clip and in front of the
+            # plate from every shot frame, or it is clipped or drawn over.
+            # Push the plate just past the array's farthest corner from
+            # any camera position, and the far clip past the plate.
+            bb = cmds.exactWorldBoundingBox(grp)
+            corners = [(x, y, z) for x in (bb[0], bb[3])
+                       for y in (bb[1], bb[4]) for z in (bb[2], bb[5])]
+            reach = 0.0
+            for f in range(int(start_frame), int(end_frame) + 1):
+                m = cmds.getAttr(camera + ".worldMatrix", time=f)
+                reach = max(reach, max(
+                    math.sqrt((c[0] - m[12]) ** 2 + (c[1] - m[13]) ** 2
+                              + (c[2] - m[14]) ** 2) for c in corners))
+            cam_shapes = cmds.listRelatives(
+                camera, shapes=True, type="camera") or []
+            image_planes = []
+            for cs in cam_shapes:
+                image_planes += cmds.listConnections(
+                    cs + ".imagePlane", type="imagePlane") or []
+            pushes = ([(ip + ".depth", reach * 1.05) for ip in image_planes]
+                      + [(cs + ".farClipPlane", reach * 1.1)
+                         for cs in cam_shapes])
+            for attr, value in pushes:
+                try:
+                    saved = cmds.getAttr(attr)
+                    if saved < value:
+                        cmds.setAttr(attr, value)
+                        saved_attrs[attr] = saved
+                except Exception as e:
+                    self.log("Array Cam: could not set {}  -- {}".format(
+                        attr, e))
 
             for panel in (cmds.getPanel(visiblePanels=True) or []):
                 if cmds.getPanel(typeOf=panel) == "modelPanel":
@@ -8118,14 +8145,11 @@ class Exporter(object):
             cmds.isolateSelect(model_panel, state=True)
             cmds.isolateSelect(model_panel, addDagObject=grp)
             cmds.isolateSelect(model_panel, addDagObject=camera)
-            for cs in (cmds.listRelatives(
-                    camera, shapes=True, type="camera") or []):
-                for ip in (cmds.listConnections(
-                        cs + ".imagePlane", type="imagePlane") or []):
-                    try:
-                        cmds.isolateSelect(model_panel, addDagObject=ip)
-                    except Exception:
-                        pass
+            for ip in image_planes:
+                try:
+                    cmds.isolateSelect(model_panel, addDagObject=ip)
+                except Exception:
+                    pass
 
             original_cam = cmds.modelPanel(
                 model_panel, query=True, camera=True)
@@ -8196,6 +8220,11 @@ class Exporter(object):
                         cmds.lookThru(model_panel, original_cam)
                     except Exception:
                         pass
+            for attr, value in saved_attrs.items():
+                try:
+                    cmds.setAttr(attr, value)
+                except Exception:
+                    pass
             if grp and cmds.objExists(grp):
                 try:
                     cmds.delete(grp)
@@ -12326,7 +12355,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_mov_checkbox = QCheckBox("  Playblast QC (.mp4)")
         self.ct_mov_checkbox.setChecked(True)
         self.ct_array_checkbox = QCheckBox("  Array Cam")
-        self.ct_array_checkbox.setChecked(False)
+        self.ct_array_checkbox.setChecked(True)
         self.ct_array_checkbox.setToolTip(
             "Second playblast through the camera with a 10x10x10 lattice of "
             "bipyramids locked in world space just in front of it, so "
