@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v22.5"
+TOOL_VERSION = "v22.6"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -131,9 +131,9 @@ ARRAY_CAM_COUNT = 10               # bipyramids per row, per column and
 ARRAY_CAM_DISTANCE_FT = 3.0        # lattice's near face from the camera, in
                                    # real feet (converted to scene units);
                                    # pushed out to 2x the near clip if needed
-ARRAY_CAM_SPACING_FT = 0.6         # centre-to-centre spacing on every axis,
-                                   # in real feet (a 6 ft cube at 10)
-ARRAY_CAM_ITEM_FT = 0.15           # each bipyramid's size, in real feet
+ARRAY_CAM_SPACING_FT = 6.0         # centre-to-centre spacing on every axis,
+                                   # in real feet (a 60 ft cube at 10)
+ARRAY_CAM_ITEM_FT = 3.75           # each bipyramid's size, in real feet
 ARRAY_CAM_COLOR = (1.0, 0.85, 0.1)  # bright yellow wireframe over the plate
 
 # Skydome backdrop.  If the scene has no sky sphere the exporter builds
@@ -8045,13 +8045,15 @@ class Exporter(object):
         return grp
 
     def export_array_playblast(self, output_mp4, tmp_png_file, camera,
-                               start_frame, end_frame, shot_name=None):
+                               start_frame, end_frame, shot_name=None,
+                               geo_nodes=None, hide_domes=None):
         """Render the Array Cam movie (Camera Track).
 
-        A second .mp4 through the tracked camera showing only its plate
-        and a world-locked 10 x 10 x 10 lattice of wireframe bipyramids posed
-        just in front of the camera at start_frame (see
-        _build_bipyramid_array). Near geometry exaggerates parallax, so
+        A second .mp4 through the tracked camera showing only its plate,
+        the geo assigned in the tool (geo_nodes, minus any sky dome, which
+        would cover the plate) and a world-locked 10 x 10 x 10 lattice of
+        wireframe bipyramids posed just in front of the camera at
+        start_frame (see _build_bipyramid_array). Near geometry exaggerates parallax, so
         any camera drift or jitter the track carries is obvious. Burn-ins
         match the witness movie: frame counter and shot name, no HUD.
 
@@ -8085,10 +8087,19 @@ class Exporter(object):
             qc_bg_saved = Exporter._apply_qc_background()
             grp = Exporter._build_bipyramid_array(camera, start_frame)
 
-            # The array must sit inside the far clip and in front of the
-            # plate from every shot frame, or it is clipped or drawn over.
-            # Push the plate just past the array's farthest corner from
-            # any camera position, and the far clip past the plate.
+            # The assigned geo rides along, except sky domes: the plate is
+            # pushed past everything below, so a dome would cover it.
+            domes = set(cmds.ls(
+                Exporter._find_skydomes() + list(hide_domes or []),
+                long=True))
+            geo = [g for g in (geo_nodes or [])
+                   if cmds.objExists(g)
+                   and not set(cmds.ls(g, long=True)) & domes]
+
+            # The array and the geo must sit inside the far clip and in
+            # front of the plate from every shot frame, or they are
+            # clipped or drawn over. Push the plate just past the farthest
+            # of them from any camera position, and the far clip past it.
             bb = cmds.exactWorldBoundingBox(grp)
             corners = [(x, y, z) for x in (bb[0], bb[3])
                        for y in (bb[1], bb[4]) for z in (bb[2], bb[5])]
@@ -8098,6 +8109,12 @@ class Exporter(object):
                 reach = max(reach, max(
                     math.sqrt((c[0] - m[12]) ** 2 + (c[1] - m[13]) ** 2
                               + (c[2] - m[14]) ** 2) for c in corners))
+            if geo:
+                geo_far = Exporter.compute_far_distance(
+                    camera, geo,
+                    frames=range(int(start_frame), int(end_frame) + 1))
+                if geo_far:
+                    reach = max(reach, geo_far)
             cam_shapes = cmds.listRelatives(
                 camera, shapes=True, type="camera") or []
             image_planes = []
@@ -8138,12 +8155,17 @@ class Exporter(object):
                 imagePlane=True, displayAppearance="smoothShaded",
                 wireframeOnShaded=False)
 
-            # Isolate the array plus the camera and its image planes, so
-            # only the plate and the grid are in frame.
+            # Isolate the array, the assigned geo, the camera and its
+            # image planes, so nothing else in the scene is in frame.
             original_isolate = cmds.isolateSelect(
                 model_panel, query=True, state=True)
             cmds.isolateSelect(model_panel, state=True)
             cmds.isolateSelect(model_panel, addDagObject=grp)
+            for g in geo:
+                try:
+                    cmds.isolateSelect(model_panel, addDagObject=g)
+                except Exception:
+                    pass
             cmds.isolateSelect(model_panel, addDagObject=camera)
             for ip in image_planes:
                 try:
@@ -15205,7 +15227,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 results["array"] = exporter.export_array_playblast(
                     paths["mp4_array"], paths["mp4_array_tmp_file"],
                     primary_camera, start_frame, end_frame,
-                    shot_name=folder_name)
+                    shot_name=folder_name,
+                    geo_nodes=geo_roots + obj_tracks,
+                    hide_domes=confirmed_domes)
                 if results["array"]:
                     all_paths["array"] = paths["mp4_array"]
                 self._log_result("Array Cam Playblast", results["array"])
