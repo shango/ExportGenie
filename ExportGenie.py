@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v23.1"
+TOOL_VERSION = "v23.2"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -101,6 +101,12 @@ CAMERA_SCALE_TOLERANCE = 1e-3      # how far a camera's scale may drift from
                                    # Loose enough to absorb float error in the
                                    # world-matrix decomposition
 WITNESS_STANDOFF_GEO_KEYWORDS = ("genhuman", "genman", "lineup")
+SCENE_LINEAR_UNIT = "cm"           # studio standard; any other unit warns
+GENHUMAN_MESH_NAME = "GenHuman_body_mesh"   # scale reference, any namespace
+GENHUMAN_HEIGHT_RANGE_CM = (140.0, 210.0)   # plausible standing height; a
+                                   # GenHuman outside this on the start
+                                   # frame means the rig or the track has
+                                   # been scaled to fit the other
                                    # Camera Track only: when set, ONLY assigned
                                    # geo whose DAG path contains one of these
                                    # drives the standoff (plus the camera path
@@ -7355,6 +7361,73 @@ class Exporter(object):
         return None
 
     @staticmethod
+    def _scale_warnings(cameras, frame):
+        """Warnings that the scene may not be at real-world scale.
+
+        Checks the linear unit, each GenHuman's world-space height on
+        *frame* (its deformed mesh, so a scaled rig control is caught
+        too), and any scale on the cameras or their parent groups.
+        Warnings only -- a crouching GenHuman or a deliberately
+        rescaled solve can trip them legitimately.
+        """
+        warnings = []
+        unit = cmds.currentUnit(query=True, linear=True)
+        if unit != SCENE_LINEAR_UNIT:
+            warnings.append(
+                "Scene linear unit is '{}', not '{}'. Check Preferences "
+                "> Settings > Working Units.".format(
+                    unit, SCENE_LINEAR_UNIT))
+
+        meshes = cmds.ls(GENHUMAN_MESH_NAME, recursive=True,
+                         type="transform", long=True) or []
+        if not meshes:
+            warnings.append(
+                "No {} found in the scene, so real-world scale could "
+                "not be checked. Add a GenHuman as a scale "
+                "reference.".format(GENHUMAN_MESH_NAME))
+        else:
+            cm_per_unit = {
+                'mm': 0.1, 'cm': 1.0, 'in': 2.54,
+                'ft': 30.48, 'yd': 91.44, 'm': 100.0, 'km': 100000.0,
+            }.get(unit, 1.0)
+            lo, hi = GENHUMAN_HEIGHT_RANGE_CM
+            prev = cmds.currentTime(query=True)
+            try:
+                cmds.currentTime(frame, update=True)
+                for mesh in meshes:
+                    # Live shapes only: a skinned mesh keeps its
+                    # undeformed Orig shape as an intermediate object,
+                    # and a plain bounding box of the transform counts
+                    # it, hiding any scale applied through the joints.
+                    shapes = cmds.listRelatives(
+                        mesh, shapes=True, noIntermediate=True,
+                        fullPath=True) or []
+                    if not shapes:
+                        continue
+                    bb = cmds.exactWorldBoundingBox(shapes)
+                    height = (bb[4] - bb[1]) * cm_per_unit
+                    if not lo <= height <= hi:
+                        warnings.append(
+                            "GenHuman '{}' is {:.0f} cm tall on frame "
+                            "{} (expected {:.0f}-{:.0f} cm). The rig "
+                            "or the track may be scaled.".format(
+                                mesh.rsplit("|", 1)[-1], height,
+                                int(frame), lo, hi))
+            finally:
+                cmds.currentTime(prev, update=True)
+
+        for cam in cameras:
+            if not cam or not cmds.objExists(cam):
+                continue
+            text = Exporter._camera_scale_text(cam, frame)
+            if text:
+                warnings.append(
+                    "Camera '{}' is scaled ({}). The track may have "
+                    "been rescaled to fit.".format(
+                        cam.rsplit("|", 1)[-1], text))
+        return warnings
+
+    @staticmethod
     def _scene_cameras():
         """Transforms of every non-default camera in the scene.
 
@@ -14308,6 +14381,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         "each other. Please rename them to be "
                         "unique.".format(short))
 
+        warnings.extend(Exporter._scale_warnings(cameras, start_frame))
         return errors, warnings
 
     def _validate_matchmove(self):
@@ -14399,6 +14473,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     "({}). The T-pose will not be a distinct frame "
                     "in the export.".format(tpose_frame, start_frame))
 
+        warnings.extend(Exporter._scale_warnings(
+            [camera] if camera else [], start_frame))
         return errors, warnings
 
     def _validate_face_track(self):
