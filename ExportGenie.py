@@ -54,7 +54,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v23"
+TOOL_VERSION = "v23.1"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -2837,13 +2837,19 @@ class Exporter(object):
             return False
 
     def export_abc(self, file_path, camera, geo_roots, proxy_geos,
-                   start_frame, end_frame, rig_roots=None):
+                   start_frame, end_frame, rig_roots=None,
+                   strip_namespaces=False):
         """Export camera + geo roots + rig roots + proxy geo as Alembic cache.
 
         Args:
             geo_roots: list of geo root transforms (or empty list).
             proxy_geos: list of static/proxy geo transforms (or empty list).
             rig_roots: list of rig root transforms (or empty list).
+            strip_namespaces: write every node without its namespaces
+                (everything left of the last colon). Off by default:
+                Matchmove can carry two characters from the same rig,
+                whose root names only differ by namespace, and
+                AbcExport refuses roots that collide once stripped.
         """
         try:
             geo_roots = geo_roots or []
@@ -2930,12 +2936,14 @@ class Exporter(object):
                 "-uvWrite "
                 "-worldSpace "
                 "-wholeFrameGeo "
+                "{strip}"
                 "-dataFormat ogawa "
                 "{roots}"
                 "-file '{file}'"
             ).format(
                 start=int(start_frame),
                 end=int(end_frame),
+                strip="-stripNamespaces " if strip_namespaces else "",
                 roots=root_flags,
                 file=abc_path.replace("'", "\\'"),
             )
@@ -13719,20 +13727,28 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         obj = sel[0]
 
         if role == "camera":
+            # Exactly one node, and it must be the camera itself (its
+            # transform or its shape) -- never a group above it, and
+            # never a multi-selection that merely starts with it.
             shapes = cmds.listRelatives(
                 obj, shapes=True, type="camera") or []
-            if not shapes:
-                if cmds.nodeType(obj) == "camera":
-                    parents = cmds.listRelatives(obj, parent=True)
-                    if parents:
-                        obj = parents[0]
-                else:
-                    self._confirm_dialog(
-                        "Invalid Selection",
-                        "Export Genie {}\n\n'{}' is not a camera. "
-                        "Please select a camera.".format(
-                            TOOL_VERSION, obj))
-                    return
+            if len(sel) == 1 and not shapes and \
+                    cmds.nodeType(obj) == "camera":
+                obj = (cmds.listRelatives(obj, parent=True)
+                       or [obj])[0]
+            elif len(sel) != 1 or not shapes:
+                self._confirm_dialog(
+                    "Bad Selection",
+                    "Export Genie {}\n\nBad selection: {}.\n\n"
+                    "Select only the camera itself (the camera "
+                    "icon in the Outliner), not a group or other "
+                    "node.".format(
+                        TOOL_VERSION,
+                        "'{}' is not a camera".format(obj)
+                        if len(sel) == 1
+                        else "{} nodes are selected".format(
+                            len(sel))))
+                return
         else:
             if cmds.nodeType(obj) != "transform":
                 role_labels = {
@@ -15129,7 +15145,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 results["abc"] = exporter.export_abc(
                     paths["abc"], primary_camera,
                     export_geo, [],
-                    start_frame, end_frame)
+                    start_frame, end_frame,
+                    strip_namespaces=True)
                 self._log_result("ABC", results["abc"])
                 self._advance_progress()
 
