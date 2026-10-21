@@ -33,7 +33,8 @@ try:
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
         QColorDialog, QSizePolicy, QFrame, QApplication, QInputDialog,
     )
-    from PySide6.QtCore import Qt, Signal, QSize, QEventLoop
+    from PySide6.QtCore import (
+        Qt, Signal, QSize, QEventLoop, QObject, QEvent)
     from PySide6.QtGui import QColor, QFont, QTextCursor
     from shiboken6 import wrapInstance, isValid as _shiboken_isValid
 except ImportError:
@@ -44,7 +45,8 @@ except ImportError:
         QProgressBar, QTextEdit, QLabel, QMessageBox, QFileDialog,
         QColorDialog, QSizePolicy, QFrame, QApplication, QInputDialog,
     )
-    from PySide2.QtCore import Qt, Signal, QSize, QEventLoop
+    from PySide2.QtCore import (
+        Qt, Signal, QSize, QEventLoop, QObject, QEvent)
     from PySide2.QtGui import QColor, QFont, QTextCursor
     from shiboken2 import wrapInstance, isValid as _shiboken_isValid
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
@@ -54,7 +56,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v23.2"
+TOOL_VERSION = "v23.3"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -243,6 +245,49 @@ ICON_DATA = (
 
 # Module-level UI instance
 _ui_instance = None
+
+
+class ExportCancelled(BaseException):
+    """Raised at a progress checkpoint once the artist clicks Cancel.
+
+    A BaseException, not an Exception, so the many per-format
+    ``except Exception`` handlers let it through on its way out to
+    _on_export instead of logging it as one more failed format.
+    """
+
+
+class _ExportInputBlocker(QObject):
+    """Application event filter installed for the length of an export.
+
+    The export pumps the Qt event loop so the Cancel button can be
+    clicked, but anything the artist did to the scene in that time
+    would be thrown away by the snapshot restore. So every mouse, key
+    and wheel event aimed at a widget is swallowed, except those for
+    the Cancel button and for a modal dialog the export itself opened
+    (the sky dome question, for one).
+
+    Events addressed to the top-level QWindow are let through: Qt
+    re-sends them to the target widget, where they are filtered.
+    """
+
+    _BLOCKED = (
+        QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
+        QEvent.MouseButtonDblClick, QEvent.Wheel,
+        QEvent.KeyPress, QEvent.KeyRelease,
+        QEvent.Shortcut, QEvent.ShortcutOverride,
+        QEvent.ContextMenu,
+    )
+
+    def __init__(self, cancel_button):
+        super(_ExportInputBlocker, self).__init__()
+        self._cancel_button = cancel_button
+
+    def eventFilter(self, obj, event):
+        if (event.type() not in self._BLOCKED
+                or not isinstance(obj, QWidget)
+                or QApplication.activeModalWidget() is not None):
+            return False
+        return obj is not self._cancel_button
 
 
 # ---------------------------------------------------------------------------
@@ -12057,6 +12102,11 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.log_field = None
         self.progress_bar = None
         self.progress_label = None
+        self.cancel_btn = None
+        # Export run state: see _take_scene_snapshot / _on_export
+        self._scene_snapshot = None
+        self._cancel_requested = False
+        self._input_blocker = None
         self.tab_widget = None
         # Camera Track tab (ct_)
         self.ct_camera_entries = []
@@ -13289,6 +13339,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             "font-size: {};".format(_scaled_px(10)))
         self.progress_label.setVisible(False)
         prog_row.addWidget(self.progress_label)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip(
+            "Stop the export and put the scene back the way it was")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._on_cancel_export)
+        prog_row.addWidget(self.cancel_btn)
         self._content_layout.addLayout(prog_row)
 
     def _build_log(self):
@@ -14202,13 +14258,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if self._widget_alive(self.progress_label):
                 self.progress_label.setText("0%")
                 self.progress_label.setVisible(True)
-            # Pump the Qt event loop so the widgets repaint;
-            # cmds.refresh(force=True) here forced a full VP2
-            # re-render per progress tick for no UI benefit.
-            QApplication.processEvents(
-                QEventLoop.ExcludeUserInputEvents)
+            if self._widget_alive(self.cancel_btn):
+                self.cancel_btn.setVisible(True)
+            self._pump_events()
         except Exception:
             pass
+        self._check_cancel()
 
     def _advance_progress(self):
         self._progress_done += 1
@@ -14220,10 +14275,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if self._widget_alive(self.progress_label):
                 self.progress_label.setText("{}%".format(
                     min(pct, 100)))
-            QApplication.processEvents(
-                QEventLoop.ExcludeUserInputEvents)
+            self._pump_events()
         except Exception:
             pass
+        self._check_cancel()
 
     def _hide_progress(self):
         try:
@@ -14231,8 +14286,164 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 self.progress_bar.setVisible(False)
             if self._widget_alive(self.progress_label):
                 self.progress_label.setVisible(False)
+            if self._widget_alive(self.cancel_btn):
+                self.cancel_btn.setVisible(False)
         except Exception:
             pass
+
+    def _pump_events(self):
+        """Pump the Qt event loop so the progress widgets repaint;
+        cmds.refresh(force=True) here forced a full VP2 re-render per
+        progress tick for no UI benefit.
+
+        During an export user input is let through too, so a Cancel
+        click is delivered; _ExportInputBlocker keeps it from reaching
+        anything but the Cancel button.
+        """
+        if self._input_blocker is not None:
+            QApplication.processEvents()
+        else:
+            QApplication.processEvents(
+                QEventLoop.ExcludeUserInputEvents)
+
+    def _on_cancel_export(self):
+        """Cancel button: flag the run to stop at the next checkpoint.
+
+        The export cannot be interrupted inside a single Maya command (a
+        playblast, a bake, one format's write), so the click lands at the
+        next progress tick. The button greys out at once so one click is
+        visibly enough.
+        """
+        if self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancelling...")
+        self._log("Cancelling: stopping after the current step...")
+
+    def _check_cancel(self):
+        if self._cancel_requested:
+            raise ExportCancelled()
+
+    # ------------------------------------------------------------------
+    # Scene snapshot (restores the artist's scene after every export)
+    # ------------------------------------------------------------------
+
+    def _take_scene_snapshot(self):
+        """Write the live scene to a temp file so that
+        _restore_scene_snapshot can put it back exactly, however the
+        export ends: success, failure, error or Cancel.
+
+        Undo chunks cannot do this job. Measured in Maya 2026: undo
+        leaves an imported reference imported (its nodes stay, the
+        reference node is gone) and leaves an OpenMaya-built mesh in the
+        scene, and the exports do both. The queue can also be finite or
+        switched off by the artist.
+
+        exportAll rather than rename + save keeps the artist's scene
+        name in place the whole time and fires export callbacks instead
+        of studio save hooks; the reopened file measured identical
+        either way (unsaved nodes, reference edits, current time,
+        playback range, render settings).
+
+        Returns False if no snapshot could be written. The export must
+        then not start, since nothing could put the scene back.
+        """
+        import tempfile
+        scene_path = cmds.file(query=True, sceneName=True)
+        if not scene_path:
+            self._log("Scene must be saved before exporting.")
+            return False
+        tmp_dir = tempfile.mkdtemp(prefix="ExportGenie_snapshot_")
+        tmp_scene = os.path.join(tmp_dir, os.path.basename(scene_path))
+        modified = cmds.file(query=True, modified=True)
+        try:
+            cmds.file(
+                tmp_scene, exportAll=True, preserveReferences=True,
+                force=True,
+                type=("mayaAscii" if tmp_scene.lower().endswith(".ma")
+                      else "mayaBinary"))
+        except Exception as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._log("Could not save a scene snapshot, so the export "
+                      "did not start. See Script Editor.")
+            sys.stderr.write(
+                LOG_PREFIX + " Scene snapshot failed: {}\n".format(exc))
+            self._confirm_dialog(
+                "Export Not Started",
+                "Export Genie {}\n\nThe scene could not be saved to a "
+                "temporary snapshot, so it could not be put back after "
+                "the export. Nothing was changed.\n\n{}".format(
+                    TOOL_VERSION, exc))
+            return False
+        self._scene_snapshot = {
+            "scene": scene_path,
+            "tmp": tmp_scene,
+            "dir": tmp_dir,
+            "modified": modified,
+            "selection": cmds.ls(selection=True, long=True) or [],
+        }
+        self._log("Scene snapshot saved.")
+        return True
+
+    def _restore_scene_snapshot(self):
+        """Reopen the snapshot from _take_scene_snapshot under the
+        artist's scene name. A no-op when there is none, so every exit
+        path can call it.
+
+        The reopen clears the dirty flag and the selection, so both are
+        put back: a scene with unsaved work must still prompt on close.
+        The undo queue does not survive a reopen.
+
+        If the reopen fails the snapshot is kept and its path reported
+        rather than falling back to the file on disk, which would
+        silently drop the artist's unsaved work.
+        """
+        snap = self._scene_snapshot
+        if not snap:
+            return
+        self._scene_snapshot = None
+        open_error = None
+        try:
+            cmds.file(snap["tmp"], open=True, force=True)
+        except Exception as exc:
+            # Maya raises on read errors (a missing reference, say)
+            # even when the file did open, so check what is loaded.
+            open_error = exc
+
+        def _norm(path):
+            return os.path.normcase(os.path.normpath(path or ""))
+
+        if _norm(cmds.file(query=True, sceneName=True)) != _norm(
+                snap["tmp"]):
+            self._log("Scene restore failed! The pre-export scene is "
+                      "saved at: " + snap["tmp"])
+            sys.stderr.write(
+                LOG_PREFIX + " Scene restore failed: {}\n".format(
+                    open_error))
+            self._confirm_dialog(
+                "Scene Restore Failed",
+                "Export Genie {}\n\nThe scene could not be put back "
+                "after the export. Your pre-export scene, including "
+                "unsaved changes, is saved at:\n\n{}".format(
+                    TOOL_VERSION, snap["tmp"]))
+            return
+        cmds.file(rename=snap["scene"])
+        cmds.file(modified=snap["modified"])
+        sel = [n for n in snap["selection"] if cmds.objExists(n)]
+        if sel:
+            cmds.select(sel, replace=True)
+        else:
+            cmds.select(clear=True)
+        if open_error is None:
+            shutil.rmtree(snap["dir"], ignore_errors=True)
+            self._log("Scene restored.")
+        else:
+            sys.stderr.write(
+                LOG_PREFIX + " Scene restored with read errors: "
+                "{}\n".format(open_error))
+            self._log("Scene restored, with read errors. See Script "
+                      "Editor. Snapshot kept at: " + snap["tmp"])
 
     # ------------------------------------------------------------------
     # Validation
@@ -14622,12 +14833,37 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         if mov_cb and mov_cb.isChecked() and not self._require_username():
             return
 
-        if active_tab == TAB_CAMERA_TRACK:
-            self._export_camera_track()
-        elif active_tab == TAB_MATCHMOVE:
-            self._export_matchmove()
-        else:
-            self._export_face_track()
+        # Each export snapshots the scene once validation passes and
+        # restores it on its way out; the restore here only catches a
+        # Cancel or an error that escaped before the export's own one.
+        self._cancel_requested = False
+        if self._widget_alive(self.cancel_btn):
+            self.cancel_btn.setText("Cancel")
+            self.cancel_btn.setEnabled(True)
+        self._input_blocker = _ExportInputBlocker(self.cancel_btn)
+        QApplication.instance().installEventFilter(self._input_blocker)
+        try:
+            if active_tab == TAB_CAMERA_TRACK:
+                self._export_camera_track()
+            elif active_tab == TAB_MATCHMOVE:
+                self._export_matchmove()
+            else:
+                self._export_face_track()
+        except ExportCancelled:
+            self._restore_scene_snapshot()
+            self._hide_progress()
+            self._log("Export cancelled.")
+            self._confirm_dialog(
+                "Export Cancelled",
+                "Export Genie {}\n\nThe export was cancelled and the "
+                "scene put back the way it was.\n\nFiles already "
+                "written to the export folder were left in "
+                "place.".format(TOOL_VERSION))
+        finally:
+            self._restore_scene_snapshot()
+            QApplication.instance().removeEventFilter(self._input_blocker)
+            self._input_blocker = None
+            self._hide_progress()
 
     # ------------------------------------------------------------------
     # Render Preview
@@ -14649,6 +14885,42 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         btn.clicked.connect(self._render_preview_frame)
         self._preview_buttons.append(btn)
         return sep, btn
+
+    @staticmethod
+    def _camera_far_state(camera):
+        """Return {plug: value} for the attributes _auto_fit_camera_far
+        writes on *camera*: each camera shape's farClipPlane and the
+        depth of every image plane attached to it."""
+        plugs = []
+        for cs in cmds.listRelatives(
+                camera, shapes=True, type="camera") or []:
+            plugs.append(cs + ".farClipPlane")
+            plugs.extend(
+                ip + ".depth" for ip in cmds.listConnections(
+                    cs + ".imagePlane", type="imagePlane") or [])
+        return dict((p, cmds.getAttr(p)) for p in plugs)
+
+    def _restore_camera_far_state(self, far_state, was_modified):
+        """Put back values recorded by _camera_far_state, unlocking and
+        re-locking any plug the scene ships locked (the auto-fit does
+        the same), and the scene's dirty flag with them."""
+        for plug, value in far_state.items():
+            try:
+                if cmds.getAttr(plug) == value:
+                    continue
+                locked = cmds.getAttr(plug, lock=True)
+                if locked:
+                    cmds.setAttr(plug, lock=False)
+                cmds.setAttr(plug, value)
+                if locked:
+                    cmds.setAttr(plug, lock=True)
+            except Exception as exc:
+                self._log("Could not restore {}. See Script "
+                          "Editor.".format(plug))
+                sys.stderr.write(
+                    LOG_PREFIX + " Restore {} failed: {}\n".format(
+                        plug, exc))
+        cmds.file(modified=was_modified)
 
     def _render_preview_frame(self):
         """Render the current frame and open it in the system viewer."""
@@ -14818,16 +15090,22 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             btn.setEnabled(False)
         QApplication.processEvents()
 
-        # Match the export handlers: push the image plane behind the
-        # farthest geo (and bump the camera far clip) so the preview
-        # frame doesn't get occluded by the plate. Skipped if the
-        # user hasn't configured any geo. The preview has no sky dome, so
-        # the far clip only has to clear the geo.
-        if autofit_geo:
-            self._auto_fit_camera_far([camera], autofit_geo, frame, frame)
-        pb_kwargs["far_clip"] = self._playblast_far_clip(camera)
-
+        # The auto-fit below writes the camera's far clip and image
+        # plane depth; record them so the preview leaves the artist's
+        # scene as it found it.
+        far_state = self._camera_far_state(camera)
+        was_modified = cmds.file(query=True, modified=True)
         try:
+            # Match the export handlers: push the image plane behind the
+            # farthest geo (and bump the camera far clip) so the preview
+            # frame doesn't get occluded by the plate. Skipped if the
+            # user hasn't configured any geo. The preview has no sky
+            # dome, so the far clip only has to clear the geo.
+            if autofit_geo:
+                self._auto_fit_camera_far(
+                    [camera], autofit_geo, frame, frame)
+            pb_kwargs["far_clip"] = self._playblast_far_clip(camera)
+
             exporter = Exporter(self._log)
             result = exporter.export_playblast(
                 tmp_file, camera, frame, frame, **pb_kwargs)
@@ -14837,6 +15115,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 "Render failed:\n{}".format(e))
             return
         finally:
+            self._restore_camera_far_state(far_state, was_modified)
             for btn in self._preview_buttons:
                 btn.setText("Render Preview")
                 btn.setEnabled(True)
@@ -14893,6 +15172,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if result == "Cancel":
                 self._log("Export cancelled by user.")
                 return
+
+        if not self._take_scene_snapshot():
+            return
 
         original_sel = cmds.ls(selection=True)
 
@@ -14957,8 +15239,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self._reset_progress(total_formats)
 
         # --- Prepare cameras: rename and bake each one ---
-        renamed_cams = {}  # current_name -> original_name
-        baked_abc_cams = []
+        # Renames, bakes, the sky dome and the plate re-fit all stay in
+        # the scene until the snapshot restore in the finally below.
         primary_camera = None
         try:
             resolved_cameras = []
@@ -14971,9 +15253,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     # their names so all exports include every camera.
                     if not resolved_cameras:
                         if short != "cam_main":
-                            new_name = cmds.rename(cam, "cam_main")
-                            renamed_cams[new_name] = cam_orig
-                            cam = new_name
+                            cam = cmds.rename(cam, "cam_main")
                     resolved_cameras.append(cam)
                 elif not resolved_cameras and cmds.objExists("cam_main"):
                     resolved_cameras.append("cam_main")
@@ -15008,8 +15288,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 sys.stderr.write(
                     "{} Baking Alembic camera '{}'...\n".format(
                         LOG_PREFIX, cam))
-                cmds.undoInfo(openChunk=True)
-                baked_abc_cams.append(cam)
                 trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                        "sx", "sy", "sz"]
                 Exporter._unlock_for_bake(
@@ -15062,7 +15340,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             # Bake Alembic-driven object tracks.
             # The user selects a group; we need to bake every
             # descendant transform that is driven by an AlembicNode.
-            baked_obj_tracks = []
             for obj in obj_tracks:
                 if not cmds.objExists(obj):
                     continue
@@ -15105,8 +15382,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     "Baking object track '{}' "
                     "({} node(s))...".format(
                         obj, len(nodes_to_bake)))
-                cmds.undoInfo(openChunk=True)
-                baked_obj_tracks.append(obj)
 
                 # One batched bake per group -- simulation=True plays
                 # the timeline once per bakeResults call, not once
@@ -15463,36 +15738,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 self._log_result("Nuke", results["nk"])
                 self._advance_progress()
         finally:
-            # Undo bakes in reverse order (object tracks first,
-            # then cameras  -- reverse of the order they were opened)
-            for _ in baked_obj_tracks:
-                try:
-                    cmds.undoInfo(closeChunk=True)
-                except Exception:
-                    pass
-                try:
-                    cmds.undo()
-                except Exception:
-                    self._log(
-                        "Undo object track bake failed. "
-                        "See Script Editor.")
-            for _ in baked_abc_cams:
-                try:
-                    cmds.undoInfo(closeChunk=True)
-                except Exception:
-                    pass
-                try:
-                    cmds.undo()
-                except Exception:
-                    self._log(
-                        "Undo camera bake failed. See Script Editor.")
-            # Restore renamed cameras
-            for current_name, orig_name in renamed_cams.items():
-                if cmds.objExists(current_name):
-                    try:
-                        cmds.rename(current_name, orig_name)
-                    except Exception:
-                        pass
+            self._restore_scene_snapshot()
 
         self._finish_export(results, all_paths, original_sel)
 
@@ -15516,6 +15762,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if result == "Cancel":
                 self._log("Export cancelled by user.")
                 return
+
+        if not self._take_scene_snapshot():
+            return
 
         original_sel = cmds.ls(selection=True)
 
@@ -15602,9 +15851,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
         self._reset_progress(total_formats)
 
-        renamed_cam = None
-        original_cam_name = camera
-        baked_abc_cam = False
+        # The rename, the camera bake and the FBX prep all stay in the
+        # scene until the snapshot restore in the finally below.
         try:
             if camera:
                 if cmds.objExists(camera):
@@ -15614,9 +15862,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         # Already named correctly  -- no rename
                         pass
                     else:
-                        renamed_cam = cmds.rename(
-                            camera, "cam_main")
-                        camera = renamed_cam
+                        camera = cmds.rename(camera, "cam_main")
                 elif cmds.objExists("cam_main"):
                     camera = "cam_main"
                 else:
@@ -15646,8 +15892,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 if abc_nodes:
                     sys.stderr.write(
                         "{} Baking Alembic camera...\n".format(LOG_PREFIX))
-                    cmds.undoInfo(openChunk=True)
-                    baked_abc_cam = True
                     trs = ["tx", "ty", "tz", "rx", "ry", "rz",
                            "sx", "sy", "sz"]
                     Exporter._unlock_for_bake(
@@ -15877,181 +16121,108 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                      results["witness"])
                 self._advance_progress()
 
-            # FBX is last  -- destructive prep (bake, import refs,
-            # strip namespaces) cannot be reliably undone, so we
-            # save the scene to a temp file, run the prep + export,
-            # then reopen the original to guarantee a clean restore.
+            # FBX is last  -- its prep is destructive (bake, import
+            # refs, strip namespaces, freeze) and nothing after it
+            # needs the scene, so it runs on the live scene and the
+            # snapshot restore in the finally below puts it all back.
             if do_fbx:
                 self._log("Exporting FBX...")
-                scene_path = cmds.file(
-                    query=True, sceneName=True)
-                if not scene_path:
-                    self._log(
-                        "Scene must be saved before FBX export.")
-                    results["fbx"] = False
-                else:
-                    import tempfile
-                    tmp_dir = tempfile.mkdtemp(
-                        prefix="ExportGenie_fbx_")
-                    tmp_scene = os.path.join(
-                        tmp_dir, os.path.basename(scene_path))
-                    try:
-                        # Save current scene state to temp file
-                        cmds.file(rename=tmp_scene)
-                        cmds.file(save=True, type="mayaAscii"
-                                  if tmp_scene.endswith(".ma")
-                                  else "mayaBinary")
-                        # Restore the original file name in the
-                        # title bar (the file on disk is unchanged)
-                        cmds.file(rename=scene_path)
-                        self._log("Scene snapshot saved.")
-
-                        # Destructive prep on the live scene
-                        vertex_anim_set = \
-                            exporter.detect_vertex_anim_meshes(
-                                geo_roots, tpose_start, end_frame)
-                        has_vertex_anim = bool(vertex_anim_set)
-                        if has_vertex_anim:
-                            sys.stderr.write(
-                                LOG_PREFIX + " Detected {} vertex-"
-                                "animated mesh(es) in Mesh "
-                                "Group.\n".format(
-                                    len(vertex_anim_set)))
-
-                        exporter.prep_for_ue5_fbx_export(
-                            geo_roots, rig_roots,
-                            tpose_start, end_frame,
-                            camera=camera,
-                            skip_mesh_xforms=vertex_anim_set)
-
-                        def _resolve_name(name):
-                            if not name:
-                                return name
-                            long_names = cmds.ls(name, long=True)
-                            if long_names:
-                                return long_names[0]
-                            short = name.rsplit(":", 1)[-1]
-                            long_names = cmds.ls(
-                                short, long=True)
-                            if len(long_names) == 1:
-                                return long_names[0]
-                            if long_names:
-                                stripped_tail = "/".join(
-                                    seg.rsplit(":", 1)[-1]
-                                    for seg in name.split("|")
-                                    if seg)
-                                for ln in long_names:
-                                    ln_tail = "/".join(
-                                        seg for seg in
-                                        ln.split("|") if seg)
-                                    if ln_tail.endswith(
-                                            stripped_tail):
-                                        return ln
-                                return long_names[0]
-                            return name
-
-                        base_meshes = []
-                        if has_vertex_anim:
-                            self._log(
-                                "Converting vertex animation...")
-                            for old_long in list(vertex_anim_set):
-                                resolved = _resolve_name(old_long)
-                                conv = \
-                                    exporter.convert_abc_to_blendshape(
-                                        resolved, tpose_start,
-                                        end_frame)
-                                base_meshes.append(
-                                    conv["base_mesh"])
-
-                        fbx_geo = [_resolve_name(g)
-                                   for g in geo_roots]
-                        fbx_rigs = [_resolve_name(r)
-                                    for r in rig_roots]
-                        fbx_proxies = [_resolve_name(p)
-                                       for p in proxy_geos]
-                        fbx_cam = (_resolve_name(camera)
-                                   if camera else camera)
-                        # Delete history and freeze static geo so the
-                        # FBX has clean shapes on identity roots.  Scene
-                        # state is reverted by the tmp-file reopen in
-                        # the finally block.
-                        if fbx_proxies:
-                            n_frozen = \
-                                Exporter._prep_static_geo_for_export(
-                                    fbx_proxies)
-                            if n_frozen:
-                                self._log(
-                                    "Cleaned {} static geo "
-                                    "(history + transforms)."
-                                    .format(n_frozen))
-                        results["fbx"] = exporter.export_fbx(
-                            paths["fbx"], fbx_cam, fbx_geo,
-                            fbx_rigs, fbx_proxies,
-                            tpose_start, end_frame,
-                            export_input_connections=has_vertex_anim,
-                        )
-                    except Exception as exc:
-                        self._log(
-                            "FBX export failed. See Script Editor.")
+                try:
+                    # Destructive prep on the live scene
+                    vertex_anim_set = \
+                        exporter.detect_vertex_anim_meshes(
+                            geo_roots, tpose_start, end_frame)
+                    has_vertex_anim = bool(vertex_anim_set)
+                    if has_vertex_anim:
                         sys.stderr.write(
-                            LOG_PREFIX + " FBX error: "
-                            "{}\n".format(exc))
-                        results["fbx"] = False
-                    finally:
-                        # Reopen the pre-export snapshot to
-                        # guarantee a clean restore (preserves any
-                        # unsaved changes the user had).
-                        restored = False
-                        try:
-                            cmds.file(
-                                tmp_scene, open=True, force=True)
-                            cmds.file(rename=scene_path)
-                            self._log("Scene restored.")
-                            restored = True
-                        except Exception:
-                            pass
-                        if not restored:
-                            # Snapshot failed  -- fall back to the
-                            # original file on disk.
-                            try:
-                                cmds.file(
-                                    scene_path, open=True,
-                                    force=True)
-                                self._log(
-                                    "Restored from saved file.")
-                            except Exception:
-                                self._log(
-                                    "Scene restore failed! "
-                                    "Snapshot at: " + tmp_scene)
-                        # Clean up temp file
-                        try:
-                            if os.path.isfile(tmp_scene):
-                                os.remove(tmp_scene)
-                            os.rmdir(tmp_dir)
-                        except Exception:
-                            pass
+                            LOG_PREFIX + " Detected {} vertex-"
+                            "animated mesh(es) in Mesh "
+                            "Group.\n".format(
+                                len(vertex_anim_set)))
+
+                    exporter.prep_for_ue5_fbx_export(
+                        geo_roots, rig_roots,
+                        tpose_start, end_frame,
+                        camera=camera,
+                        skip_mesh_xforms=vertex_anim_set)
+
+                    def _resolve_name(name):
+                        if not name:
+                            return name
+                        long_names = cmds.ls(name, long=True)
+                        if long_names:
+                            return long_names[0]
+                        short = name.rsplit(":", 1)[-1]
+                        long_names = cmds.ls(
+                            short, long=True)
+                        if len(long_names) == 1:
+                            return long_names[0]
+                        if long_names:
+                            stripped_tail = "/".join(
+                                seg.rsplit(":", 1)[-1]
+                                for seg in name.split("|")
+                                if seg)
+                            for ln in long_names:
+                                ln_tail = "/".join(
+                                    seg for seg in
+                                    ln.split("|") if seg)
+                                if ln_tail.endswith(
+                                        stripped_tail):
+                                    return ln
+                            return long_names[0]
+                        return name
+
+                    base_meshes = []
+                    if has_vertex_anim:
+                        self._log(
+                            "Converting vertex animation...")
+                        for old_long in list(vertex_anim_set):
+                            resolved = _resolve_name(old_long)
+                            conv = \
+                                exporter.convert_abc_to_blendshape(
+                                    resolved, tpose_start,
+                                    end_frame)
+                            base_meshes.append(
+                                conv["base_mesh"])
+
+                    fbx_geo = [_resolve_name(g)
+                               for g in geo_roots]
+                    fbx_rigs = [_resolve_name(r)
+                                for r in rig_roots]
+                    fbx_proxies = [_resolve_name(p)
+                                   for p in proxy_geos]
+                    fbx_cam = (_resolve_name(camera)
+                               if camera else camera)
+                    # Delete history and freeze static geo so the
+                    # FBX has clean shapes on identity roots.  Scene
+                    # state is reverted by the snapshot restore.
+                    if fbx_proxies:
+                        n_frozen = \
+                            Exporter._prep_static_geo_for_export(
+                                fbx_proxies)
+                        if n_frozen:
+                            self._log(
+                                "Cleaned {} static geo "
+                                "(history + transforms)."
+                                .format(n_frozen))
+                    results["fbx"] = exporter.export_fbx(
+                        paths["fbx"], fbx_cam, fbx_geo,
+                        fbx_rigs, fbx_proxies,
+                        tpose_start, end_frame,
+                        export_input_connections=has_vertex_anim,
+                    )
+                except Exception as exc:
+                    self._log(
+                        "FBX export failed. See Script Editor.")
+                    sys.stderr.write(
+                        LOG_PREFIX + " FBX error: "
+                        "{}\n".format(exc))
+                    results["fbx"] = False
                 self._log_result("FBX", results.get("fbx", False))
                 self._advance_progress()
 
         finally:
-            # Undo Alembic camera bake (restores original connections)
-            if baked_abc_cam:
-                try:
-                    cmds.undoInfo(closeChunk=True)
-                except Exception:
-                    pass
-                try:
-                    cmds.undo()
-                except Exception:
-                    self._log(
-                        "Undo camera bake failed. "
-                        "See Script Editor.")
-            # Restore original camera name
-            if renamed_cam and cmds.objExists(renamed_cam):
-                try:
-                    cmds.rename(renamed_cam, original_cam_name)
-                except Exception:
-                    pass
+            self._restore_scene_snapshot()
 
         self._finish_export(results, paths, original_sel)
 
@@ -16075,6 +16246,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             if result == "Cancel":
                 self._log("Export cancelled by user.")
                 return
+
+        if not self._take_scene_snapshot():
+            return
 
         original_sel = cmds.ls(selection=True)
 
@@ -16148,8 +16322,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         total_formats = sum([do_ma, do_fbx, do_abc, do_usd, do_mov])
         self._reset_progress(total_formats)
 
-        renamed_cam = None
-        original_cam_name = camera
         tmp_scene = None
         tmp_scene_baked = None
         tmp_dir = None
@@ -16163,22 +16335,20 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         # Already named correctly  -- no rename
                         pass
                     else:
-                        renamed_cam = cmds.rename(
-                            camera, "cam_main")
-                        camera = renamed_cam
+                        camera = cmds.rename(camera, "cam_main")
                 elif cmds.objExists("cam_main"):
                     camera = "cam_main"
                 else:
                     self._log("Camera not found. See Script Editor.")
                     camera = None
 
-            # Save scene snapshot before any baking.  Temp-file
-            # save/restore is used instead of undo chunks so that
-            # both camera and geo transforms can be baked before
-            # the playblast and reliably reverted afterward.
+            # Save the renamed scene before any baking: MA, USD and FBX
+            # prep is destructive, so each of them reopens from this
+            # file (or the camera-baked copy below). The artist's own
+            # scene comes back from the snapshot restore in the finally.
             scene_path = cmds.file(
                 query=True, sceneName=True)
-            if scene_path:
+            if scene_path and (do_ma or do_usd or do_fbx):
                 import tempfile
                 tmp_dir = tempfile.mkdtemp(
                     prefix="ExportGenie_ft_")
@@ -16191,7 +16361,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 cmds.file(rename=tmp_scene)
                 cmds.file(save=True, type=scene_type)
                 cmds.file(rename=scene_path)
-                self._log("Scene snapshot saved.")
             elif do_ma or do_usd or do_fbx:
                 self._log(
                     "Scene must be saved before "
@@ -16309,7 +16478,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             # ---- Bake geo transforms for playblast ----
             # Ensures motion blur on the first frame is clean
             # (no pop from Alembic data starting abruptly).
-            if do_mov and face_meshes and tmp_scene:
+            if do_mov and face_meshes:
                 bake_pre = int(start_frame) - 1
                 geo_to_bake = []
                 for fm in face_meshes:
@@ -16520,8 +16689,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                                 "select_for_export",
                                 resolved_meshes)
                             # Delete history and freeze static geo.
-                            # Scene is restored from tmp_scene in the
-                            # outer finally, so no explicit undo needed.
+                            # The snapshot restore in the outer finally
+                            # reverts it, so no explicit undo needed.
                             if resolved_statics:
                                 n_frozen = \
                                     Exporter._prep_static_geo_for_export(
@@ -16683,45 +16852,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         "{}\n".format(exc))
 
         finally:
-            # Restore from the pre-bake snapshot (replaces
-            # the old undo-chunk approach).
-            if tmp_scene:
-                restored = False
-                try:
-                    cmds.file(
-                        tmp_scene, open=True, force=True)
-                    cmds.file(rename=scene_path)
-                    self._log("Scene restored.")
-                    restored = True
-                except Exception:
-                    pass
-                if not restored:
-                    try:
-                        cmds.file(
-                            scene_path, open=True,
-                            force=True)
-                        self._log(
-                            "Restored from saved file.")
-                    except Exception:
-                        self._log(
-                            "Scene restore failed! "
-                            "Snapshot at: " + tmp_scene)
-                # Clean up temp files
-                try:
-                    if os.path.isfile(tmp_scene):
-                        os.remove(tmp_scene)
-                    if (tmp_scene_baked
-                            and os.path.isfile(tmp_scene_baked)):
-                        os.remove(tmp_scene_baked)
-                    if tmp_dir:
-                        os.rmdir(tmp_dir)
-                except Exception:
-                    pass
-            if renamed_cam and cmds.objExists(renamed_cam):
-                try:
-                    cmds.rename(renamed_cam, original_cam_name)
-                except Exception:
-                    pass
+            self._restore_scene_snapshot()
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         self._finish_export(results, paths, original_sel)
 
