@@ -56,7 +56,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v23.3"
+TOOL_VERSION = "v23.4_beta-1"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -225,7 +225,9 @@ _THIRDPARTY_RENDERER_PLUGINS = {
 }
 
 # Path to the bundled Nuke template. Two flavors:
-#  - have_stmaps=True  -> ud_qc_v01_.nk: full undistort/redistort QC pipe.
+#  - have_stmaps=True  -> ud_qc_v02_.nk: full undistort/redistort QC pipe,
+#    plus the STMap Double-Check and comp-starter sections from
+#    MasterQC_templates_v40 (SynthEyes HD copy).
 #  - have_stmaps=False -> qc_v01_.nk: minimal raw-plate + alembic + playblast
 #    pipe, no STMap branches.
 # Resolved lazily so the module loads even if a template is missing.
@@ -233,7 +235,7 @@ def _nk_template_path(have_stmaps=True):
     """Return the absolute path to the bundled Nuke template, or None
     if it's not present alongside the plugin."""
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    fname = "ud_qc_v01_.nk" if have_stmaps else "qc_v01_.nk"
+    fname = "ud_qc_v02_.nk" if have_stmaps else "qc_v01_.nk"
     candidate = os.path.join(plugin_dir, "templates", fname)
     return candidate if os.path.exists(candidate) else None
 
@@ -10948,9 +10950,10 @@ class Exporter(object):
             return False
 
     # Node-name → asset-key mapping for the bundled Nuke template
-    # (templates/ud_qc_v01_.nk). Any Read/ReadGeo/Camera node whose
+    # (templates/ud_qc_v02_.nk). Any Read/ReadGeo/Camera node whose
     # `name` knob isn't in this map is left untouched at generation
-    # time.
+    # time. dc_* nodes are the STMap Double-Check section, cs_* the
+    # comp-starter section.
     _NK_NODE_TO_ASSET = {
         "raw_plate": "raw_plate",
         "ud_plate":  "ud_plate",
@@ -10959,6 +10962,12 @@ class Exporter(object):
         "playblast": "playblast",
         "alembic":   "alembic",
         "Camera1":   "alembic",
+        "dc_raw_plate": "raw_plate",
+        "dc_ud_plate":  "ud_plate",
+        "dc_rd_stmap":  "stmap_redistort",
+        "dc_ud_stmap":  "stmap_undistort",
+        "cs_raw_plate": "raw_plate",
+        "cs_rd_stmap":  "stmap_redistort",
     }
     # Reformat-name → asset-key whose dimensions drive the `format`
     # knob. Names follow a `set_<element>_res` convention defined in
@@ -10970,12 +10979,23 @@ class Exporter(object):
         "set_ud_plate_res":  "ud_plate",
         "set_ud_stmap_res":  "ud_stmap",
         "set_ud_stmap_res2": "ud_stmap",
+        "set_dc_plate_res":  "raw_plate",
+        "set_cs_plate_res":  "raw_plate",
     }
+    # Reformats that sit in front of a redistort STMap and take a
+    # UD-res image. 3DE STMaps keep the plate size as their format
+    # (overscan lives in the bbox), so for 3DE these are enabled and
+    # set to raw plate dims (resize none, centered, preserve bbox);
+    # for SynthEyes they stay disabled as the template ships them.
+    _NK_3DE_PRE_REDISTORT_REFORMATS = frozenset({
+        "set_ud_stmap_res2", "set_dc_plate_res",
+    })
     # Image-sequence Reads: file frame numbers equal timeline frame
     # numbers (e.g. raw_plate_1001.exr -> raw_plate_1195.exr), so
     # first/last/origfirst/origlast are rewritten to start/end_frame.
     _NK_SEQUENCE_NODES = frozenset({
         "raw_plate", "ud_plate",
+        "dc_raw_plate", "dc_ud_plate", "cs_raw_plate",
     })
     # Movie Reads: the file's internal frames are 1..N regardless of
     # the shot's timeline range, so last/origlast are rewritten to
@@ -11185,7 +11205,7 @@ class Exporter(object):
                   start_frame=None, end_frame=None,
                   plate_width=None, plate_height=None,
                   raw_plate_dims=None, ud_plate_dims=None,
-                  alembic_geo_paths=None):
+                  alembic_geo_paths=None, stmaps_3de=False):
         """Generate a Nuke .nk script from the bundled template.
 
         Rewrites Read/ReadGeo/Camera node `file` paths (relative to
@@ -11203,6 +11223,10 @@ class Exporter(object):
         follows ud_plate dims. When either is missing the
         corresponding Reads/Reformats are left as the template
         had them.
+
+        stmaps_3de=True marks the STMaps as 3DEqualizer exports: the
+        `_NK_3DE_PRE_REDISTORT_REFORMATS` are enabled and set to
+        raw_plate_dims. False (SynthEyes) leaves them as authored.
 
         Missing assets (None / empty) leave the corresponding Read
         node's `file` knob blank — Nuke will report a missing file
@@ -11234,6 +11258,7 @@ class Exporter(object):
             "plate_height": plate_height,
             "raw_plate_dims": raw_plate_dims,
             "ud_plate_dims": ud_plate_dims,
+            "stmaps_3de": stmaps_3de,
         }
         current_block = "<pre-parse>"
 
@@ -11254,7 +11279,7 @@ class Exporter(object):
                 "alembic", "playblast",
                 "start_frame", "end_frame",
                 "plate_width", "plate_height",
-                "raw_plate_dims", "ud_plate_dims",
+                "raw_plate_dims", "ud_plate_dims", "stmaps_3de",
             ):
                 buf.append("    {:<18} = {!r}".format(k, ctx.get(k)))
             buf.append("")
@@ -11305,13 +11330,16 @@ class Exporter(object):
             # ud_stmap shares ud_plate's domain. Movies and geo
             # carry no static dims — the template's existing format
             # is correct for them.
+            dims_by_asset = {
+                "raw_plate": raw_plate_dims,
+                "stmap_redistort": raw_plate_dims,
+                "ud_plate": ud_plate_dims,
+                "stmap_undistort": ud_plate_dims,
+            }
             read_dims_by_block_name = {}
-            if raw_plate_dims:
-                read_dims_by_block_name["raw_plate"] = raw_plate_dims
-                read_dims_by_block_name["rd_stmap"] = raw_plate_dims
-            if ud_plate_dims:
-                read_dims_by_block_name["ud_plate"] = ud_plate_dims
-                read_dims_by_block_name["ud_stmap"] = ud_plate_dims
+            for bn, asset in self._NK_NODE_TO_ASSET.items():
+                if dims_by_asset.get(asset):
+                    read_dims_by_block_name[bn] = dims_by_asset[asset]
 
             # Per-Reformat dims: looked up by `set_<element>_res` name.
             reformat_dims_by_block_name = {}
@@ -11320,6 +11348,9 @@ class Exporter(object):
                     reformat_dims_by_block_name[rfn] = raw_plate_dims
                 elif asset in ("ud_plate", "ud_stmap") and ud_plate_dims:
                     reformat_dims_by_block_name[rfn] = ud_plate_dims
+            if stmaps_3de and raw_plate_dims:
+                for rfn in self._NK_3DE_PRE_REDISTORT_REFORMATS:
+                    reformat_dims_by_block_name[rfn] = raw_plate_dims
 
             with open(template_path, "r") as f:
                 lines = f.read().splitlines()
@@ -11411,6 +11442,10 @@ class Exporter(object):
                     out_lines.extend(self._rewrite_nk_time_offset_block(
                         block, start_frame))
                 elif node_type == "Reformat":
+                    if (stmaps_3de and block_name
+                            in self._NK_3DE_PRE_REDISTORT_REFORMATS):
+                        block = [bl for bl in block
+                                 if bl != " disable true"]
                     out_lines.extend(self._rewrite_nk_reformat_block(
                         block, reformat_dims_by_block_name.get(
                             block_name)))
@@ -12120,6 +12155,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self.ct_obj_track_minus_btn = None
         self.ct_stmap_undistort_field = None
         self.ct_stmap_redistort_field = None
+        self.ct_stmap_sy_checkbox = None
+        self.ct_stmap_3de_checkbox = None
         self.ct_raw_plate_field = None
         self.ct_ma_checkbox = None
         self.ct_jsx_checkbox = None
@@ -12468,6 +12505,29 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             partial(self._browse_stmap, self.ct_stmap_redistort_field))
         rd_row.addWidget(rd_btn)
         stmap_layout.addLayout(rd_row)
+
+        # Which tracker wrote the STMaps. 3DE keeps the plate size as
+        # the map's format and puts the overscan in the bounding box,
+        # so the generated .nk must Reformat UD-res images to plate
+        # res before redistorting; SynthEyes maps cover the whole
+        # padded image and need no Reformat. Exactly one is required
+        # whenever an STMap is assigned (see _validate_camera_track).
+        src_row = QHBoxLayout()
+        src_row.setSpacing(12)
+        src_row.addWidget(QLabel("STMaps exported from:"))
+        self.ct_stmap_sy_checkbox = QCheckBox("SynthEyes")
+        self.ct_stmap_3de_checkbox = QCheckBox("3DEqualizer")
+        for cb, other in (
+                (self.ct_stmap_sy_checkbox, self.ct_stmap_3de_checkbox),
+                (self.ct_stmap_3de_checkbox, self.ct_stmap_sy_checkbox)):
+            cb.setToolTip(
+                "Required when an STMap is assigned. Choose the "
+                "application that exported the STMaps.")
+            cb.toggled.connect(
+                partial(lambda o, on: on and o.setChecked(False), other))
+            src_row.addWidget(cb)
+        src_row.addStretch(1)
+        stmap_layout.addLayout(src_row)
 
         rp_lbl = QLabel("Raw Plate (distorted sequence):")
         stmap_layout.addWidget(rp_lbl)
@@ -14592,6 +14652,17 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         "each other. Please rename them to be "
                         "unique.".format(short))
 
+        has_stmap = bool(
+            (self.ct_stmap_undistort_field
+             and self.ct_stmap_undistort_field.text().strip())
+            or (self.ct_stmap_redistort_field
+                and self.ct_stmap_redistort_field.text().strip()))
+        if has_stmap and not (self.ct_stmap_sy_checkbox.isChecked()
+                              or self.ct_stmap_3de_checkbox.isChecked()):
+            errors.append(
+                "STMaps assigned: choose whether they were exported "
+                "from SynthEyes or 3DEqualizer.")
+
         warnings.extend(Exporter._scale_warnings(cameras, start_frame))
         return errors, warnings
 
@@ -15206,6 +15277,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                           if self.ct_stmap_undistort_field else "")
         stmap_redistort = (self.ct_stmap_redistort_field.text().strip()
                           if self.ct_stmap_redistort_field else "")
+        stmaps_3de = bool(self.ct_stmap_3de_checkbox
+                          and self.ct_stmap_3de_checkbox.isChecked())
         raw_plate = (self.ct_raw_plate_field.text().strip()
                      if self.ct_raw_plate_field else "")
         start_frame = self.start_frame_spin.value()
@@ -15732,7 +15805,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                     plate_width=plate_w, plate_height=plate_h,
                     raw_plate_dims=raw_dims,
                     ud_plate_dims=ud_dims,
-                    alembic_geo_paths=abc_geo_paths)
+                    alembic_geo_paths=abc_geo_paths,
+                    stmaps_3de=stmaps_3de)
                 if results["nk"]:
                     all_paths["nk"] = nk_path
                 self._log_result("Nuke", results["nk"])

@@ -1,0 +1,666 @@
+#! C:/Program Files/Nuke17.1v2/nuke-17.1.2.dll -nx
+version 17.1 v2
+define_window_layout_xml {<?xml version="1.0" encoding="UTF-8"?>
+<layout version="1.0">
+    <window x="-2" y="-5" w="1538" h="890" screen="0">
+        <splitter orientation="1">
+            <split size="40"/>
+            <dock id="" hideTitles="1" activePageId="Toolbar.1">
+                <page id="Toolbar.1"/>
+            </dock>
+            <split size="875" stretch="1"/>
+            <splitter orientation="2">
+                <split size="312"/>
+                <dock id="" activePageId="Viewer.1">
+                    <page id="Viewer.1"/>
+                </dock>
+                <split size="535"/>
+                <dock id="" activePageId="DAG.1" focus="true">
+                    <page id="DAG.1"/>
+                    <page id="Curve Editor.1"/>
+                    <page id="DopeSheet.1"/>
+                </dock>
+            </splitter>
+            <split size="615"/>
+            <dock id="" activePageId="Properties.1">
+                <page id="Properties.1"/>
+                <page id="uk.co.thefoundry.backgroundrenderview.1"/>
+                <page id="Scenegraph.1"/>
+            </dock>
+        </splitter>
+    </window>
+</layout>
+}
+Root {
+ inputs 0
+ name ud_qc_v02_.nk
+ frame 1001
+ first_frame 1001
+ last_frame 1158
+ lock_range true
+ format "3840 2160 0 0 3840 2160 1 UHD_4K"
+ proxy_type scale
+ proxy_format "1024 778 0 0 1024 778 1 1K_Super_35(full-ap)"
+ colorManagement Nuke
+ workingSpaceLUT linear
+ monitorLut sRGB
+ monitorOutLUT rec709
+ int8Lut sRGB
+ int16Lut sRGB
+ logLut Cineon
+ floatLut linear
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode2
+ tile_color 0x84442dff
+ xpos -1776
+ ypos 1278
+ bdwidth 1571
+ bdheight 277
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode3
+ tile_color 0x84834bff
+ xpos -1768
+ ypos 120
+ bdwidth 1568
+ bdheight 1092
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode5
+ tile_color 0x6a8866ff
+ label "THIS SCRIPT DOES 4 THINGS:\nA)CHECK OF STMAPS UNDISTORT & REDISTORT\nB)CREATES THE udTRACK TEST .MP4\nC)QC OF .ABC FILE\nD)DOUBLE-CHECK OF THE STMAPS\n\nSTEPS:\n1)FOOTAGE, STMAPS AND .ABC ARE FILLED IN BY EXPORT GENIE\n2)CHECK RED BACKDROP @ BOTTOM FOR RESULTS AND OUTPUTS\n3)STMAP DOUBLE-CHECK AND COMP STARTER SIT BELOW"
+ note_font_size 41
+ xpos -3631
+ ypos -412
+ bdwidth 3429
+ bdheight 478
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode1
+ tile_color 0x729844ff
+ note_font_size 21
+ xpos -1862
+ ypos -256
+ bdwidth 1110
+ bdheight 236
+ z_order 1
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode4
+ tile_color 0x14427cff
+ label ABC
+ note_font Verdana
+ note_font_size 51
+ note_font_color 0xff0100ff
+ xpos -787
+ ypos 292
+ bdwidth 342
+ bdheight 621
+ z_order 1
+}
+Dot {
+ inputs 0
+ name Dot12
+ label " RAW PLATE"
+ note_font_size 21
+ note_font_color 0xffffffff
+ xpos -1725
+ ypos -221
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot13
+ label "UD PLATE"
+ note_font_size 21
+ note_font_color 0xffffffff
+ xpos -1513
+ ypos -221
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot14
+ label "UD STMAP"
+ note_font_size 21
+ note_font_color 0xffffffff
+ xpos -1332
+ ypos -219
+ hide_input true
+}
+Read {
+ inputs 0
+ file_type exr
+ file rd_stmap
+ format "3840 2160 0 0 3840 2160 1 UHD_4K"
+ origset true
+ name rd_stmap
+ xpos -1156
+ ypos -165
+}
+Dot {
+ name Dot6
+ xpos -1122
+ ypos 635
+}
+set N76610c00 [stack 0]
+Dot {
+ name Dot2
+ xpos -1122
+ ypos 977
+}
+set N76611000 [stack 0]
+Read {
+ inputs 0
+ file_type exr
+ file ud_plate
+ format "4224 2376 0 0 4224 2376 1 "
+ first 1001
+ last 1158
+ origfirst 1001
+ origlast 1158
+ origset true
+ name ud_plate
+ xpos -1486
+ ypos -173
+}
+Dot {
+ name Dot4
+ xpos -1452
+ ypos 234
+}
+set N76611400 [stack 0]
+Dot {
+ name Dot21
+ xpos -1451
+ ypos 706
+}
+set N2359e400 [stack 0]
+Reformat {
+ resize none
+ pbb true
+ name set_ud_stmap_res2
+ disable true
+ xpos -1486
+ ypos 900
+}
+STMap {
+ inputs 2
+ channels rgb
+ uv rgb
+ name stmap_rd
+ selected true
+ xpos -1486
+ ypos 973
+}
+set N76620f00 [stack 0]
+Read {
+ inputs 0
+ file_type exr
+ file raw_plate
+ format "3840 2160 0 0 3840 2160 1 UHD_4K"
+ first 1001
+ last 1158
+ origfirst 1001
+ origlast 1158
+ origset true
+ raw true
+ name raw_plate
+ xpos -1687
+ ypos -175
+}
+Dot {
+ name Dot19
+ xpos -1653
+ ypos 326
+}
+set N76611c00 [stack 0]
+Dot {
+ name Dot3
+ xpos -1653
+ ypos 973
+}
+Merge2 {
+ inputs 2
+ operation difference
+ name Merge1
+ xpos -1486
+ ypos 1349
+}
+Dot {
+ inputs 0
+ name Dot15
+ label "RD STMAP"
+ note_font_size 21
+ note_font_color 0xffffffff
+ xpos -1170
+ ypos -222
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot16
+ tile_color 0xff
+ label "MAYA PLAYBLAST"
+ note_font_size 21
+ note_font_color 0xffffffff
+ xpos -1023
+ ypos -222
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot17
+ label "<--replace camera with generated camera from readgeo"
+ xpos -393
+ ypos 614
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot18
+ label "select abc file,create all in one camera\nand replace default camera in scene. In\nthe read geo node do not load trackers \nor locators or it will take 10+ minutes \nto open abc."
+ xpos -393
+ ypos 508
+ hide_input true
+}
+push $N76620f00
+push $N76611000
+Camera3 {
+ inputs 0
+ name Camera1
+ xpos -566
+ ypos 482
+}
+Wireframe {
+ inputs 0
+ name Wireframe1
+ xpos -694
+ ypos 389
+}
+ReadGeo2 {
+ name alembic
+ xpos -694
+ ypos 496
+}
+push 0
+ScanlineRender {
+ inputs 3
+ conservative_shader_sampling false
+ motion_vectors_type distance
+ name scanline
+ xpos -694
+ ypos 598
+}
+Keyer {
+ operation "luminance key"
+ name Keyer1
+ xpos -694
+ ypos 679
+}
+Reformat {
+ format "4224 2376 0 0 4224 2376 1 "
+ name set_ud_plate_res
+ xpos -694
+ ypos 782
+}
+push $N76611400
+Dot {
+ name Dot5
+ xpos -416
+ ypos 234
+}
+Merge2 {
+ inputs 2
+ name Merge2
+ xpos -450
+ ypos 788
+}
+STMap {
+ inputs 2
+ channels rgb
+ uv rgb
+ name stmap_rd3
+ xpos -450
+ ypos 973
+}
+Dot {
+ name Dot7
+ label "<----ABC checker"
+ xpos -416
+ ypos 1360
+}
+Viewer {
+ inputs 2
+ frame_range 1001-1158
+ frame_range_lock true
+ viewerProcess None
+ monitorOutNDISenderName "Nuke - ud_qc_v01_ - Viewer1"
+ monitorOutOutputTransform rec709
+ name Viewer1
+ xpos -523
+ ypos -171
+}
+Dot {
+ inputs 0
+ name Dot8
+ label A
+ note_font_size 81
+ xpos -1479
+ ypos 1441
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot9
+ label B
+ note_font_size 81
+ xpos -1300
+ ypos 1440
+ hide_input true
+}
+push $N76610c00
+Read {
+ inputs 0
+ file_type mov
+ file maya_playblast
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ last 158
+ origlast 158
+ origset true
+ name playblast
+ xpos -1008
+ ypos -170
+}
+TimeOffset {
+ time ""
+ name TimeOffset1
+ xpos -1008
+ ypos -73
+}
+Reformat {
+ format "4224 2376 0 0 4224 2376 1 "
+ name set_ud_stmap_res
+ xpos -1008
+ ypos 402
+}
+Reformat {
+ resize none
+ pbb true
+ name set_plate_res2
+ xpos -1008
+ ypos 529
+}
+STMap {
+ inputs 2
+ channels rgb
+ uv rgb
+ name stmap_rd2
+ xpos -1008
+ ypos 631
+}
+Reformat {
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ name set_HD
+ xpos -1008
+ ypos 758
+}
+Write {
+ file Y:/+projects/meta/QC/STAT0001/STAT0001_pl01_track_v02.mp4
+ file_type mov
+ mov64_format "mp4 (MP4 (MPEG-4 Part 14))"
+ mov64_codec mp4v
+ mov_h264_codec_profile "High 4:2:0 8-bit"
+ mov64_pixel_format {
+  {0}
+  "yuv420p\tYCbCr 4:2:0 8-bit"
+ }
+ mov64_quality High
+ mov64_fast_start true
+ mov64_write_timecode true
+ mov64_gop_size 12
+ mov64_b_frames 0
+ mov64_bitrate 200000
+ mov64_bitrate_tolerance 4000000
+ mov64_quality_min 1
+ mov64_quality_max 3
+ raw true
+ create_directories true
+ checkHashOnRead false
+ ocioColorspace scene_linear
+ display default
+ view sRGB
+ name Write1
+ xpos -1008
+ ypos 1334
+}
+Dot {
+ inputs 0
+ name Dot10
+ label C
+ note_font_size 81
+ xpos -989
+ ypos 1442
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot1
+ label D
+ note_font_size 81
+ xpos -439
+ ypos 1426
+ hide_input true
+}
+Dot {
+ inputs 0
+ name Dot11
+ label "<--if black Stmaps are working"
+ xpos -1415
+ ypos 1525
+ hide_input true
+}
+push $N2359e400
+Read {
+ inputs 0
+ file_type exr
+ file ud_stmap
+ format "3840 2160 0 0 3840 2160 1 UHD_4K"
+ origset true
+ name ud_stmap
+ xpos -1311
+ ypos -176
+}
+push $N76611c00
+STMap {
+ inputs 2
+ channels rgb
+ uv rgb
+ name STMap1
+ xpos -1311
+ ypos 322
+}
+Merge2 {
+ inputs 2
+ operation difference
+ name Merge3
+ xpos -1311
+ ypos 1354
+}
+Dot {
+ name Dot20
+ xpos -1277
+ ypos 1380
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode_cs
+ tile_color 0x7a4433ff
+ label "UD:\nCopy, Reformat and STMap for use in script"
+ note_font_size 42
+ note_font_color 0xffffffff
+ xpos -1015
+ ypos 1699
+ bdwidth 807
+ bdheight 664
+}
+BackdropNode {
+ inputs 0
+ name BackdropNode_dc
+ tile_color 0x7e5e4fff
+ label "UD/RD:\nSTMap Double-Check"
+ note_font_size 42
+ note_font_color 0xffffffff
+ xpos -1776
+ ypos 1700
+ bdwidth 748
+ bdheight 510
+}
+Read {
+ inputs 0
+ file_type exr
+ file ""
+ format "1936 1088 0 0 1936 1088 0.999082 "
+ origset true
+ name dc_ud_stmap
+ xpos -1696
+ ypos 1943
+}
+set NS129 [stack 0]
+Read {
+ inputs 0
+ file_type exr
+ file ""
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ first 1001
+ last 1248
+ origfirst 1001
+ origlast 1248
+ origset true
+ colorspace sRGB
+ name dc_raw_plate
+ xpos -1578
+ ypos 1843
+}
+set NS130 [stack 0]
+push $NS129
+push $NS130
+STMap {
+ inputs 2
+ uv rgb
+ name dc_undistort
+ xpos -1578
+ ypos 2020
+}
+Read {
+ inputs 0
+ file_type exr
+ file ""
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ origset true
+ name cs_rd_stmap
+ xpos -757
+ ypos 2080
+}
+set NS132 [stack 0]
+Read {
+ inputs 0
+ file_type exr
+ file ""
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ first 1001
+ last 1248
+ origfirst 1001
+ origlast 1248
+ origset true
+ colorspace sRGB
+ name cs_raw_plate
+ xpos -652
+ ypos 1928
+}
+set NS133 [stack 0]
+push $NS133
+Reformat {
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ resize none
+ pbb true
+ name set_cs_plate_res
+ xpos -652
+ ypos 2042
+}
+set NS134 [stack 0]
+push $NS132
+push $NS134
+STMap {
+ inputs 2
+ uv rgb
+ name cs_redistort
+ xpos -652
+ ypos 2186
+}
+Read {
+ inputs 0
+ file_type exr
+ file ""
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ origset true
+ name dc_rd_stmap
+ xpos -1223
+ ypos 1945
+}
+set NS157 [stack 0]
+Read {
+ inputs 0
+ file_type exr
+ file ""
+ format "1936 1088 0 0 1936 1088 0.999082 "
+ first 1001
+ last 1248
+ origfirst 1001
+ origlast 1248
+ origset true
+ colorspace sRGB
+ name dc_ud_plate
+ xpos -1361
+ ypos 1843
+}
+set NS158 [stack 0]
+push $NS158
+Reformat {
+ format "1920 1080 0 0 1920 1080 1 HD_1080"
+ resize none
+ pbb true
+ name set_dc_plate_res
+ xpos -1361
+ ypos 1954
+ disable true
+}
+set NS159 [stack 0]
+push $NS157
+push $NS159
+STMap {
+ inputs 2
+ uv rgb
+ name dc_redistort
+ xpos -1361
+ ypos 2020
+}
+set NS160 [stack 0]
+push $NS160
+push $NS130
+Viewer {
+ inputs 2
+ frame_range 1001-1193
+ input_number 1
+ render_settings_schema false
+ monitorOutNDISenderName "NukeX - MasterQC_templates_v27 - Viewer5"
+ name Viewer_dc
+ xpos -1455
+ ypos 2130
+}
