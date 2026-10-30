@@ -56,7 +56,7 @@ from maya.OpenMayaUI import MQtUtil
 # Constants
 # ---------------------------------------------------------------------------
 TOOL_NAME = "ExportGenie"
-TOOL_VERSION = "v23.4_beta-1"
+TOOL_VERSION = "v23.4_beta-2"
 WINDOW_NAME = "multiExportWindow"
 WORKSPACE_CONTROL_NAME = "exportGenieWorkspaceControl"
 SHELF_BUTTON_LABEL = "ExportGenie"
@@ -105,6 +105,7 @@ CAMERA_SCALE_TOLERANCE = 1e-3      # how far a camera's scale may drift from
 WITNESS_STANDOFF_GEO_KEYWORDS = ("genhuman", "genman", "lineup")
 SCENE_LINEAR_UNIT = "cm"           # studio standard; any other unit warns
 GENHUMAN_MESH_NAME = "GenHuman_body_mesh"   # scale reference, any namespace
+EXPORT_FOLDER_SUFFIX = "prePro3d"         # <shot>_<plate>_prePro3d, unversioned
 GENHUMAN_HEIGHT_RANGE_CM = (140.0, 210.0)   # plausible standing height; a
                                    # GenHuman outside this on the start
                                    # frame means the rig or the track has
@@ -394,7 +395,7 @@ class FolderManager(object):
 
     @staticmethod
     def build_export_paths(export_root, scene_base_name, version_str,
-                           tag="track", qc_tag="track",
+                           tag="track", qc_tag=None,
                            folder_name=None):
         """Build the full set of export paths.
 
@@ -405,7 +406,8 @@ class FolderManager(object):
                  "cam" for Camera Track, "charMM" for Matchmove,
                  "KTHead" for Face Track.
             qc_tag: Naming tag for QC playblast files (mov, png, mp4).
-                    Defaults to "track" for all tabs.
+                    Defaults to *tag*, so each product's movie carries
+                    its own name (cam / charMM / KTHead).
             folder_name: Full export folder name. When provided, used
                 as the subdirectory under export_root instead of
                 scene_base_name.
@@ -422,7 +424,8 @@ class FolderManager(object):
                 base=scene_base_name, tag=tag, ver=version_str, ext=ext
             )
             paths[fmt] = os.path.join(dir_path, file_name)
-        # QC playblast  -- uses qc_tag (always "track") for consistent naming
+        # QC playblast -- named after the product it reviews
+        qc_tag = qc_tag or tag
         qc_base = "{base}_{tag}_{ver}".format(
             base=scene_base_name, tag=qc_tag, ver=version_str
         )
@@ -1223,16 +1226,15 @@ class Exporter(object):
         return None
 
     @staticmethod
-    def _get_image_plane_resolution(camera):
+    def _get_image_plane_resolution(camera, default=(1920, 1080)):
         """Return (width, height) from the first image plane on *camera*.
 
         Reads the actual source image file to determine pixel
         dimensions rather than relying on Maya's ``coverageX/Y``
         attributes (which may differ from the true file resolution).
-        Falls back to (1920, 1080) if no image plane is found or
-        the file cannot be read.
+        Falls back to *default* if no image plane is found or the
+        file cannot be read.
         """
-        default = (1920, 1080)
         if not camera or not cmds.objExists(camera):
             return default
         cam_shapes = cmds.listRelatives(
@@ -5165,6 +5167,9 @@ class Exporter(object):
         if resolution is None:
             resolution = self._get_image_plane_resolution(camera)
         pb_width, pb_height = resolution
+        # The burn-in names the source plate size, not the capped
+        # review-movie size.
+        hud_resolution = tuple(resolution)
         # Cap width at 1920, scaling height to preserve aspect ratio.
         if pb_width > 1920:
             pb_height = int(round(pb_height * 1920.0 / pb_width))
@@ -6766,7 +6771,7 @@ class Exporter(object):
                             png_output=True,
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
-                            resolution=(pb_width, pb_height),
+                            resolution=hud_resolution,
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
@@ -6784,7 +6789,7 @@ class Exporter(object):
                             opacity=opacity_01,
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
-                            resolution=(pb_width, pb_height),
+                            resolution=hud_resolution,
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
@@ -6808,7 +6813,7 @@ class Exporter(object):
                             opacity=opacity_01,
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
-                            resolution=(pb_width, pb_height),
+                            resolution=hud_resolution,
                             crown_dir=c_crown_dir,
                             crown_base=c_crown_base,
                             wireframe_dir=c_wf_dir,
@@ -6896,7 +6901,7 @@ class Exporter(object):
                             mp4_output,
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
-                            resolution=(pb_width, pb_height),
+                            resolution=hud_resolution,
                             plate_name=hud_plate_name,
                             rig_lines=hud_rig_lines)
                     elif png_mode:
@@ -6912,7 +6917,7 @@ class Exporter(object):
                         if show_hud and self._has_drawtext():
                             hud_f = self._build_hud_drawtext(
                                 start_frame, hud_focal_lengths,
-                                resolution=(pb_width, pb_height),
+                                resolution=hud_resolution,
                                 plate_name=hud_plate_name,
                                 rig_lines=hud_rig_lines)
                             hud_filters = hud_f.replace(
@@ -7008,7 +7013,7 @@ class Exporter(object):
                             ct_output,
                             show_hud=show_hud,
                             focal_lengths=hud_focal_lengths,
-                            resolution=(pb_width, pb_height),
+                            resolution=hud_resolution,
                             plate_name=hud_plate_name,
                             rig_lines=hud_rig_lines)
                     if encode_ok:
@@ -7472,6 +7477,57 @@ class Exporter(object):
                     "Camera '{}' is scaled ({}). The track may have "
                     "been rescaled to fit.".format(
                         cam.rsplit("|", 1)[-1], text))
+        return warnings
+
+    @staticmethod
+    def _resolution_warnings(camera, stmap_undistort, stmap_redistort,
+                             raw_plate):
+        """Warnings that the back plate, STMaps and raw plate sizes do
+        not belong together.
+
+        The undistort STMap is the undistorted plate's size, so the
+        camera's image plane should match it exactly. Every size should
+        also be within lens overscan of the raw plate (or of the
+        redistort STMap when no raw plate is set): a 2x gap means an HD
+        proxy got mixed with a 4K master.
+        """
+        sizes = []
+        ip = Exporter._get_image_plane_resolution(camera, default=None)
+        if ip:
+            sizes.append(("Image plane", ip))
+        for label, path in (("Undistort STMap", stmap_undistort),
+                            ("Redistort STMap", stmap_redistort),
+                            ("Raw plate", raw_plate)):
+            res = (Exporter._get_image_resolution(path)
+                   if path and os.path.isfile(path) else None)
+            if res:
+                sizes.append((label, res))
+        found = dict(sizes)
+        listing = "\n".join(
+            "  {}: {}x{}".format(label, w, h) for label, (w, h) in sizes)
+
+        warnings = []
+        ud = found.get("Undistort STMap")
+        if ip and ud and tuple(ip) != tuple(ud):
+            warnings.append(
+                "The image plane on '{}' is {}x{} but the undistort "
+                "STMap is {}x{}. The back plate should be the undistorted "
+                "plate at the STMap's size.\n{}".format(
+                    camera.rsplit("|", 1)[-1], ip[0], ip[1],
+                    ud[0], ud[1], listing))
+
+        ref = found.get("Raw plate") or found.get("Redistort STMap")
+        if ref:
+            off = [label for label, (w, h) in sizes
+                   if not 0.95 <= float(w) / ref[0] <= 1.25]
+            if off:
+                warnings.append(
+                    "Resolution mismatch: {} {} not at the same scale as the "
+                    "{} (for example HD next to 4K). Check that everything "
+                    "comes from the same master plate.\n{}".format(
+                        ", ".join(off), "is" if len(off) == 1 else "are",
+                        "raw plate" if found.get("Raw plate")
+                        else "redistort STMap", listing))
         return warnings
 
     @staticmethod
@@ -10769,8 +10825,10 @@ class Exporter(object):
                 stmap_undistort or stmap_redistort)
             if has_lens_distortion:
                 ae_dir = os.path.dirname(os.path.abspath(jsx_path))
-                mw_folder = os.path.basename(os.path.dirname(ae_dir))
-                _, v_str = VersionParser.parse_folder_name(mw_folder)
+                # "<base>_afterEffects_v04" carries the version; the
+                # prePro3d folder above it is unversioned.
+                _, v_str = VersionParser.parse_folder_name(
+                    os.path.basename(ae_dir))
                 mw_jsx = self._export_mesh_warp_presets(
                     ae_dir, scene_base, v_str,
                     stmap_undistort, stmap_redistort,
@@ -12362,9 +12420,10 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         name_row.addWidget(nlbl)
         self.export_name_field = QLineEdit()
         self.export_name_field.setToolTip(
-            "Export folder name. Auto-populated from the scene "
-            "filename  -- edit to customize. The version and tag "
-            "segments are used for file naming.")
+            "Shot folder under the export root: <shot>_<plate>_prePro3d, "
+            "built from the scene file name. Each product's files carry "
+            "the scene's version (e.g. _cam_v04).")
+        self.export_name_field.setReadOnly(True)
         name_row.addWidget(self.export_name_field, 2)
         layout.addLayout(name_row)
 
@@ -12474,6 +12533,29 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         stmap_layout = QVBoxLayout()
         stmap_layout.setSpacing(6)
 
+        # Which tracker wrote the STMaps. 3DE keeps the plate size as
+        # the map's format and puts the overscan in the bounding box,
+        # so the generated .nk must Reformat UD-res images to plate
+        # res before redistorting; SynthEyes maps cover the whole
+        # padded image and need no Reformat. Exactly one is required
+        # whenever an STMap is assigned (see _validate_camera_track).
+        src_row = QHBoxLayout()
+        src_row.setSpacing(12)
+        src_row.addWidget(QLabel("<b>STMaps exported from:</b>"))
+        self.ct_stmap_sy_checkbox = QCheckBox("SynthEyes")
+        self.ct_stmap_3de_checkbox = QCheckBox("3DEqualizer")
+        for cb, other in (
+                (self.ct_stmap_sy_checkbox, self.ct_stmap_3de_checkbox),
+                (self.ct_stmap_3de_checkbox, self.ct_stmap_sy_checkbox)):
+            cb.setToolTip(
+                "Required when an STMap is assigned. Choose the "
+                "application that exported the STMaps.")
+            cb.toggled.connect(
+                partial(lambda o, on: on and o.setChecked(False), other))
+            src_row.addWidget(cb)
+        src_row.addStretch(1)
+        stmap_layout.addLayout(src_row)
+
         ud_lbl = QLabel("Undistort STMap (.exr):")
         stmap_layout.addWidget(ud_lbl)
         ud_row = QHBoxLayout()
@@ -12505,29 +12587,6 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             partial(self._browse_stmap, self.ct_stmap_redistort_field))
         rd_row.addWidget(rd_btn)
         stmap_layout.addLayout(rd_row)
-
-        # Which tracker wrote the STMaps. 3DE keeps the plate size as
-        # the map's format and puts the overscan in the bounding box,
-        # so the generated .nk must Reformat UD-res images to plate
-        # res before redistorting; SynthEyes maps cover the whole
-        # padded image and need no Reformat. Exactly one is required
-        # whenever an STMap is assigned (see _validate_camera_track).
-        src_row = QHBoxLayout()
-        src_row.setSpacing(12)
-        src_row.addWidget(QLabel("STMaps exported from:"))
-        self.ct_stmap_sy_checkbox = QCheckBox("SynthEyes")
-        self.ct_stmap_3de_checkbox = QCheckBox("3DEqualizer")
-        for cb, other in (
-                (self.ct_stmap_sy_checkbox, self.ct_stmap_3de_checkbox),
-                (self.ct_stmap_3de_checkbox, self.ct_stmap_sy_checkbox)):
-            cb.setToolTip(
-                "Required when an STMap is assigned. Choose the "
-                "application that exported the STMaps.")
-            cb.toggled.connect(
-                partial(lambda o, on: on and o.setChecked(False), other))
-            src_row.addWidget(cb)
-        src_row.addStretch(1)
-        stmap_layout.addLayout(src_row)
 
         rp_lbl = QLabel("Raw Plate (distorted sequence):")
         stmap_layout.addWidget(rp_lbl)
@@ -14067,18 +14126,8 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         if scene_path:
             scene_short = os.path.basename(scene_path)
             self.scene_info_label.setText("Scene: " + scene_short)
-            # Auto-populate export folder with filename (no extension)
-            clean = VersionParser._strip_increment(scene_short)
-            folder_name = os.path.splitext(clean)[0]
-            # Only overwrite the field when it is empty or still
-            # holds the previously auto-derived name -- this fires on
-            # every scene save, and it was clobbering user-edited
-            # folder names (which the tooltip explicitly invites).
-            current = self.export_name_field.text().strip()
-            prev_auto = getattr(self, "_auto_folder_name", None)
-            if not current or current == prev_auto:
-                self.export_name_field.setText(folder_name)
-            self._auto_folder_name = folder_name
+            _, _, folder_name = self._export_naming()
+            self.export_name_field.setText(folder_name)
             self.export_root_field.setPlaceholderText(folder_name)
         else:
             self.scene_info_label.setText("Scene: (unsaved scene)")
@@ -14509,6 +14558,25 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
     # Validation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _export_naming():
+        """Return (scene_base, version_str, folder_name) for the open scene.
+
+        Pre Pro 3d publishing: one unversioned "<shot>_<plate>_prePro3d"
+        folder per shot, with each product (cam / charMM / KTHead)
+        versioned in its own file names. The version comes from the
+        scene file name, e.g. "TABL0011_pl01_cam_v04.ma" -> v04.
+        version_str is None when the scene name has no _v## version.
+        """
+        scene_path = cmds.file(query=True, sceneName=True) or ""
+        scene_short = os.path.basename(scene_path)
+        if not scene_short:
+            return "", None, ""
+        version_str, _ = VersionParser.parse(scene_short)
+        scene_base = VersionParser.get_scene_base_name(scene_short)
+        return (scene_base, version_str,
+                "{}_{}".format(scene_base, EXPORT_FOLDER_SUFFIX))
+
     def _validate_shared(self):
         errors = []
         warnings = []
@@ -14529,15 +14597,13 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         if end_frame <= start_frame:
             errors.append("End frame must be greater than start frame.")
 
-        # Parse folder name into base + version
-        folder_name = self.export_name_field.text().strip()
-        if not folder_name:
-            errors.append("Export Folder is not set.")
-            scene_base = ""
+        scene_base, version_str, folder_name = self._export_naming()
+        if scene_path and not version_str:
+            errors.append(
+                "Scene file name has no version (e.g. "
+                "SHOT_pl01_cam_v01.ma). The export version is taken "
+                "from it.")
             version_str = "v01"
-        else:
-            scene_base, version_str = VersionParser.parse_folder_name(
-                folder_name)
 
         return (errors, warnings, export_root, version_str, scene_base,
                 folder_name, start_frame, end_frame)
@@ -14664,6 +14730,12 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 "from SynthEyes or 3DEqualizer.")
 
         warnings.extend(Exporter._scale_warnings(cameras, start_frame))
+        if has_stmap and cameras:
+            warnings.extend(Exporter._resolution_warnings(
+                cameras[0],
+                self.ct_stmap_undistort_field.text().strip(),
+                self.ct_stmap_redistort_field.text().strip(),
+                self.ct_raw_plate_field.text().strip()))
         return errors, warnings
 
     def _validate_matchmove(self):
@@ -15035,14 +15107,18 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
 
         # Build tab-specific keyword arguments. far_clip is set below, once
         # the auto-fit has pushed the camera's far plane past the geo.
-        folder_name = self.export_name_field.text().strip()
+        scene_base, version_str, _ = self._export_naming()
+        preview_tag = {TAB_CAMERA_TRACK: "cam", TAB_MATCHMOVE: "charMM",
+                       TAB_FACE_TRACK: "KTHead"}.get(active_tab, "cam")
+        folder_name = "{}_{}_{}".format(
+            scene_base, preview_tag, version_str or "v01")
         pb_kwargs = dict(
             raw_playblast=raw_pb,
             render_raw_srgb=not custom_vt,
             msaa_16=aa16,
             png_mode=True,
             show_hud=False,
-            shot_name=folder_name,
+            shot_name=shot_label,
         )
 
         # Geo nodes the preview should consider for image-plane
@@ -15290,9 +15366,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
         self._auto_fit_camera_far(
             cameras, geo_roots + obj_tracks, start_frame, end_frame)
 
-        folder_name = self.export_name_field.text().strip()
-        scene_base, version_str = VersionParser.parse_folder_name(
-            folder_name)
+        scene_base, version_str, folder_name = self._export_naming()
+        # Burn-in names the product, e.g. "SHOT_pl01_cam_v04".
+        shot_label = "{}_cam_{}".format(scene_base, version_str)
 
         FolderManager.resolve_versioned_dir(
             export_root, scene_base, version_str)
@@ -15633,7 +15709,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         png_mode=png_mode, mp4_mode=mp4_mode,
                         mp4_output=paths.get("mp4"),
                         show_hud=show_hud,
-                        shot_name=folder_name)
+                        shot_name=shot_label)
                     self._log_result("Playblast", results["mov"])
 
                     # Witness pass -- a second, HUD-less .mp4 from a
@@ -15648,7 +15724,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             start_frame, end_frame,
                             geo_nodes=geo_roots + obj_tracks,
                             hide_domes=confirmed_domes,
-                            shot_name=folder_name,
+                            shot_name=shot_label,
                             standoff_geo_keywords=(
                                 WITNESS_STANDOFF_GEO_KEYWORDS),
                             auto_place=(
@@ -15668,7 +15744,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                 results["array"] = exporter.export_array_playblast(
                     paths["mp4_array"], paths["mp4_array_tmp_file"],
                     primary_camera, start_frame, end_frame,
-                    shot_name=folder_name,
+                    shot_name=shot_label,
                     geo_nodes=geo_roots + obj_tracks,
                     hide_domes=confirmed_domes)
                 if results["array"]:
@@ -15896,9 +15972,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         tpose_frame, start_frame))
             tpose_start = min(start_frame, tpose_frame)
 
-        folder_name = self.export_name_field.text().strip()
-        scene_base, version_str = VersionParser.parse_folder_name(
-            folder_name)
+        scene_base, version_str, folder_name = self._export_naming()
+        # Burn-in names the product, e.g. "SHOT_pl01_charMM_v04".
+        shot_label = "{}_charMM_{}".format(scene_base, version_str)
 
         FolderManager.resolve_versioned_dir(
             export_root, scene_base, version_str)
@@ -16171,7 +16247,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_geo=geo_roots,
                         composite_wireframe_opacity=wf_opacity,
                         composite_wireframe_color=wf_color,
-                        shot_name=folder_name)
+                        shot_name=shot_label)
                     self._log_result("Playblast", results["mov"])
 
                     # Witness pass -- a second, HUD-less .mp4 from a
@@ -16188,7 +16264,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             # plus the main camera path only -- other geo
                             # still renders but does not push the standoff.
                             geo_nodes=rig_roots,
-                            shot_name=folder_name,
+                            shot_name=shot_label,
                             auto_place=(
                                 self.pb_auto_qc_cam_cb.isChecked())))
                     self._log_result("Witness Playblast",
@@ -16367,9 +16443,9 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
             [camera] if camera else [], ft_geo_for_far,
             start_frame, end_frame)
 
-        folder_name = self.export_name_field.text().strip()
-        scene_base, version_str = VersionParser.parse_folder_name(
-            folder_name)
+        scene_base, version_str, folder_name = self._export_naming()
+        # Burn-in names the product, e.g. "SHOT_pl01_KTHead_v04".
+        shot_label = "{}_KTHead_{}".format(scene_base, version_str)
 
         FolderManager.resolve_versioned_dir(
             export_root, scene_base, version_str)
@@ -16656,7 +16732,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                         composite_wireframe_geo=face_meshes,
                         composite_wireframe_opacity=wf_opacity,
                         composite_wireframe_color=wf_color,
-                        shot_name=folder_name)
+                        shot_name=shot_label)
                     self._log_result("Playblast", results["mov"])
 
                     # Witness pass -- a second, HUD-less .mp4 from a
@@ -16674,7 +16750,7 @@ class ExportGenieWidget(MayaQWidgetDockableMixin, QWidget):
                             # geo still renders but must not push the
                             # standoff out to enclose the environment.
                             geo_nodes=face_meshes,
-                            shot_name=folder_name,
+                            shot_name=shot_label,
                             auto_place=(
                                 self.pb_auto_qc_cam_cb.isChecked())))
                     self._log_result("Witness Playblast",

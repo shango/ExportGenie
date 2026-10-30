@@ -147,8 +147,9 @@ Restart Maya, open a fresh scene, drag the new `ExportGenie.py` into the viewpor
 
 ### Export Directory and Naming
 - Browse to set your export root directory
-- **Export Folder** field is the full folder name - auto-populated from the scene filename (without extension), fully editable
-- Version and tag are parsed from the folder name: `{shot}_{plate}_{tag}_{version}` (e.g., `SHOT001_pl01_track_v03`)
+- **Export Folder** is one unversioned folder per shot, `{shot}_{plate}_prePro3d`, built from the scene filename (display only)
+- The version comes from the scene filename: `SHOT001_pl01_cam_v03.ma` exports `SHOT001_pl01_cam_v03.*`. A scene name without `_v##` is blocked
+- Each product carries its own name and version: `cam` (Camera Track), `charMM` (Matchmove), `KTHead` (Face Track)
 
 ### Export Formats
 - **Maya ASCII (.ma)** - Camera renamed to `cam_main`, custom shaders stripped to default lambert, image plane references preserved
@@ -198,36 +199,22 @@ Required plugins (`fbxmaya`, `AbcExport`, `objExport`) are auto-loaded when need
 
 ## Output Folder Structure
 
-Exports go into `<export_root>/<export_name>/`:
+All three tabs export into the same shot folder, `<export_root>/<shot>_<plate>_prePro3d/`. Each product is versioned in its own file names:
 
-**Camera Track:**
 ```
 <export_root>/
-  <export_name>/
-    <name>_cam_v01.ma
-    <name>_cam_v01.fbx
-    <name>_cam_v01.abc
-    <name>_track_v01.mov
-    <name>_afterEffects/
-      <name>_ae_v01.jsx
-      <name>_v01_geo1.obj
-```
-
-**Matchmove:**
-```
-<export_root>/
-  <export_name>/
-    <name>_charMM_v01.ma
-    <name>_charMM_v01.fbx
-    <name>_charMM_v01.abc
-    <name>_track_v01.mov
-```
-
-**Face Track:**
-```
-<export_root>/
-  <export_name>/
-    <name>_KTHead_v01.ma
-    <name>_KTHead_v01.fbx
-    <name>_track_v01.mov
+  <shot>_<plate>_prePro3d/
+    <shot>_<plate>_cam_v01.ma / .fbx / .abc / .usd / .nk
+    <shot>_<plate>_cam_v01.mp4          main playblast
+    <shot>_<plate>_cam_v01_qc.mp4       QC side view
+    <shot>_<plate>_cam_v01_array.mp4    Array Cam
+    <shot>_<plate>_afterEffects_v01/
+      <shot>_<plate>_ae_v01.jsx
+      <shot>_<plate>_<geo>_v01.obj
+    <shot>_<plate>_charMM_v01.ma / .fbx / .abc
+    <shot>_<plate>_charMM_v01.mp4
+    <shot>_<plate>_charMM_v01_qc.mp4
+    <shot>_<plate>_KTHead_v01.ma / .fbx / .abc / .usd
+    <shot>_<plate>_KTHead_v01.mp4
+    <shot>_<plate>_KTHead_v01_qc.mp4
 ```
